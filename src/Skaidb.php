@@ -97,16 +97,39 @@ class Connection
         string $user = 'anonymous',
         string $password = '',
         $consistency = 'QUORUM',
-        float $timeout = 10.0
+        float $timeout = 10.0,
+        ?string $database = null,
+        bool $tls = false,
+        ?string $tlsCa = null,
+        bool $tlsInsecure = false,
+        string $tlsServerName = 'skaidb'
     ) {
         $this->consistency = self::resolveConsistency($consistency);
 
         $errno = 0;
         $errstr = '';
-        // TCP_NODELAY via stream context where supported (PHP 7.1+).
-        $ctx = stream_context_create(['socket' => ['tcp_nodelay' => true]]);
+        // A server with client_tls = required refuses plaintext outright, so
+        // without TLS such a cluster is simply unreachable. Any of the three
+        // knobs turns it on.
+        $tls = $tls || $tlsCa !== null || $tlsInsecure;
+        $opts = ['socket' => ['tcp_nodelay' => true]];
+        if ($tls) {
+            // peer_name is SNI *and* the verified name; skaidb's certs carry
+            // DNS:skaidb, which is usually NOT the address dialled.
+            $opts['ssl'] = [
+                'peer_name' => $tlsServerName,
+                'verify_peer' => !$tlsInsecure,
+                'verify_peer_name' => !$tlsInsecure,
+                // Encrypt-without-authenticating is development only.
+                'allow_self_signed' => $tlsInsecure,
+            ];
+            if ($tlsCa !== null && $tlsCa !== '') {
+                $opts['ssl']['cafile'] = $tlsCa;
+            }
+        }
+        $ctx = stream_context_create($opts);
         $sock = @stream_socket_client(
-            "tcp://{$host}:{$port}",
+            ($tls ? 'ssl://' : 'tcp://') . "{$host}:{$port}",
             $errno,
             $errstr,
             $timeout,
@@ -125,6 +148,11 @@ class Connection
         } catch (SkaidbException $e) {
             $this->close();
             throw $e;
+        }
+
+        // USE is per-connection session state, so it runs on every dial.
+        if ($database !== null && $database !== '') {
+            $this->exec('USE "' . str_replace('"', '""', $database) . '"');
         }
     }
 

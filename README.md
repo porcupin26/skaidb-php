@@ -76,7 +76,20 @@ $stmt->setConsistency(int|string $c): static
 Every error — connect failure, auth denial, or a server statement error —
 throws `Skaidb\SkaidbException` (modelled on `PDOException`).
 
-### Consistency
+### TLS and database
+
+```php
+// ($host, $port, $user, $password, $consistency, $timeout, $database,
+//  $tls, $tlsCa, $tlsInsecure, $tlsServerName)
+$db = new Skaidb\Connection('db1', 7000, 'u', 'p', 'QUORUM', 10.0, 'app',
+                            false, '/etc/skaidb/skai-ca.crt');
+```
+
+A server with `client_tls = required` refuses plaintext, so one of the TLS
+options is mandatory there. `$tlsServerName` (default `skaidb`) must match a
+SAN on the server certificate — usually *not* the address you dialled.
+
+## Consistency
 
 skaidb is leaderless with tunable consistency. Default is `QUORUM`:
 
