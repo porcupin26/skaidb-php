@@ -284,6 +284,84 @@ class Connection
     }
 
     /**
+     * Stream a result set: yields one associative-array row at a time while
+     * holding a single chunk, instead of buffering the whole result. For
+     * exports and large scans.
+     *
+     *     foreach ($db->stream('SELECT ...') as $row) { ... }
+     *
+     * The connection is busy until the stream ends; breaking out of the
+     * foreach drains the remaining frames so the connection stays usable.
+     * Takes no parameters — the streaming opcode carries SQL text.
+     *
+     * @return \Generator<int,array<string,mixed>>
+     */
+    public function stream(string $sql, ?int $consistency = null): \Generator
+    {
+        if ($this->closed) {
+            throw new SkaidbException('connection is closed');
+        }
+        $level = $consistency ?? $this->consistency;
+        $req = pack('C', 5) . pack('C', $level) . pack('V', strlen($sql)) . $sql;
+        $this->writeFrame($req);
+        $r = new Reader($this->readFrame());
+        $tag = $r->u8();
+        if ($tag === 3) {
+            $msg = $r->text();
+            throw new SkaidbException(
+                str_contains($msg, 'unknown opcode') ? "server does not support streaming: {$msg}" : $msg
+            );
+        }
+        if ($tag === 1 || $tag === 2) {
+            return; // not row-producing
+        }
+        if ($tag !== 5) {
+            throw new SkaidbException("unexpected response tag {$tag} to stream request");
+        }
+        $ncols = $r->u32();
+        $columns = [];
+        for ($i = 0; $i < $ncols; $i++) {
+            $columns[] = $r->text();
+        }
+        $live = true;
+        try {
+            while ($live) {
+                $fr = new Reader($this->readFrame());
+                $t = $fr->u8();
+                if ($t === 6) {
+                    $n = $fr->u32();
+                    for ($i = 0; $i < $n; $i++) {
+                        $ncells = $fr->u32();
+                        $row = [];
+                        for ($c = 0; $c < $ncells; $c++) {
+                            $row[$columns[$c] ?? $c] = $this->decodeValue(new Reader($fr->blob()));
+                        }
+                        yield $row;
+                    }
+                } elseif ($t === 7) {
+                    $live = false;
+                } elseif ($t === 3) {
+                    $live = false;
+                    throw new SkaidbException($fr->text());
+                } else {
+                    $live = false;
+                    throw new SkaidbException("unexpected frame tag {$t} in stream");
+                }
+            }
+        } finally {
+            // Abandoned early: drain so leftovers are not read as the reply
+            // to the next statement on this connection.
+            while ($live) {
+                $fr = new Reader($this->readFrame());
+                $t = $fr->u8();
+                if ($t === 7 || $t === 3) {
+                    $live = false;
+                }
+            }
+        }
+    }
+
+    /**
      * Prepare $sql on the SERVER, returning [id, paramCount]. Cached per
      * connection, because a prepared id only means anything on the
      * connection that created it. Throws Unpreparable for statement kinds
