@@ -114,7 +114,8 @@ class Connection
         bool $tls = false,
         ?string $tlsCa = null,
         bool $tlsInsecure = false,
-        string $tlsServerName = 'skaidb'
+        string $tlsServerName = 'skaidb',
+        array $seeds = []
     ) {
         $this->consistency = self::resolveConsistency($consistency);
 
@@ -140,16 +141,30 @@ class Connection
             }
         }
         $ctx = stream_context_create($opts);
-        $sock = @stream_socket_client(
-            ($tls ? 'ssl://' : 'tcp://') . "{$host}:{$port}",
-            $errno,
-            $errstr,
-            $timeout,
-            STREAM_CLIENT_CONNECT,
-            $ctx
-        );
+        // Seeds: try each until one connects. skaidb is leaderless, so any
+        // node serves — there is no primary to discover. Shuffled so many
+        // clients spread instead of stampeding the first entry.
+        $endpoints = $seeds === [] ? ["{$host}:{$port}"] : $seeds;
+        shuffle($endpoints);
+        $sock = false;
+        $tried = [];
+        foreach ($endpoints as $ep) {
+            $tried[] = $ep;
+            $sock = @stream_socket_client(
+                ($tls ? 'ssl://' : 'tcp://') . $ep,
+                $errno,
+                $errstr,
+                $timeout,
+                STREAM_CLIENT_CONNECT,
+                $ctx
+            );
+            if ($sock !== false) {
+                break;
+            }
+        }
         if ($sock === false) {
-            throw new SkaidbException("connect failed: {$errstr} ({$errno})");
+            $list = implode(', ', $tried);
+            throw new SkaidbException("no reachable endpoint in {$list}: {$errstr} ({$errno})");
         }
         $this->sock = $sock;
         // Read timeout for fread loops.

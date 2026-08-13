@@ -76,6 +76,16 @@ $stmt->setConsistency(int|string $c): static
 Every error — connect failure, auth denial, or a server statement error —
 throws `Skaidb\SkaidbException` (modelled on `PDOException`).
 
+### Failover
+
+```php
+// ..., $tlsServerName, $seeds
+new Skaidb\Connection('db1', 7000, 'u', 'p', 'QUORUM', 10.0, null, false, null,
+                      false, 'skaidb', ['db1:7000', 'db2:7000']);
+```
+
+Tried in shuffled order until one connects.
+
 ### TLS and database
 
 ```php
