@@ -46,6 +46,15 @@ class SkaidbException extends Exception
 }
 
 /**
+ * The server declines to prepare some statement kinds (DDL, session
+ * statements). Not an error — the caller falls back to client-side text
+ * binding.
+ */
+class Unpreparable extends SkaidbException
+{
+}
+
+/**
  * A connection to one skaidb node. Runs the SCRAM-SHA-256 handshake in the
  * constructor, then exposes a PDO-shaped query API.
  */
@@ -76,6 +85,9 @@ class Connection
     private int $consistency;
 
     private bool $closed = false;
+
+    /** @var array<string,array{0:int,1:int}> */
+    private array $preparedCache = [];
 
     private static int $nonceCounter = 0;
 
@@ -253,6 +265,144 @@ class Connection
         // OP_QUERY=1, consistency u8, u32 LE sql_len, sql bytes.
         $req = pack('C', 1) . pack('C', $consistency)
             . pack('V', strlen($sqlBytes)) . $sqlBytes;
+        return $this->roundtrip($req);
+    }
+
+    /**
+     * Prepare $sql on the SERVER, returning [id, paramCount]. Cached per
+     * connection, because a prepared id only means anything on the
+     * connection that created it. Throws Unpreparable for statement kinds
+     * the server declines (DDL, session statements).
+     *
+     * @internal
+     * @return array{0:int,1:int}
+     */
+    public function prepareServer(string $sql): array
+    {
+        if (isset($this->preparedCache[$sql])) {
+            return $this->preparedCache[$sql];
+        }
+        if ($this->closed) {
+            throw new SkaidbException('connection is closed');
+        }
+        $req = pack('C', 2) . pack('V', strlen($sql)) . $sql;
+        $this->writeFrame($req);
+        $r = new Reader($this->readFrame());
+        $tag = $r->u8();
+        if ($tag === 4) { // Prepared
+            $id = $r->u32();
+            $nparams = $r->u16();
+            if (count($this->preparedCache) < 240) {
+                $this->preparedCache[$sql] = [$id, $nparams];
+            }
+            return [$id, $nparams];
+        }
+        if ($tag === 3) {
+            throw new Unpreparable($r->text());
+        }
+        throw new SkaidbException("unexpected prepare response tag {$tag}");
+    }
+
+    /**
+     * Execute a prepared statement with TYPED parameters — the only way to
+     * send an array or a document, neither of which has a SQL literal form.
+     *
+     * @internal
+     * @param array<int,mixed> $params
+     * @return array{kind:string, columns:array<int,string>, rows:array<int,array<int,mixed>>, affected:int}
+     */
+    public function execPrepared(int $id, array $params, int $consistency): array
+    {
+        $req = pack('C', 3) . pack('C', $consistency) . pack('V', $id)
+            . pack('v', count($params));
+        foreach ($params as $p) {
+            $v = self::encodeValue($p);
+            $req .= pack('V', strlen($v)) . $v;
+        }
+        return $this->roundtrip($req);
+    }
+
+    /**
+     * Execute a prepared statement once per row in ONE round-trip. Rows
+     * autocommit individually: a failure names the row and earlier rows
+     * stay applied, so the statement must be idempotent.
+     *
+     * @internal
+     * @param array<int,array<int,mixed>> $rows
+     * @return array{kind:string, columns:array<int,string>, rows:array<int,array<int,mixed>>, affected:int}
+     */
+    public function execBatch(int $id, array $rows, int $consistency): array
+    {
+        $req = pack('C', 7) . pack('C', $consistency) . pack('V', $id)
+            . pack('V', count($rows));
+        foreach ($rows as $params) {
+            $req .= pack('v', count($params));
+            foreach ($params as $p) {
+                $v = self::encodeValue($p);
+                $req .= pack('V', strlen($v)) . $v;
+            }
+        }
+        return $this->roundtrip($req);
+    }
+
+    /**
+     * Encode a PHP value as a TYPED skaidb value (tag + payload), the
+     * inverse of decodeValue. Lists become Array, associative arrays become
+     * Document.
+     *
+     * @internal
+     */
+    public static function encodeValue($v): string
+    {
+        if ($v === null) {
+            return pack('C', 0);
+        }
+        if (is_bool($v)) {
+            return pack('C', 1) . pack('C', $v ? 1 : 0);
+        }
+        if (is_int($v)) {
+            return pack('C', 2) . pack('P', $v);
+        }
+        if (is_float($v)) {
+            if (is_nan($v) || is_infinite($v)) {
+                throw new SkaidbException('cannot bind NaN/Infinity');
+            }
+            return pack('C', 3) . pack('e', $v);
+        }
+        if (is_string($v)) {
+            return pack('C', 5) . pack('V', strlen($v)) . $v;
+        }
+        if ($v instanceof \DateTimeInterface) {
+            return pack('C', 8) . pack('P', (int) round((float) $v->format('U.u') * 1000));
+        }
+        if (is_array($v)) {
+            // A list encodes as Array; anything else as Document.
+            if (array_is_list($v)) {
+                $out = pack('C', 9) . pack('V', count($v));
+                foreach ($v as $item) {
+                    $out .= self::encodeValue($item);
+                }
+                return $out;
+            }
+            $out = pack('C', 10) . pack('V', count($v));
+            foreach ($v as $k => $item) {
+                $ks = (string) $k;
+                $out .= pack('V', strlen($ks)) . $ks . self::encodeValue($item);
+            }
+            return $out;
+        }
+        $t = is_object($v) ? get_class($v) : gettype($v);
+        throw new SkaidbException("cannot bind value of type {$t}");
+    }
+
+    /**
+     * @return array{kind:string, columns:array<int,string>, rows:array<int,array<int,mixed>>, affected:int}
+     */
+    private function roundtrip(string $req): array
+    {
+        if ($this->closed) {
+            throw new SkaidbException('connection is closed');
+        }
         $this->writeFrame($req);
 
         $r = new Reader($this->readFrame());
@@ -732,8 +882,26 @@ class Statement
      */
     public function execute(array $params = []): bool
     {
-        $bound = Connection::bindParams($this->sql, $params);
-        $res = $this->conn->runQuery($bound, $this->consistency);
+        $res = null;
+        if ($params !== []) {
+            // Server-side prepare so parameters travel as TYPED values;
+            // arrays and documents have no SQL literal form.
+            try {
+                [$id, $n] = $this->conn->prepareServer($this->sql);
+                if ($n !== count($params)) {
+                    throw new SkaidbException(
+                        "statement expects {$n} parameters, got " . count($params)
+                    );
+                }
+                $res = $this->conn->execPrepared($id, array_values($params), $this->consistency);
+            } catch (Unpreparable $e) {
+                $res = null; // fall through to text binding
+            }
+        }
+        if ($res === null) {
+            $bound = Connection::bindParams($this->sql, $params);
+            $res = $this->conn->runQuery($bound, $this->consistency);
+        }
         $this->pos = 0;
         if ($res['kind'] === 'rows') {
             $this->isRows = true;
@@ -868,6 +1036,11 @@ class Reader
     public function u8(): int
     {
         return ord($this->take(1));
+    }
+
+    public function u16(): int
+    {
+        return unpack('v', $this->take(2))[1]; // u16 LE
     }
 
     public function u32(): int
