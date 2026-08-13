@@ -880,6 +880,34 @@ class Statement
      *
      * @param array<int,mixed> $params positional values for '?' placeholders
      */
+    /**
+     * Execute this statement once per row in ONE round-trip. Rows autocommit
+     * individually: a failure names the row and earlier rows stay applied,
+     * so the statement must be idempotent. Returns total affected rows.
+     *
+     * @param array<int,array<int,mixed>> $rows
+     */
+    public function executeBatch(array $rows): int
+    {
+        if ($rows === []) {
+            return 0;
+        }
+        [$id, $n] = $this->conn->prepareServer($this->sql);
+        foreach ($rows as $r) {
+            if (count($r) !== $n) {
+                throw new SkaidbException(
+                    "batch row expects {$n} parameters, got " . count($r)
+                );
+            }
+        }
+        $res = $this->conn->execBatch(
+            $id,
+            array_map('array_values', $rows),
+            $this->consistency
+        );
+        return $res['affected'];
+    }
+
     public function execute(array $params = []): bool
     {
         $res = null;
