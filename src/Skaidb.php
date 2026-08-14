@@ -89,6 +89,12 @@ class Connection
     /** @var array<string,array{0:int,1:int}> */
     private array $preparedCache = [];
 
+    /** Transport died; the next statement re-dials (see ensureLive). */
+    private bool $broken = false;
+
+    /** Everything a redial needs, captured at construction. */
+    private array $dialArgs = [];
+
     private static int $nonceCounter = 0;
 
     /**
@@ -118,6 +124,22 @@ class Connection
         array $seeds = []
     ) {
         $this->consistency = self::resolveConsistency($consistency);
+        // Retained so a reconnect repeats the original connect exactly.
+        $this->dialArgs = compact(
+            'host', 'port', 'user', 'password', 'timeout', 'database',
+            'tls', 'tlsCa', 'tlsInsecure', 'tlsServerName', 'seeds'
+        );
+        $this->dial();
+    }
+
+    /**
+     * Connect, authenticate and enter the session database. Used for the
+     * first connect and for every reconnect, so a recovered connection is
+     * indistinguishable from a fresh one.
+     */
+    private function dial(): void
+    {
+        extract($this->dialArgs);
 
         $errno = 0;
         $errstr = '';
@@ -273,6 +295,7 @@ class Connection
      */
     public function runQuery(string $sql, int $consistency): array
     {
+        $this->ensureLive();
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
@@ -298,6 +321,7 @@ class Connection
      */
     public function stream(string $sql, ?int $consistency = null): \Generator
     {
+        $this->ensureLive();
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
@@ -372,6 +396,7 @@ class Connection
      */
     public function prepareServer(string $sql): array
     {
+        $this->ensureLive();
         if (isset($this->preparedCache[$sql])) {
             return $this->preparedCache[$sql];
         }
@@ -535,6 +560,38 @@ class Connection
 
     // ---- framing ----------------------------------------------------------
 
+    /**
+     * Re-dial if the transport died since the last statement, BEFORE anything
+     * is prepared on it.
+     *
+     * The prepared-statement cache MUST be cleared: an id is only valid on the
+     * connection that created it, so carrying one across a reconnect would run
+     * a different statement (or fail obscurely).
+     */
+    private function ensureLive(): void
+    {
+        if ($this->sock === null && !$this->broken) {
+            throw new SkaidbException('connection is closed');
+        }
+        if (!$this->broken) {
+            return;
+        }
+        $this->preparedCache = [];
+        if (is_resource($this->sock)) {
+            @fclose($this->sock);
+        }
+        $this->sock = null;
+        // Cleared BEFORE dialling: dial() issues USE, which runs a statement
+        // and would otherwise re-enter this method forever.
+        $this->broken = false;
+        try {
+            $this->dial();
+        } catch (SkaidbException $e) {
+            $this->broken = true;   // still down; the next statement retries
+            throw $e;
+        }
+    }
+
     private function writeFrame(string $payload): void
     {
         // u32 BE length prefix, then payload.
@@ -544,6 +601,7 @@ class Connection
         while ($written < $total) {
             $n = @fwrite($this->sock, substr($frame, $written));
             if ($n === false || $n === 0) {
+                $this->broken = true;
                 throw new SkaidbException('connection closed by server (write)');
             }
             $written += $n;
@@ -570,8 +628,10 @@ class Connection
             if ($chunk === false || $chunk === '') {
                 $meta = is_resource($this->sock) ? stream_get_meta_data($this->sock) : ['timed_out' => false];
                 if (!empty($meta['timed_out'])) {
-                    throw new SkaidbException('connection timed out');
+                    $this->broken = true;
+                throw new SkaidbException('connection timed out');
                 }
+                $this->broken = true;
                 throw new SkaidbException('connection closed by server');
             }
             $buf .= $chunk;
