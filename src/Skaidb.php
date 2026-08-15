@@ -273,6 +273,12 @@ class Connection
         return $stmt->rowCount();
     }
 
+    /** False once closed, or once a transport error broke the socket. */
+    public function isUsable(): bool
+    {
+        return !$this->closed && !$this->broken && is_resource($this->sock);
+    }
+
     public function close(): void
     {
         if (!$this->closed) {
@@ -1263,5 +1269,105 @@ class Reader
     public function text(): string
     {
         return $this->blob();
+    }
+}
+/**
+ * A pool of skaidb connections.
+ *
+ * `maxsize` bounds the connections kept IDLE, not the number checked out: a
+ * burst creates extras and the surplus is closed on return. Every Connection
+ * constructor argument passes through, so pooled connections inherit seed
+ * failover, TLS and the session database.
+ *
+ * PHP is share-nothing per request, so this pool lives for one process — it
+ * pays off in a worker or a long-running CLI job, not in a plain web request
+ * that opens one connection and exits.
+ *
+ *     $pool = new Skaidb\Pool(['127.0.0.1', 7441], 8);
+ *     $n = $pool->withConnection(fn ($c) => $c->exec('SELECT 1'));
+ *     $pool->close();
+ */
+class Pool
+{
+    /** @var array<int, Connection> */
+    private array $idle = [];
+
+    private bool $closed = false;
+
+    private int $maxsize;
+
+    /** @var array<int, mixed> constructor arguments for each new Connection */
+    private array $args;
+
+    /**
+     * @param array<int, mixed> $connectionArgs positional args for Connection::__construct
+     * @param int               $maxsize        connections kept idle
+     */
+    public function __construct(array $connectionArgs = [], int $maxsize = 10)
+    {
+        if ($maxsize < 1) {
+            throw new SkaidbException('maxsize must be >= 1');
+        }
+        $this->args = $connectionArgs;
+        $this->maxsize = $maxsize;
+    }
+
+    /** Check out a usable connection, reusing an idle one when possible. */
+    public function acquire(): Connection
+    {
+        while (true) {
+            if ($this->closed) {
+                throw new SkaidbException('pool is closed');
+            }
+            $conn = array_pop($this->idle);
+            if ($conn === null) {
+                return new Connection(...$this->args);
+            }
+            // A connection the server closed while it sat idle still looks
+            // fine locally, so check before handing it out.
+            if ($conn->isUsable()) {
+                return $conn;
+            }
+            $conn->close();
+        }
+    }
+
+    /** Return a connection, closing it if broken or the pool is full. */
+    public function release(Connection $conn): void
+    {
+        if (!$this->closed && $conn->isUsable() && count($this->idle) < $this->maxsize) {
+            $this->idle[] = $conn;
+
+            return;
+        }
+        $conn->close();
+    }
+
+    /**
+     * Run $fn with a checked-out connection, returning it however $fn ends.
+     *
+     * @param callable(Connection):mixed $fn
+     *
+     * @return mixed whatever $fn returns
+     */
+    public function withConnection(callable $fn)
+    {
+        $conn = $this->acquire();
+        try {
+            return $fn($conn);
+        } finally {
+            $this->release($conn);
+        }
+    }
+
+    /** Close the pool and every idle connection. */
+    public function close(): void
+    {
+        $this->closed = true;
+        $idle = $this->idle;
+        $this->idle = [];
+        foreach ($idle as $conn) {
+            $conn->close();
+        }
     }
 }
