@@ -273,6 +273,46 @@ class Connection
         return $stmt->rowCount();
     }
 
+    /**
+     * Yield a stream's events as they arrive, forever.
+     *
+     * A dependency-free helper over the stream's log: pages it with the
+     * keyset cursor and yields each event (id, op, k, ts, doc). `id` is the
+     * position — keep the last one and pass it as $after to resume exactly
+     * where you stopped, across restarts.
+     *
+     * This polls; for push delivery subscribe to `$stream/<db>/<name>` with
+     * any MQTT client instead. The events are identical.
+     *
+     *     foreach ($db->subscribe('big_orders') as $ev) { ... }
+     *
+     * @return \Generator<int, array<string, mixed>>
+     */
+    public function subscribe(string $stream, ?string $after = null, float $poll = 0.5): \Generator
+    {
+        $log = '_stream_' . $stream;
+        $cur = $after;
+        while (true) {
+            if ($cur === null) {
+                $st = $this->prepare("SELECT id, op, k, ts, doc FROM {$log} ORDER BY id LIMIT 500");
+                $st->execute();
+            } else {
+                $st = $this->prepare(
+                    "SELECT id, op, k, ts, doc FROM {$log} WHERE id > ? ORDER BY id LIMIT 500"
+                );
+                $st->execute([$cur]);
+            }
+            $rows = $st->fetchAll();
+            foreach ($rows as $row) {
+                $cur = $row['id'];
+                yield $row;
+            }
+            if (count($rows) === 0) {
+                usleep((int) ($poll * 1_000_000));
+            }
+        }
+    }
+
     /** False once closed, or once a transport error broke the socket. */
     public function isUsable(): bool
     {
