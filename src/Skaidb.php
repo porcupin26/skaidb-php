@@ -199,9 +199,31 @@ class Connection
             throw $e;
         }
 
+        $this->sendHello();
         // USE is per-connection session state, so it runs on every dial.
         if ($database !== null && $database !== '') {
             $this->exec('USE "' . str_replace('"', '""', $database) . '"');
+        }
+    }
+
+    /**
+     * Best-effort self-identification: fills the server's `drivers` table
+     * client_name/client_version. An old server answers the unknown opcode
+     * with an error frame, which is ignored — identity is telemetry, never
+     * load-bearing.
+     */
+    private function sendHello(): void
+    {
+        try {
+            $name = 'php';
+            $ver = '0.1.0';
+            $req = chr(8)
+                . pack('V', strlen($name)) . $name
+                . pack('V', strlen($ver)) . $ver;
+            $this->writeFrame($req);
+            $this->readFrame();
+        } catch (SkaidbException $e) {
+            // telemetry only
         }
     }
 
