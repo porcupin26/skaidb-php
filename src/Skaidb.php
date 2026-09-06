@@ -613,6 +613,33 @@ class Connection
             }
             return ['kind' => 'rows', 'columns' => $columns, 'rows' => $rows, 'affected' => 0];
         }
+        if ($tag === 8) { // ResultSets: a CALL whose body EMITted
+            $sets = [];
+            $nsets = $r->u32();
+            for ($s = 0; $s < $nsets; $s++) {
+                $ncols = $r->u32();
+                $columns = [];
+                for ($i = 0; $i < $ncols; $i++) {
+                    $columns[] = $r->text();
+                }
+                $nrows = $r->u32();
+                $rows = [];
+                for ($i = 0; $i < $nrows; $i++) {
+                    $ncells = $r->u32();
+                    $row = [];
+                    for ($c = 0; $c < $ncells; $c++) {
+                        $row[] = $this->decodeValue(new Reader($r->blob()));
+                    }
+                    $rows[] = $row;
+                }
+                $sets[] = ['columns' => $columns, 'rows' => $rows];
+            }
+            // The last set (the call's final result) is the result's own
+            // columns/rows; every set, in order, is under result_sets.
+            $last = $sets === [] ? ['columns' => [], 'rows' => []] : $sets[count($sets) - 1];
+            return ['kind' => 'rows', 'columns' => $last['columns'], 'rows' => $last['rows'],
+                    'affected' => 0, 'result_sets' => $sets];
+        }
         if ($tag === 1) { // Mutation
             $affected = $r->u64();
             return ['kind' => 'mutation', 'columns' => [], 'rows' => [], 'affected' => $affected];
