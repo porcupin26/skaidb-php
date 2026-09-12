@@ -423,7 +423,15 @@ class Connection
         $live = false; // true only once the header promises RowsChunk frames
         try {
             $r = new Reader($this->readFrame());
-            $tag = $r->u8();
+            // Before the tag is known, a short or empty frame makes even
+            // `u8()` throw — and at that point we cannot say what the
+            // reply left queued, so the socket is not reusable.
+            try {
+                $tag = $r->u8();
+            } catch (\Throwable $e) {
+                $this->broken = true;
+                throw $e;
+            }
             if ($tag === 3) {
                 $msg = $r->text();
                 throw new SkaidbException(
@@ -438,12 +446,21 @@ class Connection
                 $this->broken = true;
                 throw new SkaidbException("unexpected response tag {$tag} to stream request");
             }
+            // The server has committed to chunks + RowsEnd, so from here
+            // the socket carries frames this call owns: say so BEFORE
+            // parsing the header. A Reader throw on a truncated column
+            // list would otherwise leave `$live === false` and
+            // `$broken === false`, so finishStream() returns without
+            // draining, isUsable() stays true, and a pool hands out a
+            // connection with the whole chunk sequence still queued — the
+            // "unknown response tag 6" this ensure exists to prevent,
+            // reachable through a three-line window.
+            $live = true;
             $ncols = $r->u32();
             $columns = [];
             for ($i = 0; $i < $ncols; $i++) {
                 $columns[] = $r->text();
             }
-            $live = true;
             while ($live) {
                 $fr = new Reader($this->readFrame());
                 $t = $fr->u8();
@@ -803,8 +820,13 @@ class Connection
     private function readExact(int $n): string
     {
         if (!is_resource($this->sock)) {
-            // A stream abandoned after close() drains through here; fread()
-            // on null would raise a TypeError out of a generator's finally.
+            // Defence in depth, not a live path: finishStream() already
+            // returns on `closed` and on a non-resource socket before it
+            // reads anything, so an abandoned stream never arrives here
+            // with a dead socket. Kept because `fread(null, …)` is a
+            // TypeError rather than a SkaidbException, and one reachable
+            // caller past this guard would turn a closed connection into
+            // an error nobody catches.
             throw new SkaidbException('connection is closed');
         }
         $buf = '';
