@@ -92,6 +92,14 @@ class Connection
     /** Transport died; the next statement re-dials (see ensureLive). */
     private bool $broken = false;
 
+    /**
+     * A stream is in flight: the connection owes us RowsChunk frames up to
+     * RowsEnd (PROTOCOL.md §3.4) and is therefore NOT sitting at a request
+     * boundary. Guards every other statement, and fails isUsable() so a pool
+     * cannot hand the connection out mid-stream.
+     */
+    private bool $streaming = false;
+
     /** Everything a redial needs, captured at construction. */
     private array $dialArgs = [];
 
@@ -335,10 +343,16 @@ class Connection
         }
     }
 
-    /** False once closed, or once a transport error broke the socket. */
+    /**
+     * False once closed, once a transport error broke the socket, and while a
+     * stream is still in flight. Pool::acquire/release use this as the health
+     * check, and a connection parked on a RowsChunk would answer the next
+     * borrower's statement with a leftover stream frame.
+     */
     public function isUsable(): bool
     {
-        return !$this->closed && !$this->broken && is_resource($this->sock);
+        return !$this->closed && !$this->broken && !$this->streaming
+            && is_resource($this->sock);
     }
 
     public function close(): void
@@ -363,6 +377,7 @@ class Connection
      */
     public function runQuery(string $sql, int $consistency): array
     {
+        $this->assertNotStreaming();
         $this->ensureLive();
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
@@ -381,14 +396,20 @@ class Connection
      *
      *     foreach ($db->stream('SELECT ...') as $row) { ... }
      *
-     * The connection is busy until the stream ends; breaking out of the
-     * foreach drains the remaining frames so the connection stays usable.
+     * The connection is busy for the whole stream (PROTOCOL.md §3.4): any
+     * other statement on it throws until the stream ends. Abandoning it —
+     * break, return, an exception, or just letting the generator be collected
+     * — runs the finally below, which drains the frames still in flight so the
+     * connection stays usable; a drain that cannot complete marks the
+     * connection broken instead, so it re-dials rather than answering the next
+     * statement with a leftover frame.
      * Takes no parameters — the streaming opcode carries SQL text.
      *
      * @return \Generator<int,array<string,mixed>>
      */
     public function stream(string $sql, ?int $consistency = null): \Generator
     {
+        $this->assertNotStreaming();
         $this->ensureLive();
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
@@ -396,27 +417,33 @@ class Connection
         $level = $consistency ?? $this->consistency;
         $req = pack('C', 5) . pack('C', $level) . pack('V', strlen($sql)) . $sql;
         $this->writeFrame($req);
-        $r = new Reader($this->readFrame());
-        $tag = $r->u8();
-        if ($tag === 3) {
-            $msg = $r->text();
-            throw new SkaidbException(
-                str_contains($msg, 'unknown opcode') ? "server does not support streaming: {$msg}" : $msg
-            );
-        }
-        if ($tag === 1 || $tag === 2) {
-            return; // not row-producing
-        }
-        if ($tag !== 5) {
-            throw new SkaidbException("unexpected response tag {$tag} to stream request");
-        }
-        $ncols = $r->u32();
-        $columns = [];
-        for ($i = 0; $i < $ncols; $i++) {
-            $columns[] = $r->text();
-        }
-        $live = true;
+        // Busy from the request, not from the first row: the header read below
+        // is already part of the stream's exchange.
+        $this->streaming = true;
+        $live = false; // true only once the header promises RowsChunk frames
         try {
+            $r = new Reader($this->readFrame());
+            $tag = $r->u8();
+            if ($tag === 3) {
+                $msg = $r->text();
+                throw new SkaidbException(
+                    str_contains($msg, 'unknown opcode') ? "server does not support streaming: {$msg}" : $msg
+                );
+            }
+            if ($tag === 1 || $tag === 2) {
+                return; // not row-producing
+            }
+            if ($tag !== 5) {
+                // We cannot know what else this reply left queued behind it.
+                $this->broken = true;
+                throw new SkaidbException("unexpected response tag {$tag} to stream request");
+            }
+            $ncols = $r->u32();
+            $columns = [];
+            for ($i = 0; $i < $ncols; $i++) {
+                $columns[] = $r->text();
+            }
+            $live = true;
             while ($live) {
                 $fr = new Reader($this->readFrame());
                 $t = $fr->u8();
@@ -441,15 +468,51 @@ class Connection
                 }
             }
         } finally {
-            // Abandoned early: drain so leftovers are not read as the reply
-            // to the next statement on this connection.
-            while ($live) {
-                $fr = new Reader($this->readFrame());
-                $t = $fr->u8();
-                if ($t === 7 || $t === 3) {
-                    $live = false;
+            $this->finishStream($live);
+        }
+    }
+
+    /**
+     * End a stream and hand the connection back at a request boundary.
+     *
+     * PHP runs a generator's finally when the generator is destroyed, so this
+     * covers every abandon path, including one triggered by the garbage
+     * collector. $live says whether the server still owes us frames.
+     *
+     * Draining mirrors the Rust driver's RowStream::drop: it blocks until the
+     * server finishes, so abandoning a huge scan costs the rest of that scan —
+     * close() the connection instead if that trade is wrong for the caller.
+     * Anything that stops the drain leaves unread frames on the socket, and
+     * then only $broken is truthful: ensureLive() re-dials before the next
+     * statement and isUsable() keeps the connection out of the pool.
+     */
+    private function finishStream(bool $live): void
+    {
+        try {
+            if (!$live) {
+                return;
+            }
+            if ($this->closed) {
+                return; // socket already gone; nothing can reuse it
+            }
+            if ($this->broken || !is_resource($this->sock)) {
+                $this->broken = true;
+                return;
+            }
+            while (true) {
+                $t = (new Reader($this->readFrame()))->u8();
+                if ($t === 7 || $t === 3) { // RowsEnd | Error: stream over
+                    return;
+                }
+                if ($t !== 6) { // not a RowsChunk — we have lost the framing
+                    $this->broken = true;
+                    return;
                 }
             }
+        } catch (\Throwable $e) {
+            $this->broken = true;
+        } finally {
+            $this->streaming = false;
         }
     }
 
@@ -464,6 +527,7 @@ class Connection
      */
     public function prepareServer(string $sql): array
     {
+        $this->assertNotStreaming();
         $this->ensureLive();
         if (isset($this->preparedCache[$sql])) {
             return $this->preparedCache[$sql];
@@ -586,6 +650,7 @@ class Connection
      */
     private function roundtrip(string $req): array
     {
+        $this->assertNotStreaming();
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
@@ -656,6 +721,27 @@ class Connection
     // ---- framing ----------------------------------------------------------
 
     /**
+     * Refuse to write a request while a stream is in flight.
+     *
+     * A flag rather than a lock held for the stream's duration: stream() is a
+     * generator, so its "critical section" spans arbitrary caller code between
+     * yields — there is nothing to hold a lock across, and holding one would
+     * deadlock the very common `foreach (stream()) { ... }` body that touches
+     * the same connection. Failing loudly is the honest alternative to
+     * interleaving two conversations on one socket and corrupting both.
+     */
+    private function assertNotStreaming(): void
+    {
+        if ($this->streaming) {
+            throw new SkaidbException(
+                'connection is busy streaming a result set: finish or abandon the '
+                . 'stream before running another statement on this connection '
+                . '(use a second connection to run one in parallel)'
+            );
+        }
+    }
+
+    /**
      * Re-dial if the transport died since the last statement, BEFORE anything
      * is prepared on it.
      *
@@ -716,6 +802,11 @@ class Connection
     /** Read exactly $n bytes; fread may return short, so loop. */
     private function readExact(int $n): string
     {
+        if (!is_resource($this->sock)) {
+            // A stream abandoned after close() drains through here; fread()
+            // on null would raise a TypeError out of a generator's finally.
+            throw new SkaidbException('connection is closed');
+        }
         $buf = '';
         $remaining = $n;
         while ($remaining > 0) {
