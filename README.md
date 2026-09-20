@@ -43,7 +43,7 @@ point Composer at the GitHub repository:
 composer require skaidb/skaidb:^1.0
 ```
 
-Composer resolves `^1.0` to the `v1.0.0` tag and wires `src/Skaidb.php` into
+Composer resolves `^1.0` to the `v1.0.1` tag and wires `src/Skaidb.php` into
 `vendor/autoload.php`. (Once the package is on Packagist the `repositories`
 entry becomes unnecessary; `composer require skaidb/skaidb` installs the same
 thing.)
@@ -323,7 +323,7 @@ autocommit one by one, as described above.
 
 After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
-(the package version, `1.0.0`). An older server without the opcode ignores
+(the package version, `1.0.1`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
 client-side fallback automatically), batches ≥ 0.87.0, streaming a server
 with the streaming opcode, multiple result sets a server with `EMIT`.
@@ -342,9 +342,14 @@ installs the package through Composer the way the Install section says, and
 checks that the Hello version is derived from `Skaidb::VERSION`. Tagging
 `vX.Y.Z` runs the publish workflow, which refuses a tag that does not equal
 `Skaidb::VERSION`, builds the source zip and attaches it to a GitHub
-Release. Packagist has no secret to hold: registering the repository on
-packagist.org is the whole publish step, and until that is done the GitHub
-release and the VCS install above are the channels.
+Release. Packagist has no upload: registering the repository once on
+packagist.org (Submit → this repository's URL) makes every tag a version
+there. The workflow's last step asks Packagist to re-crawl the repository
+when the `PACKAGIST_USERNAME` and `PACKAGIST_TOKEN` repository secrets are
+set (the packagist.org account name and the API token from its profile page)
+and waits until the version is listed; without them, while the package is
+not on Packagist, it logs that as a notice and the GitHub release and the
+VCS install above are the channels.
 
 ## License
 

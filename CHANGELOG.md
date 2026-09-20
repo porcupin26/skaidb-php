@@ -4,6 +4,22 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-09-20
+
+Release automation: published from GitHub Actions. No driver code changed
+except `Skaidb::VERSION`, which the Hello frame reports.
+
+### Changed
+- The Release workflow's Packagist step: with the `PACKAGIST_USERNAME` and
+  `PACKAGIST_TOKEN` repository secrets set it asks Packagist to re-crawl the
+  repository through the update API and then waits until the tagged version
+  is listed in the Composer metadata; without them, while the package is not
+  on Packagist, it logs the one-time setup as a notice and stays green. The
+  workflow also refuses a tag when `composer.json` does not name
+  `skaidb/skaidb`.
+- The workflows moved to `actions/checkout@v5` and
+  `softprops/action-gh-release@v3`, the Node 24 lines.
+
 ## [1.0.0] - 2026-09-20
 
 First release as a standalone package (`github.com/porcupin26/skaidb-php`),
@@ -62,4 +78,5 @@ end-to-end test in `tests/live/live.php` is what found the fixes below.
   or newer (the driver already used `array_is_list`).
 - The example moved from `example.php` to `examples/basic.php`.
 
+[1.0.1]: https://github.com/porcupin26/skaidb-php/releases/tag/v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-php/releases/tag/v1.0.0
