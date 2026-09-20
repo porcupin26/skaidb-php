@@ -1,10 +1,17 @@
 name: Release
 
 # Runs on every v* tag. Refuses a tag that does not equal Skaidb::VERSION,
-# builds the source zip and attaches it to a GitHub Release. Packagist is
-# registered on packagist.org, not through a secret: a PACKAGIST_USERNAME /
-# PACKAGIST_TOKEN pair, if ever added, makes the last step ping Packagist to
-# re-crawl the repository; without it the step logs a notice and exits green.
+# runs the suite, builds the source zip and attaches it to a GitHub Release.
+#
+# Packagist has no upload: a Composer package is published by registering
+# the repository once on packagist.org (Submit → the REPO_URL below), after
+# which every git tag is a version. The last step asks Packagist to re-crawl
+# the repository through its update API when the PACKAGIST_USERNAME and
+# PACKAGIST_TOKEN secrets are set (username = the packagist.org account, token
+# = the API token from that account's profile page), then waits until the
+# tagged version is listed in the Composer metadata. Without the secrets the
+# step logs a notice and exits green, so a tag never fails on a credential the
+# repository does not hold.
 
 on:
   push:
@@ -13,23 +20,32 @@ on:
 permissions:
   contents: write
 
+env:
+  PACKAGE: skaidb/skaidb
+  REPO_URL: https://github.com/porcupin26/skaidb-php
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
           extensions: pcntl, posix, sockets, openssl
           tools: composer
           coverage: none
-      - name: Tag matches Skaidb::VERSION
+      - name: Tag matches Skaidb::VERSION and composer.json names the package
         run: |
           tag="${GITHUB_REF_NAME#v}"
           ver="$(php -r 'require "src/Skaidb.php"; echo Skaidb\Skaidb::VERSION;')"
           if [ "$tag" != "$ver" ]; then
             echo "::error::tag v$tag does not match Skaidb::VERSION $ver"
+            exit 1
+          fi
+          name="$(php -r 'echo json_decode(file_get_contents("composer.json"), true)["name"];')"
+          if [ "$name" != "$PACKAGE" ]; then
+            echo "::error::composer.json names $name, this workflow publishes $PACKAGE"
             exit 1
           fi
           echo "VERSION=$ver" >> "$GITHUB_ENV"
@@ -51,10 +67,10 @@ jobs:
             on && /^## \[/ { exit }
             on { print }
           ' CHANGELOG.md > notes.md
-          printf '\nInstall: see the README — Composer with a VCS repository entry for https://github.com/porcupin26/skaidb-php and `composer require skaidb/skaidb:^%s`, or `require` `src/Skaidb.php` from the attached zip.\n' "${VERSION%.*}" >> notes.md
+          printf '\nInstall: see the README — Composer with a VCS repository entry for %s and `composer require %s:^%s`, or `require` `src/Skaidb.php` from the attached zip.\n' "$REPO_URL" "$PACKAGE" "${VERSION%.*}" >> notes.md
           cat notes.md
       - name: GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: v${{ env.VERSION }}
           body_path: notes.md
@@ -66,12 +82,46 @@ jobs:
           PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
           PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
         run: |
+          p2="https://repo.packagist.org/p2/${PACKAGE}.json"   # what Composer reads
+          page="https://packagist.org/packages/${PACKAGE}"
+          setup="One-time setup: create an account on https://packagist.org, Submit ${REPO_URL} at https://packagist.org/packages/submit, then either let the Packagist GitHub hook update it on every tag or add the repository secrets PACKAGIST_USERNAME (the packagist.org account name) and PACKAGIST_TOKEN (the API token shown on https://packagist.org/profile/) so this step triggers the update itself."
+
+          listed() {  # is the tagged version in the Composer metadata yet?
+            local code
+            code="$(curl -sS -o p2.json -w '%{http_code}' "$p2" || echo 000)"
+            [ "$code" = 200 ] || return 1
+            grep -qE "\"version\":\"v?${VERSION//./\\.}\"" p2.json
+          }
+
           if [ -z "$PACKAGIST_USERNAME" ] || [ -z "$PACKAGIST_TOKEN" ]; then
-            echo "::notice title=Packagist skipped::No PACKAGIST_USERNAME/PACKAGIST_TOKEN secret is set. Packagist is registered on packagist.org (Submit → https://github.com/porcupin26/skaidb-php), not from here; until then the GitHub Release asset and the Composer VCS install are the channels."
-            exit 0
+            code="$(curl -sS -o /dev/null -w '%{http_code}' "$p2" || echo 000)"
+            if [ "$code" != 200 ]; then
+              echo "::notice title=Packagist skipped::No PACKAGIST_USERNAME/PACKAGIST_TOKEN secrets are set and ${PACKAGE} is not on Packagist (HTTP ${code} from ${p2}). ${setup} Until then the GitHub Release and the Composer VCS install in the README are the channels."
+              exit 0
+            fi
+            echo "${PACKAGE} is on Packagist; no PACKAGIST_USERNAME/PACKAGIST_TOKEN secrets are set, so the Packagist GitHub hook has to deliver ${GITHUB_REF_NAME}."
+          else
+            code="$(curl -sS -o response.json -w '%{http_code}' -X POST \
+              "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+              -H 'Content-Type: application/json' \
+              -d "{\"repository\":{\"url\":\"${REPO_URL}\"}}" || echo 000)"
+            body="$(cat response.json 2>/dev/null || true)"
+            case "$code" in
+              2*) echo "Packagist accepted the update request (HTTP ${code}): ${body}" ;;
+              403) echo "::error title=Packagist::HTTP 403 ${body} — PACKAGIST_USERNAME/PACKAGIST_TOKEN do not match a packagist.org account (the token is on https://packagist.org/profile/)."; exit 1 ;;
+              404) echo "::error title=Packagist::HTTP 404 ${body} — ${PACKAGE} is not submitted on packagist.org yet, or that account does not maintain it. ${setup}"; exit 1 ;;
+              *)   echo "::error title=Packagist::HTTP ${code} from the update API: ${body}"; exit 1 ;;
+            esac
+            echo "$body" | grep -q '"status":"success"' || echo "::warning title=Packagist::unexpected reply shape, waiting for the version anyway: ${body}"
           fi
-          curl -sSf -X POST \
-            "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d '{"repository":{"url":"https://github.com/porcupin26/skaidb-php"}}'
-          echo "asked Packagist to re-crawl the repository"
+
+          echo "waiting for ${PACKAGE} ${GITHUB_REF_NAME} to be listed in ${p2}"
+          deadline=$((SECONDS + 600))
+          until listed; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error title=Packagist::${PACKAGE} ${GITHUB_REF_NAME} is not listed in ${p2} after 10 minutes. The GitHub Release exists; look for a crawl error on ${page}."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Packagist lists ${PACKAGE} ${GITHUB_REF_NAME}: composer require ${PACKAGE}:^${VERSION%.*} resolves it without a repositories entry."
