@@ -3,22 +3,41 @@
     "description": "Official pure-PHP client driver for skaidb, with a PDO-shaped API.",
     "type": "library",
     "license": "SSPL-1.0",
-    "keywords": ["skaidb", "database", "sql", "driver", "pdo"],
+    "keywords": [
+        "skaidb",
+        "database",
+        "sql",
+        "driver",
+        "pdo",
+        "client"
+    ],
+    "homepage": "https://github.com/porcupin26/skaidb-php",
+    "authors": [
+        {
+            "name": "skaidb",
+            "homepage": "https://skaidb.org"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/porcupin26/skaidb-php/issues",
+        "source": "https://github.com/porcupin26/skaidb-php",
+        "docs": "https://github.com/porcupin26/skaidb-php/tree/main/docs"
+    },
     "require": {
-        "php": ">=8.0",
-        "ext-hash": "*"
+        "php": ">=8.1",
+        "ext-hash": "*",
+        "ext-pcre": "*"
     },
     "suggest": {
-        "ext-sockets": "Optional; the driver uses stream sockets and works without it.",
-        "ext-bcmath": "Exact 128-bit Decimal mantissa handling (or ext-gmp).",
-        "ext-gmp": "Exact 128-bit Decimal mantissa handling (or ext-bcmath)."
+        "ext-openssl": "Required for TLS connections (tls / tlsCa / tlsInsecure)."
     },
     "autoload": {
-        "psr-4": {
-            "Skaidb\\": "src/"
-        },
         "files": [
             "src/Skaidb.php"
         ]
+    },
+    "scripts": {
+        "test": "php tests/run.php",
+        "lint": "php -l src/Skaidb.php"
     }
 }
