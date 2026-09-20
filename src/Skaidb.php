@@ -23,12 +23,13 @@ declare(strict_types=1);
  *         print_r($row);     // ['id' => 1, 'name' => 'Ada']
  *     }
  *
- * No Composer or PECL dependencies — only the bundled `hash` extension (and
- * optionally `sockets`/`bcmath`/`gmp`). Target PHP 8.0+.
+ * No Composer or PECL dependencies — only the bundled `hash` extension.
+ * Targets PHP 8.1+.
  *
- * The protocol uses '?' positional placeholders. Parameters passed to
- * `execute()` are quoted/escaped client-side (the wire protocol has no
- * server-side bind parameters), so values like "O'Brien" are safe.
+ * Placeholders are '?' (positional). With parameters, a statement is prepared
+ * on the server and the values travel as typed wire values; statements the
+ * server declines to prepare (DDL, session statements) fall back to safe
+ * client-side quoting, so values like "O'Brien" are safe on every path.
  */
 
 namespace Skaidb;
@@ -52,6 +53,94 @@ class SkaidbException extends Exception
  */
 class Unpreparable extends SkaidbException
 {
+}
+
+/**
+ * Package identity. VERSION is the single source of truth for the driver
+ * version: composer.json carries none (Composer takes it from the git tag),
+ * the Hello frame reports this value to the server, and the release
+ * workflow refuses a tag that does not equal it.
+ */
+final class Skaidb
+{
+    public const VERSION = '1.0.0';
+
+    /** The client_name the driver reports in the server's `drivers` table. */
+    public const CLIENT_NAME = 'php';
+}
+
+/**
+ * Bind a parameter as a skaidb Bytes value. A PHP string binds as String;
+ * wrap it to send the raw bytes with the Bytes tag instead.
+ *
+ *     $stmt->execute([1, new Bytes($blob)]);
+ */
+final class Bytes
+{
+    public function __construct(public readonly string $value)
+    {
+    }
+
+    public function __toString(): string
+    {
+        return $this->value;
+    }
+}
+
+/**
+ * Bind a parameter as a skaidb Decimal, from its exact decimal string form
+ * ('123.45', '-0.005'; exponent notation is not accepted). Decimal results
+ * come back as plain strings; wrap one to write it back unchanged.
+ */
+final class Decimal
+{
+    public readonly string $value;
+
+    public function __construct(string $value)
+    {
+        $value = trim($value);
+        if (preg_match('/^[+-]?\d+(\.\d+)?$/', $value) !== 1) {
+            throw new SkaidbException("not a decimal string: {$value}");
+        }
+        $this->value = $value;
+    }
+
+    public function __toString(): string
+    {
+        return $this->value;
+    }
+}
+
+/**
+ * Bind a parameter as a skaidb Uuid, from its canonical 8-4-4-4-12 form
+ * (hyphens optional, case-insensitive). Uuid results come back as canonical
+ * lowercase strings; wrap one to write it back as a Uuid.
+ */
+final class Uuid
+{
+    /** canonical lowercase 8-4-4-4-12 */
+    public readonly string $value;
+
+    public function __construct(string $value)
+    {
+        $hex = strtolower(str_replace('-', '', trim($value)));
+        if (preg_match('/^[0-9a-f]{32}$/', $hex) !== 1) {
+            throw new SkaidbException("not a uuid: {$value}");
+        }
+        $this->value = substr($hex, 0, 8) . '-' . substr($hex, 8, 4) . '-'
+            . substr($hex, 12, 4) . '-' . substr($hex, 16, 4) . '-' . substr($hex, 20, 12);
+    }
+
+    /** The 16 raw bytes (RFC 4122 byte order). */
+    public function bytes(): string
+    {
+        return hex2bin(str_replace('-', '', $this->value));
+    }
+
+    public function __toString(): string
+    {
+        return $this->value;
+    }
 }
 
 /**
@@ -223,8 +312,8 @@ class Connection
     private function sendHello(): void
     {
         try {
-            $name = 'php';
-            $ver = '0.1.0';
+            $name = Skaidb::CLIENT_NAME;
+            $ver = Skaidb::VERSION;
             $req = chr(8)
                 . pack('V', strlen($name)) . $name
                 . pack('V', strlen($ver)) . $ver;
@@ -405,16 +494,17 @@ class Connection
      * statement with a leftover frame.
      * Takes no parameters — the streaming opcode carries SQL text.
      *
+     * @param int|string|null $consistency 'ONE'/'QUORUM'/'ALL' or 0/1/2; default the connection's
      * @return \Generator<int,array<string,mixed>>
      */
-    public function stream(string $sql, ?int $consistency = null): \Generator
+    public function stream(string $sql, $consistency = null): \Generator
     {
+        $level = $consistency === null ? $this->consistency : self::resolveConsistency($consistency);
         $this->assertNotStreaming();
         $this->ensureLive();
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
-        $level = $consistency ?? $this->consistency;
         $req = pack('C', 5) . pack('C', $level) . pack('V', strlen($sql)) . $sql;
         $this->writeFrame($req);
         // Busy from the request, not from the first row: the header read below
@@ -470,7 +560,7 @@ class Connection
                         $ncells = $fr->u32();
                         $row = [];
                         for ($c = 0; $c < $ncells; $c++) {
-                            $row[$columns[$c] ?? $c] = $this->decodeValue(new Reader($fr->blob()));
+                            $row[$columns[$c] ?? $c] = self::decodeValue(new Reader($fr->blob()));
                         }
                         yield $row;
                     }
@@ -640,7 +730,17 @@ class Connection
             return pack('C', 5) . pack('V', strlen($v)) . $v;
         }
         if ($v instanceof \DateTimeInterface) {
-            return pack('C', 8) . pack('P', (int) round((float) $v->format('U.u') * 1000));
+            return pack('C', 8) . pack('P', self::toMillis($v));
+        }
+        if ($v instanceof Bytes) {
+            return pack('C', 6) . pack('V', strlen($v->value)) . $v->value;
+        }
+        if ($v instanceof Uuid) {
+            return pack('C', 7) . $v->bytes();
+        }
+        if ($v instanceof Decimal) {
+            [$mantissa, $scale] = self::splitDecimal($v->value);
+            return pack('C', 4) . self::i128FromString($mantissa) . pack('V', $scale);
         }
         if (is_array($v)) {
             // A list encodes as Array; anything else as Document.
@@ -689,7 +789,7 @@ class Connection
                 for ($c = 0; $c < $ncells; $c++) {
                     // Each cell is a length-prefixed blob holding one Value.
                     $cell = new Reader($r->blob());
-                    $row[] = $this->decodeValue($cell);
+                    $row[] = self::decodeValue($cell);
                 }
                 $rows[] = $row;
             }
@@ -710,7 +810,7 @@ class Connection
                     $ncells = $r->u32();
                     $row = [];
                     for ($c = 0; $c < $ncells; $c++) {
-                        $row[] = $this->decodeValue(new Reader($r->blob()));
+                        $row[] = self::decodeValue(new Reader($r->blob()));
                     }
                     $rows[] = $row;
                 }
@@ -837,7 +937,7 @@ class Connection
                 $meta = is_resource($this->sock) ? stream_get_meta_data($this->sock) : ['timed_out' => false];
                 if (!empty($meta['timed_out'])) {
                     $this->broken = true;
-                throw new SkaidbException('connection timed out');
+                    throw new SkaidbException('connection timed out');
                 }
                 $this->broken = true;
                 throw new SkaidbException('connection closed by server');
@@ -920,9 +1020,12 @@ class Connection
     // ---- value decoding (§4) ----------------------------------------------
 
     /**
+     * Decode one typed value (tag + payload) at the reader's position.
+     *
+     * @internal
      * @return mixed
      */
-    private function decodeValue(Reader $r)
+    public static function decodeValue(Reader $r)
     {
         $tag = $r->u8();
         switch ($tag) {
@@ -951,7 +1054,7 @@ class Connection
                 $count = $r->u32();
                 $out = [];
                 for ($i = 0; $i < $count; $i++) {
-                    $out[] = $this->decodeValue($r);
+                    $out[] = self::decodeValue($r);
                 }
                 return $out;
             case self::TAG_DOCUMENT:
@@ -959,50 +1062,143 @@ class Connection
                 $out = [];
                 for ($i = 0; $i < $count; $i++) {
                     $key = $r->text();
-                    $out[$key] = $this->decodeValue($r);
+                    $out[$key] = self::decodeValue($r);
                 }
                 return $out;
         }
         throw new SkaidbException("unknown value tag {$tag}");
     }
 
-    /** Convert a 16-byte little-endian two's-complement integer to a decimal string. */
+    /**
+     * Unix milliseconds for a DateTimeInterface, exactly: seconds * 1000 plus
+     * the microseconds truncated to milliseconds (no float in between).
+     */
+    private static function toMillis(\DateTimeInterface $dt): int
+    {
+        return (int) $dt->format('U') * 1000 + intdiv((int) $dt->format('u'), 1000);
+    }
+
+    /**
+     * Convert a 16-byte little-endian two's-complement integer to a decimal
+     * string, exactly, with no bigint extension: schoolbook base-256 → base-10
+     * on a digit string.
+     */
     private static function i128ToString(string $bytes): string
     {
-        // Determine sign from the most-significant byte (last byte, LE).
         $negative = (ord($bytes[15]) & 0x80) !== 0;
-
-        if (function_exists('gmp_init')) {
-            $hex = bin2hex(strrev($bytes)); // big-endian hex
-            $val = gmp_init($hex, 16);
-            if ($negative) {
-                // two's complement: subtract 2^128
-                $val = gmp_sub($val, gmp_pow(2, 128));
-            }
-            return gmp_strval($val);
+        if ($negative) {
+            $bytes = self::negate128($bytes);
         }
-
-        if (function_exists('bcadd')) {
-            // Build magnitude via bcmath from big-endian bytes.
-            $beBytes = strrev($bytes);
-            $val = '0';
-            for ($i = 0; $i < 16; $i++) {
-                $val = bcadd(bcmul($val, '256'), (string) ord($beBytes[$i]));
-            }
-            if ($negative) {
-                // two's complement: value - 2^128
-                $two128 = bcpow('2', '128');
-                $val = bcsub($val, $two128);
-            }
-            return $val;
+        $dec = '0';
+        for ($i = 15; $i >= 0; $i--) {
+            $dec = self::decMulAdd($dec, 256, ord($bytes[$i]));
         }
+        return ($negative && $dec !== '0' ? '-' : '') . $dec;
+    }
 
-        // Fallback: no bigint library. Interpret the low 64 bits as a signed
-        // i64 (correct for any mantissa that fits in 64 bits — the common case;
-        // larger mantissas may be approximate). 'P' = u64 LE, and on 64-bit PHP
-        // a set top bit already yields the correct signed two's-complement int.
-        $low = substr($bytes, 0, 8);
-        return (string) unpack('P', $low)[1];
+    /**
+     * Encode a decimal integer string as a 16-byte little-endian two's
+     * complement i128. Throws when the magnitude does not fit.
+     */
+    private static function i128FromString(string $dec): string
+    {
+        $negative = $dec !== '' && $dec[0] === '-';
+        $dec = ltrim(ltrim($dec, '+-'), '0');
+        if ($dec === '') {
+            return str_repeat("\0", 16);
+        }
+        $bytes = '';
+        while ($dec !== '0') {
+            [$dec, $rem] = self::decDivMod($dec, 256);
+            $bytes .= chr($rem);
+            if (strlen($bytes) > 16) {
+                throw new SkaidbException('decimal mantissa does not fit 128 bits');
+            }
+        }
+        $bytes = str_pad($bytes, 16, "\0");
+        $top = ord($bytes[15]);
+        if ($negative) {
+            // Magnitudes up to 2^127 inclusive are representable as negatives.
+            if ($top > 0x80 || ($top === 0x80 && rtrim(substr($bytes, 0, 15), "\0") !== '')) {
+                throw new SkaidbException('decimal mantissa does not fit 128 bits');
+            }
+            return self::negate128($bytes);
+        }
+        if ($top >= 0x80) {
+            throw new SkaidbException('decimal mantissa does not fit 128 bits');
+        }
+        return $bytes;
+    }
+
+    /** Two's-complement negation of a 16-byte LE integer. */
+    private static function negate128(string $bytes): string
+    {
+        $bytes = ~$bytes;
+        for ($i = 0; $i < 16; $i++) {
+            $b = ord($bytes[$i]) + 1;
+            $bytes[$i] = chr($b & 0xff);
+            if ($b <= 0xff) {
+                break;
+            }
+        }
+        return $bytes;
+    }
+
+    /**
+     * ('123.45') → ['12345', 2]; ('-7') → ['-7', 0]. The text was validated
+     * by Decimal's constructor.
+     *
+     * @return array{0:string,1:int}
+     */
+    private static function splitDecimal(string $text): array
+    {
+        $neg = $text[0] === '-';
+        $text = ltrim($text, '+-');
+        $dot = strpos($text, '.');
+        $scale = $dot === false ? 0 : strlen($text) - $dot - 1;
+        $digits = ltrim(str_replace('.', '', $text), '0');
+        if ($digits === '') {
+            $digits = '0';
+            $neg = false;
+        }
+        return [($neg ? '-' : '') . $digits, $scale];
+    }
+
+    /** Digit-string arithmetic: $dec * $mul + $add. */
+    private static function decMulAdd(string $dec, int $mul, int $add): string
+    {
+        $out = '';
+        $carry = $add;
+        for ($i = strlen($dec) - 1; $i >= 0; $i--) {
+            $v = (int) $dec[$i] * $mul + $carry;
+            $out .= chr(48 + $v % 10);
+            $carry = intdiv($v, 10);
+        }
+        while ($carry > 0) {
+            $out .= chr(48 + $carry % 10);
+            $carry = intdiv($carry, 10);
+        }
+        $out = ltrim(strrev($out), '0');
+        return $out === '' ? '0' : $out;
+    }
+
+    /**
+     * Digit-string arithmetic: [$dec / $div, $dec % $div].
+     *
+     * @return array{0:string,1:int}
+     */
+    private static function decDivMod(string $dec, int $div): array
+    {
+        $out = '';
+        $rem = 0;
+        $n = strlen($dec);
+        for ($i = 0; $i < $n; $i++) {
+            $rem = $rem * 10 + (int) $dec[$i];
+            $out .= chr(48 + intdiv($rem, $div));
+            $rem %= $div;
+        }
+        $out = ltrim($out, '0');
+        return [$out === '' ? '0' : $out, $rem];
     }
 
     /**
@@ -1147,15 +1343,24 @@ class Connection
             if ($s === false) {
                 throw new SkaidbException('cannot bind float value');
             }
+            // json_encode(2.0) is "2": keep an integral float a Float literal.
+            if (strpbrk($s, '.eE') === false) {
+                $s .= '.0';
+            }
             return $s;
         }
         if (is_string($arg)) {
             return "'" . str_replace("'", "''", $arg) . "'";
         }
-        if ($arg instanceof DateTimeImmutable || $arg instanceof \DateTimeInterface) {
+        if ($arg instanceof \DateTimeInterface) {
             // Bind as unix milliseconds.
-            $ms = (int) round((float) $arg->format('U.u') * 1000);
-            return (string) $ms;
+            return (string) self::toMillis($arg);
+        }
+        if ($arg instanceof Decimal) {
+            return $arg->value; // a numeric literal; the server reads it as a number
+        }
+        if ($arg instanceof Bytes) {
+            return "'" . bin2hex($arg->value) . "'"; // hex text: SQL has no bytes literal
         }
         if (is_object($arg) && method_exists($arg, '__toString')) {
             return "'" . str_replace("'", "''", (string) $arg) . "'";
@@ -1220,6 +1425,9 @@ class Statement
 
     private bool $isRows = false;
 
+    /** @var array<int,array{columns:array<int,string>,rows:array<int,array<int,mixed>>}>|null */
+    private ?array $resultSets = null;
+
     public function __construct(Connection $conn, string $sql)
     {
         $this->conn = $conn;
@@ -1235,12 +1443,6 @@ class Statement
         return $this;
     }
 
-    /**
-     * Bind $params into the SQL and run it. Returns true on success (mirrors
-     * PDOStatement::execute, which returns bool). Throws on error.
-     *
-     * @param array<int,mixed> $params positional values for '?' placeholders
-     */
     /**
      * Execute this statement once per row in ONE round-trip. Rows autocommit
      * individually: a failure names the row and earlier rows stay applied,
@@ -1269,6 +1471,16 @@ class Statement
         return $res['affected'];
     }
 
+    /**
+     * Bind $params into the SQL and run it. Returns true on success (mirrors
+     * PDOStatement::execute, which returns bool). Throws on error.
+     *
+     * With parameters the statement is prepared on the server (cached per
+     * connection) and the values travel typed; if the server declines to
+     * prepare it (DDL, session statements) the values are quoted client-side.
+     *
+     * @param array<int,mixed> $params positional values for '?' placeholders
+     */
     public function execute(array $params = []): bool
     {
         $res = null;
@@ -1284,14 +1496,28 @@ class Statement
                 }
                 $res = $this->conn->execPrepared($id, array_values($params), $this->consistency);
             } catch (Unpreparable $e) {
-                $res = null; // fall through to text binding
+                $unpreparable = $e; // fall through to text binding
             }
         }
         if ($res === null) {
-            $bound = Connection::bindParams($this->sql, $params);
+            try {
+                $bound = Connection::bindParams($this->sql, $params);
+            } catch (SkaidbException $e) {
+                if (isset($unpreparable)) {
+                    // The text path cannot carry this value; the real reason
+                    // is whatever made the server decline to prepare it
+                    // (often a syntax error), so say so.
+                    throw new SkaidbException(
+                        $e->getMessage() . ' via client-side binding; the server declined to '
+                        . 'prepare the statement: ' . $unpreparable->getMessage()
+                    );
+                }
+                throw $e;
+            }
             $res = $this->conn->runQuery($bound, $this->consistency);
         }
         $this->pos = 0;
+        $this->resultSets = $res['result_sets'] ?? null;
         if ($res['kind'] === 'rows') {
             $this->isRows = true;
             $this->columns = $res['columns'];
@@ -1373,6 +1599,33 @@ class Statement
     public function columns(): array
     {
         return $this->columns;
+    }
+
+    /**
+     * Every result set of a CALL whose body EMITted, in emission order, each
+     * as ['columns' => [...], 'rows' => [assoc rows]]. The last one is also
+     * what fetch()/fetchAll() return. Null for every other statement.
+     *
+     * @return array<int,array{columns:array<int,string>,rows:array<int,array<string,mixed>>}>|null
+     */
+    public function resultSets(): ?array
+    {
+        if ($this->resultSets === null) {
+            return null;
+        }
+        $out = [];
+        foreach ($this->resultSets as $set) {
+            $rows = [];
+            foreach ($set['rows'] as $row) {
+                $assoc = [];
+                foreach ($set['columns'] as $i => $name) {
+                    $assoc[$name] = $row[$i] ?? null;
+                }
+                $rows[] = $assoc;
+            }
+            $out[] = ['columns' => $set['columns'], 'rows' => $rows];
+        }
+        return $out;
     }
 
     /**
@@ -1485,7 +1738,7 @@ class Reader
  * pays off in a worker or a long-running CLI job, not in a plain web request
  * that opens one connection and exits.
  *
- *     $pool = new Skaidb\Pool(['127.0.0.1', 7441], 8);
+ *     $pool = new Skaidb\Pool(['127.0.0.1', 7000, 'app', 'secret'], 8);
  *     $n = $pool->withConnection(fn ($c) => $c->exec('SELECT 1'));
  *     $pool->close();
  */
