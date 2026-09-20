@@ -141,6 +141,9 @@ final class FakeServer
     /** True inside the forked child, which must not tear the parent's state down. */
     private bool $child = false;
 
+    /** Set by SIGUSR1; the select loop closes every client at its next safe point. */
+    private bool $dropAll = false;
+
     /**
      * @param array{password?:string, handle?:callable, corruptServerSignature?:bool} $opts
      *   password — the one password every user has (default 'secret').
@@ -171,7 +174,14 @@ final class FakeServer
             throw new \RuntimeException('pcntl_fork failed');
         }
         if ($pid === 0) {
-            $this->serve(); // never returns
+            // The child must never return into the test code: whatever
+            // happens in serve(), it ends here.
+            try {
+                $this->serve();
+            } catch (\Throwable $e) {
+                fwrite(STDERR, 'fake server died: ' . $e->getMessage() . "\n");
+            }
+            exit(1);
         }
         $this->pid = $pid;
         fclose($this->listener);
@@ -242,18 +252,22 @@ final class FakeServer
         pcntl_signal(SIGTERM, function () {
             exit(0);
         });
-        pcntl_signal(SIGUSR1, function () use (&$conns) {
-            foreach ($conns as $c) {
-                if (is_resource($c['sock'])) {
-                    fclose($c['sock']);
-                }
-            }
-            $conns = [];
+        // The handler only raises a flag: closing sockets from inside an
+        // async signal handler races the read loop below.
+        pcntl_signal(SIGUSR1, function () {
+            $this->dropAll = true;
         });
         stream_set_blocking($this->listener, false);
         while (true) {
             if (posix_getppid() === 1) {
                 exit(0); // the test process is gone
+            }
+            if ($this->dropAll) {
+                $this->dropAll = false;
+                foreach ($conns as $c) {
+                    fclose($c['sock']);
+                }
+                $conns = [];
             }
             $read = [$this->listener];
             foreach ($conns as $c) {
