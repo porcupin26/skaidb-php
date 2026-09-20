@@ -1,0 +1,77 @@
+name: Release
+
+# Runs on every v* tag. Refuses a tag that does not equal Skaidb::VERSION,
+# builds the source zip and attaches it to a GitHub Release. Packagist is
+# registered on packagist.org, not through a secret: a PACKAGIST_USERNAME /
+# PACKAGIST_TOKEN pair, if ever added, makes the last step ping Packagist to
+# re-crawl the repository; without it the step logs a notice and exits green.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pcntl, posix, sockets, openssl
+          tools: composer
+          coverage: none
+      - name: Tag matches Skaidb::VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(php -r 'require "src/Skaidb.php"; echo Skaidb\Skaidb::VERSION;')"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag does not match Skaidb::VERSION $ver"
+            exit 1
+          fi
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+      - name: Tests
+        run: php tests/run.php
+      - name: composer validate --strict
+        run: composer validate --strict
+      - name: Build the distributable
+        run: |
+          name="skaidb-php-${VERSION}"
+          git archive --format=zip --prefix="${name}/" -o "${name}.zip" "$GITHUB_REF_NAME" \
+            src composer.json README.md LICENSE CHANGELOG.md docs examples
+          sha256sum "${name}.zip" > "${name}.zip.sha256"
+          unzip -l "${name}.zip"
+      - name: Release notes from the CHANGELOG
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          printf '\nInstall: see the README — Composer with a VCS repository entry for https://github.com/porcupin26/skaidb-php and `composer require skaidb/skaidb:^%s`, or `require` `src/Skaidb.php` from the attached zip.\n' "${VERSION%.*}" >> notes.md
+          cat notes.md
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ env.VERSION }}
+          body_path: notes.md
+          files: |
+            skaidb-php-${{ env.VERSION }}.zip
+            skaidb-php-${{ env.VERSION }}.zip.sha256
+      - name: Packagist
+        env:
+          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        run: |
+          if [ -z "$PACKAGIST_USERNAME" ] || [ -z "$PACKAGIST_TOKEN" ]; then
+            echo "::notice title=Packagist skipped::No PACKAGIST_USERNAME/PACKAGIST_TOKEN secret is set. Packagist is registered on packagist.org (Submit → https://github.com/porcupin26/skaidb-php), not from here; until then the GitHub Release asset and the Composer VCS install are the channels."
+            exit 0
+          fi
+          curl -sSf -X POST \
+            "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d '{"repository":{"url":"https://github.com/porcupin26/skaidb-php"}}'
+          echo "asked Packagist to re-crawl the repository"

@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    name: php ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pcntl, posix, sockets, openssl
+          tools: composer
+          coverage: none
+      - name: Syntax
+        run: |
+          for f in src/Skaidb.php tests/*.php tests/live/*.php examples/*.php; do php -l "$f"; done
+      - name: Unit tests (in-process fake server, no skaidb needed)
+        run: php tests/run.php
+      - name: Live test skips itself without a server
+        run: php tests/live/live.php
+      - name: composer validate --strict
+        run: composer validate --strict
+      - name: Hello version equals the package version
+        run: |
+          php -r '
+            require "src/Skaidb.php";
+            $src = file_get_contents("src/Skaidb.php");
+            $hello = substr($src, strpos($src, "function sendHello"), 600);
+            if (!str_contains($hello, "Skaidb::VERSION") || preg_match("/\x27\d+\.\d+\.\d+\x27/", $hello) === 1) {
+              fwrite(STDERR, "sendHello() no longer derives the Hello version from Skaidb::VERSION\n");
+              exit(1);
+            }
+            if (preg_match("/^\d+\.\d+\.\d+$/", Skaidb\Skaidb::VERSION) !== 1) {
+              fwrite(STDERR, "Skaidb::VERSION is not a semver triple\n");
+              exit(1);
+            }
+            $c = json_decode(file_get_contents("composer.json"), true);
+            if (isset($c["version"])) {
+              fwrite(STDERR, "composer.json must not carry a version: the git tag is the version\n");
+              exit(1);
+            }
+            if (!str_contains(file_get_contents("CHANGELOG.md"), "## [" . Skaidb\Skaidb::VERSION . "]")) {
+              fwrite(STDERR, "CHANGELOG.md has no entry for " . Skaidb\Skaidb::VERSION . "\n");
+              exit(1);
+            }
+            echo "Hello version source: Skaidb::VERSION ", Skaidb\Skaidb::VERSION, "\n";
+          '
+
+  install:
+    name: Composer install as a consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer
+          coverage: none
+      - name: Install this checkout through a VCS repository entry
+        # The same shape the README gives, pointed at the checkout instead
+        # of GitHub so it also works on a branch that has no tag yet.
+        run: |
+          git branch -f ci-consumer HEAD
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          composer init --no-interaction --name consumer/app --stability dev
+          composer config repositories.skaidb vcs "file://$GITHUB_WORKSPACE"
+          composer require --no-interaction skaidb/skaidb:dev-ci-consumer
+          php -r '
+            require "vendor/autoload.php";
+            echo "installed skaidb/skaidb, Skaidb::VERSION = ", Skaidb\Skaidb::VERSION, "\n";
+            new Skaidb\Uuid("123e4567-e89b-12d3-a456-426614174000");
+            new Skaidb\Decimal("1.5");
+          '
+      - name: Install the tagged release from GitHub, as the README says
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          COMPOSER_AUTH: '{"github-oauth": {"github.com": "${{ secrets.GITHUB_TOKEN }}"}}'
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          constraint="^${ver%%.*}.$(echo "$ver" | cut -d. -f2)"
+          mkdir -p /tmp/consumer2 && cd /tmp/consumer2
+          composer init --no-interaction --name consumer/app
+          composer config repositories.skaidb vcs https://github.com/porcupin26/skaidb-php
+          composer require --no-interaction "skaidb/skaidb:${constraint}"
+          php -r 'require "vendor/autoload.php"; echo "installed Skaidb::VERSION = ", Skaidb\Skaidb::VERSION, "\n";'
+          installed="$(composer show skaidb/skaidb | awk '/^versions/ {print $NF}')"
+          test "$installed" = "v${ver}" || { echo "::error::composer installed $installed, expected v${ver}"; exit 1; }
