@@ -876,7 +876,7 @@
     }
   ],
   "format_version": 1,
-  "generator": "skaidb-conformance 0.306.0",
+  "generator": "skaidb-conformance (cargo run -p skaidb-conformance -- --write)",
   "ignorable_requests": {
     "about": "Requests a driver may send at its own discretion between or around cases; the fake server answers them and does not count them against a case.",
     "ddl_payload": "02",
