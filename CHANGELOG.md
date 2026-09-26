@@ -4,6 +4,34 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-09-26
+
+### Added
+- The shared skaidb wire-protocol conformance suite:
+  `conformance/vectors.json` and `conformance/README.md`, vendored
+  byte-identical from <https://skaidb.org/conformance/vectors.json>, and
+  `tests/conformance.test.php`, which runs the value and SCRAM vectors, the
+  three auth outcomes and every case through the public API against a
+  scripted fake server replaying the server's reference bytes. CI fails when
+  the vendored vectors differ from the published copy.
+- Certificate login: `tlsClientCert` / `tlsClientKey` present a TLS client
+  certificate (either implies TLS), and `authMechanism: 'certificate'` logs
+  in with it (wire mechanism EXTERNAL, PROTOCOL.md §2.4) — the certificate's
+  Common Name is the user and no password is sent. The default user
+  `'anonymous'` sends no username claim; any other `user` is sent for the
+  server to check against the Common Name.
+- `Statement::kind()`: `'rows'`, `'mutation'` or `'ddl'` for the last
+  `execute()`, so a DDL acknowledgement is distinguishable from a mutation
+  that affected zero rows.
+- `stream()`'s generator returns `['kind', 'columns', 'affected']` once it
+  has finished (`getReturn()`).
+
+### Fixed
+- Found by the conformance suite: `stream()` lost the column names of a
+  result with no rows and the affected-row count of a non-row statement
+  (`DELETE` streamed through `OP_QUERY_STREAM`); both are now in the
+  generator's return value.
+
 ## [1.0.1] - 2026-09-20
 
 Release automation: published from GitHub Actions. No driver code changed

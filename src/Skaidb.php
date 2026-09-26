@@ -63,7 +63,7 @@ class Unpreparable extends SkaidbException
  */
 final class Skaidb
 {
-    public const VERSION = '1.0.1';
+    public const VERSION = '1.1.0';
 
     /** The client_name the driver reports in the server's `drivers` table. */
     public const CLIENT_NAME = 'php';
@@ -203,6 +203,10 @@ class Connection
      * @param string     $password    password (empty for anonymous)
      * @param int|string $consistency 'ONE'/'QUORUM'/'ALL' or 0/1/2 (default QUORUM)
      * @param float      $timeout     connect/read timeout in seconds
+     * @param string|null $tlsClientCert PEM client certificate presented in the TLS handshake (implies TLS)
+     * @param string|null $tlsClientKey  PEM private key for it, when not in the certificate file
+     * @param string     $authMechanism 'scram' (username + password) or 'certificate'
+     *                                  (the client certificate is the login; wire mechanism EXTERNAL)
      *
      * @throws SkaidbException on connect or auth failure
      */
@@ -218,13 +222,29 @@ class Connection
         ?string $tlsCa = null,
         bool $tlsInsecure = false,
         string $tlsServerName = 'skaidb',
-        array $seeds = []
+        array $seeds = [],
+        ?string $tlsClientCert = null,
+        ?string $tlsClientKey = null,
+        string $authMechanism = 'scram'
     ) {
         $this->consistency = self::resolveConsistency($consistency);
+        $certAuth = self::resolveAuthMechanism($authMechanism);
+        if ($tlsClientCert === '') {
+            $tlsClientCert = null;
+        }
+        if ($tlsClientKey !== null && $tlsClientKey !== '' && $tlsClientCert === null) {
+            throw new SkaidbException('tlsClientKey needs tlsClientCert');
+        }
+        if ($certAuth && $tlsClientCert === null) {
+            throw new SkaidbException(
+                "authMechanism 'certificate' needs a TLS client certificate (tlsClientCert)"
+            );
+        }
         // Retained so a reconnect repeats the original connect exactly.
         $this->dialArgs = compact(
             'host', 'port', 'user', 'password', 'timeout', 'database',
-            'tls', 'tlsCa', 'tlsInsecure', 'tlsServerName', 'seeds'
+            'tls', 'tlsCa', 'tlsInsecure', 'tlsServerName', 'seeds',
+            'tlsClientCert', 'tlsClientKey', 'certAuth'
         );
         $this->dial();
     }
@@ -241,9 +261,9 @@ class Connection
         $errno = 0;
         $errstr = '';
         // A server with client_tls = required refuses plaintext outright, so
-        // without TLS such a cluster is simply unreachable. Any of the three
-        // knobs turns it on.
-        $tls = $tls || $tlsCa !== null || $tlsInsecure;
+        // without TLS such a cluster is simply unreachable. Any of the TLS
+        // knobs turns it on, a client certificate included.
+        $tls = $tls || $tlsCa !== null || $tlsInsecure || $tlsClientCert !== null;
         $opts = ['socket' => ['tcp_nodelay' => true]];
         if ($tls) {
             // peer_name is SNI *and* the verified name; skaidb's certs carry
@@ -257,6 +277,15 @@ class Connection
             ];
             if ($tlsCa !== null && $tlsCa !== '') {
                 $opts['ssl']['cafile'] = $tlsCa;
+            }
+            if ($tlsClientCert !== null) {
+                // Presented during the TLS handshake. With the certificate
+                // mechanism it is the login; otherwise it only satisfies a
+                // listener that verifies client certificates.
+                $opts['ssl']['local_cert'] = $tlsClientCert;
+                if ($tlsClientKey !== null && $tlsClientKey !== '') {
+                    $opts['ssl']['local_pk'] = $tlsClientKey;
+                }
             }
         }
         $ctx = stream_context_create($opts);
@@ -290,7 +319,13 @@ class Connection
         stream_set_timeout($this->sock, (int) $timeout, (int) (($timeout - (int) $timeout) * 1_000_000));
 
         try {
-            $this->handshake($user, $password);
+            if ($certAuth) {
+                // 'anonymous' is only the constructor's default, not a
+                // claim: send no username and let the certificate name it.
+                $this->handshakeCertificate($user === 'anonymous' ? '' : $user);
+            } else {
+                $this->handshake($user, $password);
+            }
         } catch (SkaidbException $e) {
             $this->close();
             throw $e;
@@ -347,6 +382,21 @@ class Connection
             throw new SkaidbException("invalid consistency {$value}");
         }
         return self::CONSISTENCY_BY_NAME[$key];
+    }
+
+    /**
+     * 'scram'/'password' → false, 'certificate'/'external'/'x509' → true.
+     */
+    private static function resolveAuthMechanism(string $mechanism): bool
+    {
+        $m = strtolower($mechanism);
+        if (in_array($m, ['scram', 'password'], true)) {
+            return false;
+        }
+        if (in_array($m, ['certificate', 'external', 'x509'], true)) {
+            return true;
+        }
+        throw new SkaidbException("unknown authMechanism {$mechanism} (use 'scram' or 'certificate')");
     }
 
     /** Set the default consistency level for subsequent queries. */
@@ -494,8 +544,13 @@ class Connection
      * statement with a leftover frame.
      * Takes no parameters — the streaming opcode carries SQL text.
      *
+     * Once the generator has run to the end, getReturn() describes the
+     * statement: ['kind' => 'rows'|'mutation'|'ddl', 'columns' => [...],
+     * 'affected' => int]. That is how a stream with no rows still reports its
+     * column names, and how a non-row statement reports its affected count.
+     *
      * @param int|string|null $consistency 'ONE'/'QUORUM'/'ALL' or 0/1/2; default the connection's
-     * @return \Generator<int,array<string,mixed>>
+     * @return \Generator<int,array<string,mixed>,mixed,array{kind:string,columns:array<int,string>,affected:int}>
      */
     public function stream(string $sql, $consistency = null): \Generator
     {
@@ -528,8 +583,11 @@ class Connection
                     str_contains($msg, 'unknown opcode') ? "server does not support streaming: {$msg}" : $msg
                 );
             }
-            if ($tag === 1 || $tag === 2) {
-                return; // not row-producing
+            if ($tag === 1) { // Mutation: not row-producing
+                return ['kind' => 'mutation', 'columns' => [], 'affected' => $r->u64()];
+            }
+            if ($tag === 2) { // Ddl
+                return ['kind' => 'ddl', 'columns' => [], 'affected' => 0];
             }
             if ($tag !== 5) {
                 // We cannot know what else this reply left queued behind it.
@@ -574,6 +632,7 @@ class Connection
                     throw new SkaidbException("unexpected frame tag {$t} in stream");
                 }
             }
+            return ['kind' => 'rows', 'columns' => $columns, 'affected' => 0];
         } finally {
             $this->finishStream($live);
         }
@@ -968,8 +1027,7 @@ class Connection
         $iterations = $r->u32();
         $serverNonce = $r->text();
 
-        $saltHex = bin2hex($salt); // lowercase hex
-        $authMessage = implode("\0", [$user, $clientNonce, $serverNonce, $saltHex, (string) $iterations]);
+        $authMessage = self::authMessage($user, $clientNonce, $serverNonce, $salt, $iterations);
 
         [$proof, $expectedServerSig] = self::scram($password, $salt, $iterations, $authMessage);
 
@@ -992,14 +1050,70 @@ class Connection
     }
 
     /**
+     * EXTERNAL (§2.4): the TLS client certificate is the credential; its
+     * Common Name is the username, and $user is empty or must equal it. No
+     * exchange follows AuthStart. The outcome's signature is 32 zero bytes
+     * and is deliberately not checked: TLS already authenticated the server.
+     */
+    private function handshakeCertificate(string $user): void
+    {
+        $this->writeFrame(self::authStartExternal($user));
+        $r = new Reader($this->readFrame());
+        if ($r->u8() !== 13) {
+            throw new SkaidbException('bad handshake outcome');
+        }
+        if ($r->u8() !== 1) {
+            throw new SkaidbException('authentication denied: ' . $r->text());
+        }
+    }
+
+    /**
+     * AuthStart for EXTERNAL: tag 10, str username, an empty client nonce,
+     * mechanism byte 2.
+     *
+     * @internal
+     */
+    public static function authStartExternal(string $user): string
+    {
+        return pack('C', 10) . self::encStr($user) . self::encStr('') . pack('C', 2);
+    }
+
+    /**
+     * The SCRAM auth message (§2.1): the NUL-joined username, client nonce,
+     * server nonce, lowercase-hex salt and decimal iteration count.
+     *
+     * @internal
+     */
+    public static function authMessage(
+        string $user,
+        string $clientNonce,
+        string $serverNonce,
+        string $salt,
+        int $iterations
+    ): string {
+        return implode("\0", [$user, $clientNonce, $serverNonce, bin2hex($salt), (string) $iterations]);
+    }
+
+    /**
+     * PBKDF2-HMAC-SHA-256 of the password, 32 raw bytes.
+     *
+     * @internal
+     */
+    public static function saltedPassword(string $password, string $salt, int $iterations): string
+    {
+        return hash_pbkdf2('sha256', $password, $salt, $iterations, 32, true);
+    }
+
+    /**
      * Compute the SCRAM-SHA-256 client proof and expected server signature.
      * All crypto outputs are RAW bytes.
      *
+     * @internal
      * @return array{0:string,1:string} [proof, expectedServerSig]
      */
-    private static function scram(string $password, string $salt, int $iterations, string $authMessage): array
+    public static function scram(string $password, string $salt, int $iterations, string $authMessage): array
     {
-        $salted = hash_pbkdf2('sha256', $password, $salt, $iterations, 32, true); // 32 raw bytes
+        $salted = self::saltedPassword($password, $salt, $iterations);
         $clientKey = hash_hmac('sha256', 'Client Key', $salted, true);            // HMAC(key=salted, msg)
         $storedKey = hash('sha256', $clientKey, true);
         $clientSig = hash_hmac('sha256', $authMessage, $storedKey, true);
@@ -1425,6 +1539,8 @@ class Statement
 
     private bool $isRows = false;
 
+    private string $kind = '';
+
     /** @var array<int,array{columns:array<int,string>,rows:array<int,array<int,mixed>>}>|null */
     private ?array $resultSets = null;
 
@@ -1518,6 +1634,7 @@ class Statement
         }
         $this->pos = 0;
         $this->resultSets = $res['result_sets'] ?? null;
+        $this->kind = $res['kind'];
         if ($res['kind'] === 'rows') {
             $this->isRows = true;
             $this->columns = $res['columns'];
@@ -1587,6 +1704,16 @@ class Statement
     public function rowCount(): int
     {
         return $this->isRows ? count($this->rows) : $this->affected;
+    }
+
+    /**
+     * What the last execute() returned: 'rows' (a result set, possibly with
+     * no rows), 'mutation' (an affected-row count, see rowCount()) or 'ddl'
+     * (a bare acknowledgement). '' before the first execute().
+     */
+    public function kind(): string
+    {
+        return $this->kind;
     }
 
     /** Number of columns in the result set. */

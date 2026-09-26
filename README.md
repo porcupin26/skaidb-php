@@ -43,7 +43,7 @@ point Composer at the GitHub repository:
 composer require skaidb/skaidb:^1.0
 ```
 
-Composer resolves `^1.0` to the `v1.0.1` tag and wires `src/Skaidb.php` into
+Composer resolves `^1.0` to the newest `v1.x` tag and wires `src/Skaidb.php` into
 `vendor/autoload.php`. (Once the package is on Packagist the `repositories`
 entry becomes unnecessary; `composer require skaidb/skaidb` installs the same
 thing.)
@@ -93,7 +93,10 @@ new Connection(
     ?string $tlsCa = null,
     bool $tlsInsecure = false,
     string $tlsServerName = 'skaidb',
-    array $seeds = []                // ['db1:7000', 'db2:7000']; wins over host/port when given
+    array $seeds = [],               // ['db1:7000', 'db2:7000']; wins over host/port when given
+    ?string $tlsClientCert = null,   // PEM client certificate presented in TLS; implies TLS
+    ?string $tlsClientKey = null,    // its PEM key, when not in the certificate file
+    string $authMechanism = 'scram'  // 'scram' (user + password) or 'certificate'
 );
 ```
 
@@ -108,6 +111,8 @@ $db = new Connection(user: 'app', password: $pw, database: 'app',
 The constructor connects and runs the SCRAM-SHA-256 handshake; it throws
 `Skaidb\SkaidbException` on a connect or authentication failure. With a
 non-empty password the server's signature is verified too (mutual auth).
+With `authMechanism: 'certificate'` the TLS client certificate is the login
+instead (see TLS below).
 
 ### Seeds and failover
 
@@ -126,6 +131,8 @@ survives the node it was talking to going away.
 | `tlsCa: '/path/ca.crt'` | TLS, certificate verified against this PEM bundle. Implies `tls`. |
 | `tlsInsecure: true` | TLS with **no** certificate verification: encrypts, authenticates nothing. Development only. Implies `tls`. |
 | `tlsServerName` | SNI and the name the certificate is verified against (default `skaidb`). Must match a SAN on the server certificate, which is usually *not* the address you dialled — skaidb's own certificates carry `DNS:skaidb`. |
+| `tlsClientCert` / `tlsClientKey` | PEM client certificate (and key, unless the certificate file holds it) presented in the TLS handshake. Implies `tls`. |
+| `authMechanism: 'certificate'` | Log in with that client certificate (wire mechanism EXTERNAL): its Common Name is the user and no password is sent. The server needs `auth.x509_enabled`. Pass `user` only to assert the expected identity. |
 
 See [docs/tls.md](docs/tls.md).
 
@@ -218,7 +225,9 @@ foreach ($db->stream('SELECT id, v FROM readings') as $row) {
 ```
 
 It takes **no parameters** (the streaming opcode carries SQL text only). A
-non-row statement streamed this way yields nothing. An error before any row
+non-row statement streamed this way yields nothing; once the generator has
+finished, `getReturn()` gives `['kind' => 'rows'|'mutation'|'ddl',
+'columns' => [...], 'affected' => n]`. An error before any row
 is an ordinary statement error; an error partway through (a node dying
 mid-scan, a scan budget tripping) is thrown after the rows already yielded,
 which are valid. On a cluster, name the columns: a bare `SELECT *` only
@@ -323,7 +332,7 @@ autocommit one by one, as described above.
 
 After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
-(the package version, `1.0.1`). An older server without the opcode ignores
+(the package version, `1.1.0`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
 client-side fallback automatically), batches ≥ 0.87.0, streaming a server
 with the streaming opcode, multiple result sets a server with `EMIT`.
@@ -336,6 +345,24 @@ SKAIDB_HOST=127.0.0.1 SKAIDB_PORT=7000 SKAIDB_USER=admin SKAIDB_PASSWORD=pw \
     php tests/live/live.php       # end-to-end against a real node (skipped when SKAIDB_HOST is unset)
 php examples/basic.php host 7000 user password
 ```
+
+## Conformance
+
+`tests/conformance.test.php` runs the shared skaidb wire-protocol
+conformance suite: `conformance/vectors.json`, generated from the server's
+own encoders and vendored byte-identical from
+<https://skaidb.org/conformance/vectors.json> (contract in
+[conformance/README.md](conformance/README.md)). It decodes every value
+vector and encodes every one the driver can bind, recomputes the SCRAM
+vectors with the driver's SCRAM code, and drives every case through the
+public API (`query`, `stream`, `prepare`/`execute`, `executeBatch`) against
+a scripted fake server that verifies the client proof independently,
+checks each request byte for byte and replays the reference responses; the
+three auth outcomes (`ok`, `bad_server_signature` must fail, `denied`) run
+too. CI fails when the vendored copy differs from the published one.
+
+Skipped: encoding `document_empty` — PHP has one empty array, and bound as
+a parameter it is an empty Array. No `call.method` is skipped.
 
 CI runs the suite on PHP 8.1, 8.2, 8.3 and 8.4, validates `composer.json`,
 installs the package through Composer the way the Install section says, and

@@ -3,7 +3,7 @@
 - [Getting started](getting-started.md) — install, connect, first queries, failover.
 - [API reference](api.md) — every public class, method and argument.
 - [Types](types.md) — the value mapping in both directions and the bind wrappers.
-- [TLS](tls.md) — the three TLS modes and the server name.
+- [TLS](tls.md) — the three TLS modes, the server name and client-certificate login.
 - [Streaming](streaming.md) — large results, the abandon rule, stream subscriptions.
 - [Pooling](pooling.md) — the connection pool.
 

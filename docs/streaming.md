@@ -18,6 +18,16 @@ foreach ($db->stream('SELECT id, v FROM readings ORDER BY id') as $row) {
 - `$consistency` overrides the connection's level for this statement
   (`'ONE'`, `'QUORUM'`, `'ALL'` or `0`/`1`/`2`).
 - A non-row statement streamed this way yields nothing.
+- Once the generator has finished, `getReturn()` describes the statement:
+  `['kind' => 'rows'|'mutation'|'ddl', 'columns' => [...], 'affected' => n]`
+  — the column names even when no row came, the affected count of a
+  non-row statement:
+
+  ```php
+  $gen = $db->stream('DELETE FROM t WHERE expired');
+  foreach ($gen as $row) {}
+  $gen->getReturn()['affected'];   // rows deleted
+  ```
 - An error before any row throws an ordinary `SkaidbException`. An error
   partway through (a node dying mid-scan, a scan budget tripping) throws
   after the rows already yielded, which are valid.

@@ -15,6 +15,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/../src/Skaidb.php';
 require __DIR__ . '/FakeServer.php';
+require __DIR__ . '/Conformance.php';
 
 final class AssertionFailed extends \Exception
 {

@@ -7,7 +7,7 @@ error is a `Skaidb\SkaidbException`.
 
 | Constant | Value |
 |---|---|
-| `Skaidb::VERSION` | the package version, e.g. `'1.0.0'`; what the Hello frame reports and what a release tag must equal |
+| `Skaidb::VERSION` | the package version, e.g. `'1.1.0'`; what the Hello frame reports and what a release tag must equal |
 | `Skaidb::CLIENT_NAME` | `'php'` |
 
 ## `new Connection(...)`
@@ -25,7 +25,10 @@ new Connection(
     ?string $tlsCa = null,                // PEM bundle; implies $tls
     bool $tlsInsecure = false,            // no verification; implies $tls
     string $tlsServerName = 'skaidb',     // SNI + verified name
-    array $seeds = []                     // ['host:port', ...]; wins over $host/$port when non-empty
+    array $seeds = [],                    // ['host:port', ...]; wins over $host/$port when non-empty
+    ?string $tlsClientCert = null,        // PEM client certificate presented in TLS; implies $tls
+    ?string $tlsClientKey = null,         // its PEM key, when not inside $tlsClientCert
+    string $authMechanism = 'scram'       // 'scram' | 'certificate' (TLS client certificate login)
 )
 ```
 
@@ -35,6 +38,14 @@ non-empty, sends the Hello frame and issues `USE $database` if given.
 Throws on any failure (`no reachable endpoint in <list>: ...`,
 `authentication denied: ...`, `server signature mismatch (mutual auth
 failed)`).
+
+With `$authMechanism = 'certificate'` (also accepted: `'external'`,
+`'x509'`) the handshake is EXTERNAL: the client certificate is the
+credential, its Common Name the user, and no password is sent. `$user` is
+sent as a claim the server checks against the Common Name, except the
+default `'anonymous'`, which sends none. It needs `$tlsClientCert`; the
+constructor refuses the combination without one, and an unknown
+mechanism.
 
 Constants: `Connection::ONE = 0`, `Connection::QUORUM = 1`,
 `Connection::ALL = 2`.
@@ -59,7 +70,10 @@ parameters and is cached per connection (up to 240 distinct statements).
 
 Runs `$sql` with the streaming opcode and yields one associative row at a
 time, holding one chunk in memory. No parameters. The connection is busy
-until the generator finishes; see [streaming](streaming.md).
+until the generator finishes; see [streaming](streaming.md). After the last
+row, `getReturn()` on the generator gives `['kind' => 'rows'|'mutation'|'ddl',
+'columns' => [...], 'affected' => int]`: the column names even when no row
+came, and the affected count of a non-row statement.
 
 ### `subscribe(string $stream, ?string $after = null, float $poll = 0.5): Generator`
 
@@ -137,6 +151,12 @@ A `NULL` cell returns `null`.
 
 Rows affected for a mutation; rows returned for a row-producing statement;
 0 for DDL.
+
+### `kind(): string`
+
+What the last `execute()` returned: `'rows'` (a result set, possibly
+empty), `'mutation'` (an affected count; see `rowCount()`) or `'ddl'` (a
+bare acknowledgement). `''` before the first `execute()`.
 
 ### `columnCount(): int` · `columns(): array`
 

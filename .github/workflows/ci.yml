@@ -27,6 +27,13 @@ jobs:
           for f in src/Skaidb.php tests/*.php tests/live/*.php examples/*.php; do php -l "$f"; done
       - name: Unit tests (in-process fake server, no skaidb needed)
         run: php tests/run.php
+      - name: Conformance vectors match the published copy
+        run: |
+          curl -fsSL https://skaidb.org/conformance/vectors.json -o /tmp/published-vectors.json
+          if ! cmp -s /tmp/published-vectors.json conformance/vectors.json; then
+            echo "::error::conformance/vectors.json differs from https://skaidb.org/conformance/vectors.json; vendor the published copy"
+            exit 1
+          fi
       - name: Live test skips itself without a server
         run: php tests/live/live.php
       - name: composer validate --strict

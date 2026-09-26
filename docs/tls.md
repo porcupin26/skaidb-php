@@ -53,9 +53,28 @@ $pool = new Skaidb\Pool(['user' => 'app', 'password' => $pw, 'database' => 'app'
 
 ## Client certificates
 
-The driver does not present a client certificate; identity is the SCRAM
-user. A server configured to require client certificates on the binary port
-will reject this driver's handshake.
+`tlsClientCert` / `tlsClientKey` (PEM files; the key may be omitted when the
+certificate file also holds it) make the driver present a client
+certificate in the TLS handshake, which a server that verifies client
+certificates needs. Either implies TLS. On its own the certificate only
+opens the TLS session; the login is still the SCRAM user.
+
+With `authMechanism: 'certificate'` the certificate IS the login (wire
+mechanism EXTERNAL): the server maps its Common Name to a role and no
+password is sent. The server needs `auth.x509_enabled`, and its client CA
+must have signed the certificate.
+
+```php
+$db = new Connection(host: 'db1', tlsCa: '/etc/skaidb/ca.crt',
+                     tlsClientCert: '/etc/app/app.crt', tlsClientKey: '/etc/app/app.key',
+                     authMechanism: 'certificate', database: 'app');
+```
+
+Pass `user` only to assert the expected identity: a certificate mapped to a
+different role fails the connect with `authentication denied: the username
+does not match the client certificate's Common Name`. The server's
+signature is not checked under this mechanism; TLS already authenticated
+the server, so verify it (`tlsCa`), not `tlsInsecure`.
 
 ## Failure modes
 
