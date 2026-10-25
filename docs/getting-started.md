@@ -128,6 +128,10 @@ $pool = new Skaidb\Pool(['user' => 'app', 'password' => $pw, 'seeds' => ['db1:70
 $n = $pool->withConnection(fn ($c) => $c->query('SELECT count(*) AS n FROM users')->fetchColumn());
 ```
 
+Pass `loadBalancing: 'least_latency'` (or `'round_robin'`) and
+`discover: true` to spread one process's connections over every member;
+see [balancing across members](pooling.md#balancing-across-members).
+
 ## Next
 
 - [API reference](api.md)

@@ -7,7 +7,7 @@ error is a `Skaidb\SkaidbException`.
 
 | Constant | Value |
 |---|---|
-| `Skaidb::VERSION` | the package version, e.g. `'1.1.0'`; what the Hello frame reports and what a release tag must equal |
+| `Skaidb::VERSION` | the package version, e.g. `'1.2.0'`; what the Hello frame reports and what a release tag must equal |
 | `Skaidb::CLIENT_NAME` | `'php'` |
 
 ## `new Connection(...)`
@@ -91,6 +91,12 @@ The default consistency for statements created afterwards.
 False once closed, once a transport error broke the connection (the next
 statement will re-dial), and while a stream is in flight.
 
+### `endpoint(): ?string`
+
+The endpoint (`'host:port'`, as configured or discovered) the live socket
+reached — the member this connection's statements go to. Changes when the
+connection re-dials to another member.
+
 ### `close(): void`
 
 Closes the socket. Terminal: a closed connection never reconnects
@@ -106,9 +112,10 @@ anything else.
 A transport error (`connection closed by server`, `connection timed out`,
 `connection closed by server (write)`) throws from the statement in flight
 and marks the connection broken. The next statement re-dials through the
-seed list, re-authenticates, re-sends `USE`, re-sends the Hello and clears
-the prepared-statement cache, then runs. The failed statement is never
-retried by the driver.
+seed list (a pooled connection: through the pool's members, usable ones
+first and the one it lost last), re-authenticates, re-sends `USE`, re-sends
+the Hello and clears the prepared-statement cache, then runs. The failed
+statement is never retried by the driver.
 
 ## `Statement`
 
@@ -172,22 +179,55 @@ For a `CALL` whose body `EMIT`s: every result set in emission order, each
 
 Overrides the consistency for this statement only.
 
-## `new Pool(array $connectionArgs = [], int $maxsize = 10)`
+## `new Pool(...)`
+
+```php
+new Pool(
+    array $connectionArgs = [],           // Connection constructor arguments, positional or named
+    int $maxsize = 10,                    // connections kept idle (>= 1)
+    string $loadBalancing = 'random',     // 'random' | 'round_robin' | 'least_latency'
+    string $idleOrder = 'lifo',           // 'lifo' | 'fifo'
+    bool $discover = false,               // read the members from SHOW ENDPOINTS
+    float $refreshInterval = 60.0,        // seconds between discovery refreshes (5 s while one is not ready)
+    float $readYourWrites = 0.0,          // seconds a write pins its affinity key to its member; 0 = off
+    int $ejectErrors = 3,                 // consecutive transport failures that eject a member (>= 1)
+    float $ejectLatencyFactor = 3.0,      // × the other members' median latency; 0 = off
+    float $ejectLatencyFloor = 0.05,      // seconds above that median a member must also be
+    float $ejectBackoff = 5.0,            // seconds of the first ejection, doubling per repeat
+    float $ejectBackoffMax = 60.0         // the longest ejection, seconds
+)
+```
 
 `$connectionArgs` are the `Connection` constructor arguments, positional
-(`['db1', 7000, 'app', $pw]`) or named (`['user' => 'app', 'seeds' => [...]]`).
-`$maxsize` bounds the connections kept idle (≥ 1).
+(`['db1', 7000, 'app', $pw]`) or named (`['user' => 'app', 'seeds' => [...]]`);
+`host`/`port` or `seeds` name the members the pool starts from, the rest
+apply to every connection. The balancing options are meant to be passed by
+name (`loadBalancing: 'least_latency'`); the policy names are also
+constants: `Pool::RANDOM`, `Pool::ROUND_ROBIN`, `Pool::LEAST_LATENCY`,
+`Pool::LIFO`, `Pool::FIFO`. An unknown policy or idle order, `$maxsize < 1`
+or `$ejectErrors < 1` throws `SkaidbException`.
 
-- `acquire(): Connection` — an idle connection that is still usable, or a
-  new one.
+- `acquire(string|int|null $affinity = null): Connection` — an idle
+  connection to the member the policy picks (still usable), or a new one
+  dialed to it, falling back to the other members. `$affinity` is the
+  read-your-writes key (a user or session id; `null` = the pool-wide key).
+  Runs the pool's upkeep first: probes one ejected member whose backoff is
+  over, and refreshes discovery when it is due.
 - `release(Connection $c): void` — returns it; closes it instead if it is
-  broken, mid-stream, or the pool already holds `$maxsize` idle connections.
-- `withConnection(callable $fn): mixed` — `acquire()`, call `$fn($conn)`,
-  `release()` however `$fn` ends; returns what `$fn` returns.
+  broken, mid-stream, its member is ejected, not `ready` or gone, or the
+  pool already holds `$maxsize` idle connections.
+- `withConnection(callable $fn, string|int|null $affinity = null): mixed` —
+  `acquire($affinity)`, call `$fn($conn)`, `release()` however `$fn` ends;
+  returns what `$fn` returns.
+- `members(): array` — one array per member, sorted by endpoint:
+  `endpoint` (what the pool dials), `canonical` (the member's own name once
+  discovered, else `null`), `state` (`'ready'`, `'ejected'`, `'resyncing'`,
+  `'unreachable'`, `'unlisted'`), `latency_ms` (the round-trip average,
+  `null` until measured), `in_use`, `idle`, `seed`.
 - `close(): void` — closes every idle connection; `acquire()` then throws
   `pool is closed`.
 
-See [pooling](pooling.md).
+See [pooling](pooling.md) for the balancing rules.
 
 ## Bind wrappers
 

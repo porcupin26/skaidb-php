@@ -5,7 +5,7 @@
 - [Types](types.md) — the value mapping in both directions and the bind wrappers.
 - [TLS](tls.md) — the three TLS modes, the server name and client-certificate login.
 - [Streaming](streaming.md) — large results, the abandon rule, stream subscriptions.
-- [Pooling](pooling.md) — the connection pool.
+- [Pooling](pooling.md) — the connection pool and balancing it across the cluster's members.
 
 Elsewhere: the package [README](../README.md), runnable [examples](../examples/),
 the [wire protocol specification](https://skaidb.org/docs/PROTOCOL.html) and

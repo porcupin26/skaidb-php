@@ -63,7 +63,7 @@ class Unpreparable extends SkaidbException
  */
 final class Skaidb
 {
-    public const VERSION = '1.1.0';
+    public const VERSION = '1.2.0';
 
     /** The client_name the driver reports in the server's `drivers` table. */
     public const CLIENT_NAME = 'php';
@@ -192,6 +192,19 @@ class Connection
     /** Everything a redial needs, captured at construction. */
     private array $dialArgs = [];
 
+    /**
+     * The Pool that owns this connection (see Pool), or null outside one:
+     * told each round trip's latency, each transport failure and each write,
+     * and asked for the dial order when the connection re-dials.
+     */
+    private ?Pool $pool = null;
+
+    /** @var array<int,string>|null endpoints to dial in exactly this order (pooled); null = the seeds, shuffled */
+    private ?array $order = null;
+
+    /** The endpoint ('host:port') the live socket reached. */
+    private ?string $connected = null;
+
     private static int $nonceCounter = 0;
 
     /**
@@ -250,6 +263,25 @@ class Connection
     }
 
     /**
+     * A pool's connection: dials exactly $order (best first, no shuffle) and
+     * reports its round trips, transport failures and writes to $pool.
+     *
+     * @internal
+     * @param array<string,mixed> $args  named Connection constructor arguments
+     * @param array<int,string>   $order endpoints to try, in order
+     */
+    public static function pooled(array $args, array $order, ?Pool $pool): self
+    {
+        $conn = (new \ReflectionClass(self::class))->newInstanceWithoutConstructor();
+        $conn->pool = $pool;
+        $conn->order = $order;
+        // The constructor proper, on the prepared instance: it validates the
+        // arguments and dials — now in the pool's order.
+        $conn->__construct(...$args);
+        return $conn;
+    }
+
+    /**
      * Connect, authenticate and enter the session database. Used for the
      * first connect and for every reconnect, so a recovered connection is
      * indistinguishable from a fresh one.
@@ -291,11 +323,16 @@ class Connection
         $ctx = stream_context_create($opts);
         // Seeds: try each until one connects. skaidb is leaderless, so any
         // node serves — there is no primary to discover. Shuffled so many
-        // clients spread instead of stampeding the first entry.
-        $endpoints = $seeds === [] ? ["{$host}:{$port}"] : $seeds;
-        shuffle($endpoints);
-        $sock = false;
+        // clients spread instead of stampeding the first entry. A pooled
+        // connection dials in the pool's order instead.
+        if ($this->order !== null) {
+            $endpoints = $this->order;
+        } else {
+            $endpoints = $seeds === [] ? ["{$host}:{$port}"] : $seeds;
+            shuffle($endpoints);
+        }
         $tried = [];
+        $why = '';
         foreach ($endpoints as $ep) {
             $tried[] = $ep;
             $sock = @stream_socket_client(
@@ -306,29 +343,45 @@ class Connection
                 STREAM_CLIENT_CONNECT,
                 $ctx
             );
-            if ($sock !== false) {
-                break;
+            if ($sock === false) {
+                $why = "{$errstr} ({$errno})";
+                $this->pool?->failed($ep);
+                continue;
             }
-        }
-        if ($sock === false) {
-            $list = implode(', ', $tried);
-            throw new SkaidbException("no reachable endpoint in {$list}: {$errstr} ({$errno})");
-        }
-        $this->sock = $sock;
-        // Read timeout for fread loops.
-        stream_set_timeout($this->sock, (int) $timeout, (int) (($timeout - (int) $timeout) * 1_000_000));
+            $this->sock = $sock;
+            // Read timeout for fread loops.
+            stream_set_timeout($this->sock, (int) $timeout, (int) (($timeout - (int) $timeout) * 1_000_000));
 
-        try {
-            if ($certAuth) {
-                // 'anonymous' is only the constructor's default, not a
-                // claim: send no username and let the certificate name it.
-                $this->handshakeCertificate($user === 'anonymous' ? '' : $user);
-            } else {
-                $this->handshake($user, $password);
+            try {
+                if ($certAuth) {
+                    // 'anonymous' is only the constructor's default, not a
+                    // claim: send no username and let the certificate name it.
+                    $this->handshakeCertificate($user === 'anonymous' ? '' : $user);
+                } else {
+                    $this->handshake($user, $password);
+                }
+            } catch (SkaidbException $e) {
+                if ($this->order === null || !Pool::memberFault($e)) {
+                    $this->close();
+                    throw $e;
+                }
+                // Pooled: a member that dropped or refused the handshake (a
+                // capacity refusal included) is a failed dial — try the next
+                // on a clean slate.
+                @fclose($this->sock);
+                $this->sock = null;
+                $this->broken = false;
+                $why = $e->getMessage();
+                $this->pool?->failed($ep);
+                continue;
             }
-        } catch (SkaidbException $e) {
-            $this->close();
-            throw $e;
+            $this->connected = $ep;
+            $this->pool?->moved($this);
+            break;
+        }
+        if ($this->sock === null) {
+            $list = implode(', ', $tried);
+            throw new SkaidbException("no reachable endpoint in {$list}: {$why}");
         }
 
         $this->sendHello();
@@ -494,6 +547,15 @@ class Connection
             && is_resource($this->sock);
     }
 
+    /**
+     * The endpoint ('host:port', as configured or discovered) the live socket
+     * reached — the member this connection's statements go to.
+     */
+    public function endpoint(): ?string
+    {
+        return $this->connected;
+    }
+
     public function close(): void
     {
         if (!$this->closed) {
@@ -502,6 +564,9 @@ class Connection
                 @fclose($this->sock);
             }
             $this->sock = null;
+            // Closed while checked out instead of released: the pool stops
+            // counting it against its member.
+            $this->pool?->closedOut($this);
         }
     }
 
@@ -561,13 +626,26 @@ class Connection
             throw new SkaidbException('connection is closed');
         }
         $req = pack('C', 5) . pack('C', $level) . pack('V', strlen($sql)) . $sql;
-        $this->writeFrame($req);
+        $started = hrtime(true);
+        try {
+            $this->writeFrame($req);
+        } catch (SkaidbException $e) {
+            $this->observeFailure();
+            throw $e;
+        }
         // Busy from the request, not from the first row: the header read below
         // is already part of the stream's exchange.
         $this->streaming = true;
         $live = false; // true only once the header promises RowsChunk frames
         try {
-            $r = new Reader($this->readFrame());
+            try {
+                $frame = $this->readFrame();
+            } catch (SkaidbException $e) {
+                $this->observeFailure();
+                throw $e;
+            }
+            $this->pool?->roundTrip($this, (hrtime(true) - $started) / 1e9);
+            $r = new Reader($frame);
             // Before the tag is known, a short or empty frame makes even
             // `u8()` throw — and at that point we cannot say what the
             // reply left queued, so the socket is not reusable.
@@ -583,6 +661,7 @@ class Connection
                     str_contains($msg, 'unknown opcode') ? "server does not support streaming: {$msg}" : $msg
                 );
             }
+            $this->noteStatement($sql);
             if ($tag === 1) { // Mutation: not row-producing
                 return ['kind' => 'mutation', 'columns' => [], 'affected' => $r->u64()];
             }
@@ -702,8 +781,7 @@ class Connection
             throw new SkaidbException('connection is closed');
         }
         $req = pack('C', 2) . pack('V', strlen($sql)) . $sql;
-        $this->writeFrame($req);
-        $r = new Reader($this->readFrame());
+        $r = new Reader($this->exchange($req));
         $tag = $r->u8();
         if ($tag === 4) { // Prepared
             $id = $r->u32();
@@ -830,9 +908,7 @@ class Connection
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
-        $this->writeFrame($req);
-
-        $r = new Reader($this->readFrame());
+        $r = new Reader($this->exchange($req));
         $tag = $r->u8();
         if ($tag === 0) { // Rows
             $ncols = $r->u32();
@@ -894,6 +970,46 @@ class Connection
         throw new SkaidbException("unknown response tag {$tag}");
     }
 
+    // ---- pool reporting ---------------------------------------------------
+
+    /**
+     * One request round trip: send $req, read the first response frame. A
+     * pooled connection reports how long it took (the member's latency) or
+     * that the transport failed (a member failure).
+     */
+    private function exchange(string $req): string
+    {
+        $started = hrtime(true);
+        try {
+            $this->writeFrame($req);
+            $frame = $this->readFrame();
+        } catch (SkaidbException $e) {
+            $this->observeFailure();
+            throw $e;
+        }
+        $this->pool?->roundTrip($this, (hrtime(true) - $started) / 1e9);
+        return $frame;
+    }
+
+    /** writeFrame/readExact mark a transport failure broken; tell the pool. */
+    private function observeFailure(): void
+    {
+        if ($this->broken && $this->pool !== null && $this->connected !== null) {
+            $this->pool->failed($this->connected);
+        }
+    }
+
+    /**
+     * A statement succeeded: a pool with read-your-writes on remembers which
+     * member took a write.
+     *
+     * @internal
+     */
+    public function noteStatement(string $sql): void
+    {
+        $this->pool?->statement($this, $sql);
+    }
+
     // ---- framing ----------------------------------------------------------
 
     /**
@@ -941,6 +1057,11 @@ class Connection
         // Cleared BEFORE dialling: dial() issues USE, which runs a statement
         // and would otherwise re-enter this method forever.
         $this->broken = false;
+        if ($this->pool !== null) {
+            // Pooled: the pool's current order (usable members first, the
+            // one this connection just lost last).
+            $this->order = $this->pool->dialOrder($this->connected);
+        }
         try {
             $this->dial();
         } catch (SkaidbException $e) {
@@ -1584,6 +1705,7 @@ class Statement
             array_map('array_values', $rows),
             $this->consistency
         );
+        $this->conn->noteStatement($this->sql);
         return $res['affected'];
     }
 
@@ -1632,6 +1754,7 @@ class Statement
             }
             $res = $this->conn->runQuery($bound, $this->consistency);
         }
+        $this->conn->noteStatement($this->sql);
         $this->pos = 0;
         $this->resultSets = $res['result_sets'] ?? null;
         $this->kind = $res['kind'];
@@ -1854,70 +1977,310 @@ class Reader
     }
 }
 /**
- * A pool of skaidb connections.
+ * One cluster member as a Pool sees it.
+ *
+ * @internal
+ */
+final class PoolMember
+{
+    /** Its own name: the `local` row of its SHOW ENDPOINTS answer. */
+    public ?string $canonical = null;
+
+    /** 'ready' | 'resyncing' | 'unreachable' | 'unlisted' */
+    public string $listed = 'ready';
+
+    /** Round-trip average in seconds; null until measured. */
+    public ?float $ewma = null;
+
+    public int $samples = 0;
+
+    /** When the last round trip was measured (Pool's monotonic seconds). */
+    public float $lastSample = 0.0;
+
+    /** Consecutive transport failures. */
+    public int $errors = 0;
+
+    /** Ejected until this time; null = admitted. */
+    public ?float $ejectedUntil = null;
+
+    public int $ejections = 0;
+
+    /** When a probe last re-admitted it; null = never ejected and re-admitted. */
+    public ?float $readmittedAt = null;
+
+    /** Connections checked out to it. */
+    public int $inUse = 0;
+
+    /**
+     * @param string $endpoint what the pool dials
+     * @param bool   $seed     configured, so discovery never drops it
+     */
+    public function __construct(public readonly string $endpoint, public readonly bool $seed)
+    {
+    }
+}
+
+/**
+ * A pool of skaidb connections, balanced across the cluster's members.
  *
  * `maxsize` bounds the connections kept IDLE, not the number checked out: a
  * burst creates extras and the surplus is closed on return. Every Connection
- * constructor argument passes through, so pooled connections inherit seed
- * failover, TLS and the session database.
+ * constructor argument passes through, so pooled connections inherit TLS,
+ * credentials and the session database; `host`/`port`/`seeds` name the
+ * members the pool starts from.
+ *
+ * Load balancing follows the rules every skaidb driver shares (PROTOCOL.md
+ * §6.1; see docs/pooling.md):
+ *
+ * - `loadBalancing`: 'random' (default; each new connection dials the
+ *   members in random order), 'round_robin' (checkouts rotate over the
+ *   members) or 'least_latency' (of two members picked at random, the one
+ *   with the lower latency average × checked-out connections).
+ * - `idleOrder`: 'lifo' (default; the most recently returned idle connection
+ *   first) or 'fifo' (the longest idle first).
+ * - `discover`: read the members from SHOW ENDPOINTS (server >= 0.327) when
+ *   a member is first reached and every `refreshInterval` seconds after (5 s
+ *   while one is resyncing or unreachable): joiners are added, leavers
+ *   dropped, and members that are not ready get no new connections.
+ * - Health ejection: `ejectErrors` consecutive transport failures, or a
+ *   latency average above `ejectLatencyFactor` × the other members' median
+ *   and more than `ejectLatencyFloor` seconds above it, takes a member out
+ *   for `ejectBackoff` seconds (doubling per repeat, up to `ejectBackoffMax`).
+ *   The last usable member is never ejected.
+ * - `readYourWrites`: seconds after a write during which checkouts with the
+ *   same affinity key go to the member that took it. 0 (default) = off.
+ *
+ * PHP has no background threads, so the upkeep runs inside acquire(): the
+ * first checkout after a member's backoff probes it (one member per
+ * checkout, bounded by the connection timeout), and the first checkout after
+ * the refresh interval re-reads SHOW ENDPOINTS on the connection it is about
+ * to hand out.
  *
  * PHP is share-nothing per request, so this pool lives for one process — it
  * pays off in a worker or a long-running CLI job, not in a plain web request
  * that opens one connection and exits.
  *
- *     $pool = new Skaidb\Pool(['127.0.0.1', 7000, 'app', 'secret'], 8);
+ *     $pool = new Skaidb\Pool(['seeds' => ['db1:7000', 'db2:7000'], 'user' => 'app', 'password' => $pw], 8,
+ *                             loadBalancing: 'least_latency', discover: true);
  *     $n = $pool->withConnection(fn ($c) => $c->exec('SELECT 1'));
  *     $pool->close();
  */
 class Pool
 {
-    /** @var array<int, Connection> */
+    public const RANDOM = 'random';
+    public const ROUND_ROBIN = 'round_robin';
+    public const LEAST_LATENCY = 'least_latency';
+    public const LIFO = 'lifo';
+    public const FIFO = 'fifo';
+
+    /**
+     * Latency EWMA: each round trip moves a member's average 5% toward it,
+     * and no sample counts for more than 10x the larger of the current
+     * average and the ejection floor — one slow query does not eject a
+     * healthy member, a member that stays slow is ejected within a few dozen
+     * statements.
+     */
+    private const EWMA_WEIGHT = 0.05;
+
+    private const EWMA_CLAMP = 10.0;
+
+    /** Round trips a member (and at least one other) needs before its average can eject it. */
+    private const EWMA_MIN_SAMPLES = 10;
+
+    /**
+     * least_latency: a member whose last round trip is older than this many
+     * seconds scores 0, so a lightly loaded pool keeps re-measuring every
+     * member instead of settling forever on whichever answered fastest once.
+     */
+    private const STALE_SAMPLE = 2.0;
+
+    /**
+     * Discovery refresh, in seconds, while a listed member is resyncing or
+     * unreachable: often a matter of seconds (a peer's circuit breaker right
+     * after it restarts), and a whole refresh interval would leave the load
+     * on the others.
+     */
+    private const REFRESH_NOT_READY = 5.0;
+
+    /** Leading keywords of statements that never write; everything else is a write. */
+    private const READ_KEYWORDS = ['select', 'show', 'explain', 'describe', 'desc', 'values', 'with', 'use'];
+
+    /** @var array<int, Connection> oldest first */
     private array $idle = [];
 
     private bool $closed = false;
 
     private int $maxsize;
 
-    /** @var array<int, mixed> constructor arguments for each new Connection */
+    /** @var array<string, mixed> named Connection constructor arguments */
     private array $args;
 
+    private string $policy;
+
+    private bool $fifo;
+
+    private bool $discover;
+
+    private float $refreshInterval;
+
+    private float $readYourWrites;
+
+    private int $ejectErrors;
+
+    private float $ejectFactor;
+
+    private float $ejectFloor;
+
+    private float $backoff;
+
+    private float $backoffMax;
+
+    /** @var array<string, PoolMember> by the endpoint the pool dials */
+    private array $members = [];
+
     /**
-     * @param array<int, mixed> $connectionArgs positional args for Connection::__construct
-     * @param int               $maxsize        connections kept idle
+     * Per connection the pool made: ep (the member it counts against), out
+     * (checked out) and key (the affinity key it was checked out under).
+     *
+     * @var \WeakMap<Connection, \stdClass>
      */
-    public function __construct(array $connectionArgs = [], int $maxsize = 10)
-    {
+    private \WeakMap $slots;
+
+    private int $rr = -1;
+
+    /** @var array<string, array{0:string,1:float}> affinity key => [member endpoint, until] */
+    private array $affinity = [];
+
+    private bool $discoveryOff = false;
+
+    private float $nextRefresh = 0.0;
+
+    /**
+     * @param array<int|string, mixed> $connectionArgs     Connection constructor arguments, positional or named
+     * @param int                      $maxsize            connections kept idle
+     * @param string                   $loadBalancing      'random' | 'round_robin' | 'least_latency'
+     * @param string                   $idleOrder          'lifo' | 'fifo'
+     * @param bool                     $discover           read the members from SHOW ENDPOINTS
+     * @param float                    $refreshInterval    seconds between discovery refreshes
+     * @param float                    $readYourWrites     seconds a write pins its affinity key to its member; 0 = off
+     * @param int                      $ejectErrors        consecutive transport failures that eject a member
+     * @param float                    $ejectLatencyFactor × the other members' median latency that ejects; 0 = off
+     * @param float                    $ejectLatencyFloor  seconds above the median a member must also be
+     * @param float                    $ejectBackoff       seconds of the first ejection, doubling per repeat
+     * @param float                    $ejectBackoffMax    the longest ejection, in seconds
+     */
+    public function __construct(
+        array $connectionArgs = [],
+        int $maxsize = 10,
+        string $loadBalancing = self::RANDOM,
+        string $idleOrder = self::LIFO,
+        bool $discover = false,
+        float $refreshInterval = 60.0,
+        float $readYourWrites = 0.0,
+        int $ejectErrors = 3,
+        float $ejectLatencyFactor = 3.0,
+        float $ejectLatencyFloor = 0.05,
+        float $ejectBackoff = 5.0,
+        float $ejectBackoffMax = 60.0
+    ) {
         if ($maxsize < 1) {
             throw new SkaidbException('maxsize must be >= 1');
         }
-        $this->args = $connectionArgs;
+        if (!in_array($loadBalancing, [self::RANDOM, self::ROUND_ROBIN, self::LEAST_LATENCY], true)) {
+            throw new SkaidbException(
+                "unknown loadBalancing '{$loadBalancing}' (use 'random', 'round_robin' or 'least_latency')"
+            );
+        }
+        if (!in_array($idleOrder, [self::LIFO, self::FIFO], true)) {
+            throw new SkaidbException("unknown idleOrder '{$idleOrder}' (use 'lifo' or 'fifo')");
+        }
+        if ($ejectErrors < 1) {
+            throw new SkaidbException('ejectErrors must be >= 1');
+        }
         $this->maxsize = $maxsize;
+        $this->policy = $loadBalancing;
+        $this->fifo = $idleOrder === self::FIFO;
+        $this->discover = $discover;
+        $this->refreshInterval = $refreshInterval;
+        $this->readYourWrites = $readYourWrites;
+        $this->ejectErrors = $ejectErrors;
+        $this->ejectFactor = $ejectLatencyFactor;
+        $this->ejectFloor = $ejectLatencyFloor;
+        $this->backoff = $ejectBackoff;
+        $this->backoffMax = $ejectBackoffMax;
+        $this->args = self::named($connectionArgs);
+        $this->slots = new \WeakMap();
+        // The seeds, exactly as Connection would dial them.
+        $seeds = $this->args['seeds'] ?? [];
+        if (!is_array($seeds) || $seeds === []) {
+            $seeds = [($this->args['host'] ?? 'localhost') . ':' . ($this->args['port'] ?? 7000)];
+        }
+        foreach ($seeds as $ep) {
+            $ep = (string) $ep;
+            $this->members[$ep] ??= new PoolMember($ep, true);
+        }
     }
 
-    /** Check out a usable connection, reusing an idle one when possible. */
-    public function acquire(): Connection
+    // ---- checkout / checkin -----------------------------------------------
+
+    /**
+     * Check out a usable connection: an idle one to the member the policy
+     * picks, or a new one dialed to it (falling back to the other members).
+     * $affinity scopes read-your-writes — a user or session id; null is the
+     * pool-wide key.
+     */
+    public function acquire(string|int|null $affinity = null): Connection
     {
+        $key = $affinity === null ? '' : 'k:' . $affinity;
         while (true) {
             if ($this->closed) {
                 throw new SkaidbException('pool is closed');
             }
-            $conn = array_pop($this->idle);
+            $this->probeDue();
+            $target = $this->pick($key);
+            $conn = $this->takeIdle($target);
             if ($conn === null) {
-                return new Connection(...$this->args);
+                $conn = $this->dial($this->order($target));
+                $this->discoverThrough($conn);
+            }
+            if ($conn->isUsable() && $this->refreshDue()) {
+                $this->nextRefresh = self::now() + $this->refreshInterval;
+                $this->listThrough($conn);
             }
             // A connection the server closed while it sat idle still looks
-            // fine locally, so check before handing it out.
-            if ($conn->isUsable()) {
-                return $conn;
+            // fine locally (its next statement throws once and re-dials);
+            // this drops the ones already known dead, then loops.
+            if (!$conn->isUsable()) {
+                $conn->close();
+                continue;
             }
-            $conn->close();
+            $slot = $this->slots[$conn];
+            $slot->out = true;
+            $slot->key = $key;
+            $m = $this->members[$slot->ep ?? ''] ?? null;
+            if ($m !== null) {
+                $m->inUse++;
+            }
+            return $conn;
         }
     }
 
-    /** Return a connection, closing it if broken or the pool is full. */
+    /**
+     * Return a connection, closing it instead if it is broken or mid-stream,
+     * its member is ejected, not ready or gone, or the pool is full or closed.
+     */
     public function release(Connection $conn): void
     {
-        if (!$this->closed && $conn->isUsable() && count($this->idle) < $this->maxsize) {
+        $slot = $this->slots[$conn] ?? null;
+        $m = $slot === null ? null : ($this->members[$slot->ep ?? ''] ?? null);
+        if ($slot !== null && $slot->out) {
+            $slot->out = false;
+            if ($m !== null && $m->inUse > 0) {
+                $m->inUse--;
+            }
+        }
+        if (!$this->closed && $conn->isUsable() && $m !== null && self::usable($m)
+            && count($this->idle) < $this->maxsize) {
             $this->idle[] = $conn;
 
             return;
@@ -1929,12 +2292,13 @@ class Pool
      * Run $fn with a checked-out connection, returning it however $fn ends.
      *
      * @param callable(Connection):mixed $fn
+     * @param string|int|null            $affinity read-your-writes key, as for acquire()
      *
      * @return mixed whatever $fn returns
      */
-    public function withConnection(callable $fn)
+    public function withConnection(callable $fn, string|int|null $affinity = null)
     {
-        $conn = $this->acquire();
+        $conn = $this->acquire($affinity);
         try {
             return $fn($conn);
         } finally {
@@ -1942,7 +2306,36 @@ class Pool
         }
     }
 
-    /** Close the pool and every idle connection. */
+    /**
+     * The members as the pool sees them, for monitoring: endpoint (what it
+     * dials), canonical (the member's own name, once discovered), state
+     * ('ready', 'ejected', 'resyncing', 'unreachable', 'unlisted'),
+     * latency_ms (the round-trip average; null until measured), in_use,
+     * idle and seed.
+     *
+     * @return array<int, array{endpoint:string, canonical:?string, state:string, latency_ms:?float, in_use:int, idle:int, seed:bool}>
+     */
+    public function members(): array
+    {
+        $idle = [];
+        foreach ($this->idle as $c) {
+            $ep = $this->slots[$c]->ep ?? '';
+            $idle[$ep] = ($idle[$ep] ?? 0) + 1;
+        }
+        $members = array_values($this->members);
+        usort($members, fn (PoolMember $a, PoolMember $b) => strcmp($a->endpoint, $b->endpoint));
+        return array_map(fn (PoolMember $m) => [
+            'endpoint' => $m->endpoint,
+            'canonical' => $m->canonical,
+            'state' => $m->ejectedUntil !== null ? 'ejected' : $m->listed,
+            'latency_ms' => $m->ewma === null ? null : $m->ewma * 1000.0,
+            'in_use' => $m->inUse,
+            'idle' => $idle[$m->endpoint] ?? 0,
+            'seed' => $m->seed,
+        ], $members);
+    }
+
+    /** Close the pool and every idle connection; checked-out ones close on release. */
     public function close(): void
     {
         $this->closed = true;
@@ -1951,5 +2344,557 @@ class Pool
         foreach ($idle as $conn) {
             $conn->close();
         }
+    }
+
+    // ---- choosing a member ------------------------------------------------
+
+    private static function usable(PoolMember $m): bool
+    {
+        return $m->ejectedUntil === null && $m->listed === 'ready';
+    }
+
+    /** The member this checkout should go to, or null for "any" (random, or nothing usable). */
+    private function pick(string $key): ?PoolMember
+    {
+        if ($this->readYourWrites > 0 && isset($this->affinity[$key])) {
+            [$ep, $until] = $this->affinity[$key];
+            $m = $this->members[$ep] ?? null;
+            if (self::now() >= $until || $m === null) {
+                unset($this->affinity[$key]);
+            } elseif (self::usable($m)) {
+                return $m;
+            }
+        }
+        $usable = array_values(array_filter($this->members, fn (PoolMember $m) => self::usable($m)));
+        if ($usable === [] || $this->policy === self::RANDOM) {
+            return null;
+        }
+        if ($this->policy === self::ROUND_ROBIN) {
+            usort($usable, fn (PoolMember $a, PoolMember $b) => strcmp($a->endpoint, $b->endpoint));
+            $this->rr = ($this->rr + 1) % count($usable);
+            return $usable[$this->rr];
+        }
+        $n = count($usable);
+        if ($n === 1) {
+            return $usable[0];
+        }
+        // Two distinct members, in random order.
+        $i = mt_rand(0, $n - 1);
+        $j = mt_rand(0, $n - 2);
+        if ($j >= $i) {
+            $j++;
+        }
+        [$a, $b] = [$usable[$i], $usable[$j]];
+        return self::score($a) <= self::score($b) ? $a : $b;
+    }
+
+    private static function score(PoolMember $m): float
+    {
+        // A member never measured, or not lately, scores 0: it is tried and
+        // measured.
+        if ($m->ewma === null || self::now() - $m->lastSample > self::STALE_SAMPLE) {
+            return 0.0;
+        }
+        return $m->ewma * ($m->inUse + 1);
+    }
+
+    /**
+     * Remove and return an idle connection to $target (to any usable member
+     * when null), closing the idle connections found to belong to members
+     * that are no longer usable.
+     */
+    private function takeIdle(?PoolMember $target): ?Connection
+    {
+        $n = count($this->idle);
+        $found = null;
+        $stale = [];
+        for ($k = 0; $k < $n; $k++) {
+            $i = $this->fifo ? $k : $n - 1 - $k;
+            $m = $this->members[$this->slots[$this->idle[$i]]->ep ?? ''] ?? null;
+            if ($m === null || !self::usable($m)) {
+                $stale[] = $this->idle[$i];
+                unset($this->idle[$i]);
+                continue;
+            }
+            if ($target === null || $m === $target) {
+                $found = $this->idle[$i];
+                unset($this->idle[$i]);
+                break;
+            }
+        }
+        $this->idle = array_values($this->idle);
+        foreach ($stale as $c) {
+            $c->close();
+        }
+        return $found;
+    }
+
+    /**
+     * Endpoints to dial, best first: $first, the other usable members in
+     * random order, then the rest (resyncing/unreachable before ejected, the
+     * soonest re-admission first) — a dial never has nowhere to go while any
+     * member is configured. $exclude, when given, goes last.
+     *
+     * @return array<int, string>
+     */
+    private function order(?PoolMember $first = null, ?string $exclude = null): array
+    {
+        $usable = [];
+        $rest = [];
+        foreach ($this->members as $m) {
+            if ($m === $first) {
+                continue;
+            }
+            if (self::usable($m)) {
+                $usable[] = $m;
+            } else {
+                $rest[] = $m;
+            }
+        }
+        shuffle($usable);
+        usort($rest, fn (PoolMember $a, PoolMember $b) => [$a->ejectedUntil !== null, $a->ejectedUntil ?? 0.0]
+            <=> [$b->ejectedUntil !== null, $b->ejectedUntil ?? 0.0]);
+        $eps = array_map(fn (PoolMember $m) => $m->endpoint, [...($first === null ? [] : [$first]), ...$usable, ...$rest]);
+        $i = $exclude === null ? false : array_search($exclude, $eps, true);
+        if ($i !== false && count($eps) > 1) {
+            array_splice($eps, $i, 1);
+            $eps[] = $exclude;
+        }
+        return $eps;
+    }
+
+    private function dial(array $order): Connection
+    {
+        $conn = Connection::pooled($this->args, $order, $this);
+        $this->slots[$conn] = (object) ['ep' => $conn->endpoint(), 'out' => false, 'key' => ''];
+        return $conn;
+    }
+
+    // ---- what connections report (called by Connection) -------------------
+
+    /**
+     * A pooled connection re-dialing: the pool's order, the member it lost
+     * last.
+     *
+     * @internal
+     * @return array<int, string>
+     */
+    public function dialOrder(?string $exclude): array
+    {
+        return $this->order(null, $exclude);
+    }
+
+    /**
+     * A request on $conn took $elapsed seconds (send to first response frame).
+     *
+     * @internal
+     */
+    public function roundTrip(Connection $conn, float $elapsed): void
+    {
+        $m = $this->members[$conn->endpoint() ?? ''] ?? null;
+        if ($m === null) {
+            return;
+        }
+        $m->errors = 0;
+        if ($m->ewma === null) {
+            $m->ewma = $elapsed;
+        } else {
+            $cap = self::EWMA_CLAMP * max($m->ewma, $this->ejectFloor);
+            $m->ewma += self::EWMA_WEIGHT * (min($elapsed, $cap) - $m->ewma);
+        }
+        $m->samples++;
+        $m->lastSample = self::now();
+        // Only a member still in rotation: round trips finishing on
+        // connections checked out before an ejection must not eject it again.
+        if (!self::usable($m) || $m->samples < self::EWMA_MIN_SAMPLES || $this->ejectFactor <= 0) {
+            return;
+        }
+        $others = [];
+        foreach ($this->members as $o) {
+            if ($o !== $m && self::usable($o) && $o->ewma !== null && $o->samples >= self::EWMA_MIN_SAMPLES) {
+                $others[] = $o->ewma;
+            }
+        }
+        if ($others === []) {
+            return;
+        }
+        sort($others);
+        $median = $others[intdiv(count($others) - 1, 2)]; // the lower middle when even
+        if ($m->ewma > $this->ejectFactor * $median && $m->ewma - $median > $this->ejectFloor) {
+            $this->eject($m);
+        }
+    }
+
+    /**
+     * A transport failure on $endpoint: a failed dial, an I/O error or a
+     * timeout mid-request, a capacity refusal.
+     *
+     * @internal
+     */
+    public function failed(string $endpoint): void
+    {
+        $m = $this->members[$endpoint] ?? null;
+        if ($m === null) {
+            return;
+        }
+        $m->errors++;
+        if ($m->errors >= $this->ejectErrors && $m->ejectedUntil === null) {
+            $this->eject($m);
+        }
+    }
+
+    /**
+     * $conn (re-)dialed: count it against the member it reached now.
+     *
+     * @internal
+     */
+    public function moved(Connection $conn): void
+    {
+        $slot = $this->slots[$conn] ?? null;
+        $ep = $conn->endpoint();
+        if ($slot === null || $slot->ep === $ep) {
+            return;
+        }
+        if ($slot->out) {
+            $old = $this->members[$slot->ep ?? ''] ?? null;
+            if ($old !== null && $old->inUse > 0) {
+                $old->inUse--;
+            }
+            $new = $this->members[$ep ?? ''] ?? null;
+            if ($new !== null) {
+                $new->inUse++;
+            }
+        }
+        $slot->ep = $ep;
+    }
+
+    /**
+     * $conn was closed: if it was checked out, it no longer counts.
+     *
+     * @internal
+     */
+    public function closedOut(Connection $conn): void
+    {
+        $slot = $this->slots[$conn] ?? null;
+        if ($slot === null || !$slot->out) {
+            return;
+        }
+        $slot->out = false;
+        $m = $this->members[$slot->ep ?? ''] ?? null;
+        if ($m !== null && $m->inUse > 0) {
+            $m->inUse--;
+        }
+    }
+
+    /**
+     * $sql succeeded on $conn: with read-your-writes on, a write sends the
+     * affinity key it was checked out under to that member for the window.
+     *
+     * @internal
+     */
+    public function statement(Connection $conn, string $sql): void
+    {
+        if ($this->readYourWrites <= 0 || !self::isWrite($sql)) {
+            return;
+        }
+        $slot = $this->slots[$conn] ?? null;
+        $ep = $conn->endpoint();
+        if ($slot === null || !$slot->out || $ep === null) {
+            return;
+        }
+        $now = self::now();
+        if (count($this->affinity) >= 4096) {
+            $this->affinity = array_filter($this->affinity, fn (array $a) => $a[1] > $now);
+        }
+        $this->affinity[$slot->key] = [$ep, $now + $this->readYourWrites];
+    }
+
+    // ---- ejection and re-admission ----------------------------------------
+
+    /** Take $m out of rotation — unless it is the last usable member: a slow or flaky member beats none. */
+    private function eject(PoolMember $m): void
+    {
+        $others = false;
+        foreach ($this->members as $o) {
+            if ($o !== $m && self::usable($o)) {
+                $others = true;
+                break;
+            }
+        }
+        if (!$others) {
+            return;
+        }
+        $now = self::now();
+        if ($m->readmittedAt === null || $now - $m->readmittedAt > $this->backoffMax) {
+            $m->ejections = 0; // healthy for a while: start the backoff over
+        }
+        $m->ejections++;
+        $m->ejectedUntil = $now + $this->backoffFor($m);
+        $keep = [];
+        $drop = [];
+        foreach ($this->idle as $c) {
+            if (($this->slots[$c]->ep ?? null) === $m->endpoint) {
+                $drop[] = $c;
+            } else {
+                $keep[] = $c;
+            }
+        }
+        $this->idle = $keep;
+        foreach ($drop as $c) {
+            $c->close();
+        }
+    }
+
+    private function backoffFor(PoolMember $m): float
+    {
+        return min($this->backoff * (2 ** max($m->ejections - 1, 0)), $this->backoffMax);
+    }
+
+    /**
+     * Probe the member whose backoff ran out longest ago, if any. Inline —
+     * PHP has no background thread — so a checkout runs at most one probe.
+     */
+    private function probeDue(): void
+    {
+        $now = self::now();
+        $due = null;
+        foreach ($this->members as $m) {
+            if ($m->ejectedUntil !== null && $now >= $m->ejectedUntil
+                && ($due === null || $m->ejectedUntil < $due->ejectedUntil)) {
+                $due = $m;
+            }
+        }
+        if ($due !== null) {
+            $this->probe($due);
+        }
+    }
+
+    /**
+     * Dial $m alone and run one statement, bounded by the connection timeout:
+     * success re-admits it with a fresh latency average (the probe connection
+     * joins the idle set), failure ejects it again for twice as long.
+     */
+    private function probe(PoolMember $m): void
+    {
+        $conn = null;
+        try {
+            $conn = Connection::pooled($this->args, [$m->endpoint], $this);
+            $conn->query('SHOW DATABASES');
+            $ok = $conn->isUsable();
+        } catch (SkaidbException $e) {
+            $ok = false;
+        }
+        if (!$ok) {
+            $m->ejections++;
+            $m->ejectedUntil = self::now() + $this->backoffFor($m);
+        } elseif (($this->members[$m->endpoint] ?? null) === $m) {
+            $m->ejectedUntil = null;
+            $m->errors = 0;
+            $m->ewma = null;
+            $m->samples = 0;
+            $m->readmittedAt = self::now();
+            if (count($this->idle) < $this->maxsize) {
+                $this->slots[$conn] = (object) ['ep' => $m->endpoint, 'out' => false, 'key' => ''];
+                $this->idle[] = $conn;
+
+                return;
+            }
+        }
+        $conn?->close();
+    }
+
+    // ---- discovery --------------------------------------------------------
+
+    /**
+     * Run discovery on a freshly dialed connection when the member it reached
+     * has not named itself yet (once per member, so a seed given as a host
+     * name is matched to the endpoint the server reports).
+     */
+    private function discoverThrough(Connection $conn): void
+    {
+        if (!$this->discover || $this->discoveryOff) {
+            return;
+        }
+        $m = $this->members[$conn->endpoint() ?? ''] ?? null;
+        if ($m !== null && $m->canonical === null) {
+            $this->listThrough($conn);
+        }
+    }
+
+    private function refreshDue(): bool
+    {
+        return $this->discover && !$this->discoveryOff && self::now() >= $this->nextRefresh;
+    }
+
+    private function listThrough(Connection $conn): void
+    {
+        try {
+            $rows = $conn->query('SHOW ENDPOINTS')->fetchAll();
+        } catch (SkaidbException $e) {
+            if ($conn->isUsable()) {
+                // A statement error on a live connection: a server that
+                // predates SHOW ENDPOINTS. Keep the seeds, stop asking.
+                $this->discoveryOff = true;
+            }
+            return;
+        }
+        if ($rows === []) {
+            // A standalone server: nothing to discover. Keep the seeds, stop
+            // asking.
+            $this->discoveryOff = true;
+            return;
+        }
+        $this->applyListing($conn->endpoint(), $rows);
+        $interval = $this->refreshInterval;
+        foreach ($this->members as $m) {
+            if ($m->listed === 'resyncing' || $m->listed === 'unreachable') {
+                $interval = min($interval, self::REFRESH_NOT_READY);
+                break;
+            }
+        }
+        $this->nextRefresh = self::now() + $interval;
+    }
+
+    /**
+     * Fold a SHOW ENDPOINTS answer (endpoint, state, local) into the members.
+     *
+     * @param array<int, array<string, mixed>> $rows
+     */
+    private function applyListing(?string $dialed, array $rows): void
+    {
+        $listed = [];
+        foreach ($rows as $row) {
+            $endpoint = (string) ($row['endpoint'] ?? '');
+            if ($endpoint === '') {
+                continue;
+            }
+            $listed[$endpoint] = (string) ($row['state'] ?? 'ready');
+            if (!empty($row['local']) && isset($this->members[$dialed ?? ''])) {
+                $this->members[$dialed]->canonical = $endpoint;
+            }
+        }
+        // A member reported under the name of one already known (a seed
+        // given as a host name) is that member, not a new one.
+        $byName = [];
+        foreach ($this->members as $m) {
+            if ($m->canonical !== null && (!isset($byName[$m->canonical]) || $m->seed)) {
+                $byName[$m->canonical] = $m;
+            }
+        }
+        foreach ($this->members as $key => $m) {
+            if ($m->canonical !== null && $byName[$m->canonical] !== $m) {
+                unset($this->members[$key]); // a duplicate of a seed
+            }
+        }
+        $seen = [];
+        foreach ($listed as $endpoint => $state) {
+            $endpoint = (string) $endpoint;
+            $m = $byName[$endpoint] ?? null;
+            if ($m === null) {
+                $m = $this->members[$endpoint] ?? null;
+                if ($m === null) {
+                    $m = new PoolMember($endpoint, false);
+                    $this->members[$endpoint] = $m;
+                }
+                $m->canonical = $endpoint;
+            }
+            $state = in_array($state, ['ready', 'resyncing', 'unreachable'], true) ? $state : 'ready';
+            if ($state === 'ready' && $m->listed !== 'ready') {
+                // Back in rotation: measured afresh, like a re-admission.
+                $m->ewma = null;
+                $m->samples = 0;
+                $m->errors = 0;
+            }
+            $m->listed = $state;
+            $seen[spl_object_id($m)] = true;
+        }
+        foreach ($this->members as $key => $m) {
+            if (isset($seen[spl_object_id($m)]) || ($m->seed && $m->canonical === null)) {
+                continue; // listed, or a seed not identified yet
+            }
+            if ($m->seed) {
+                $m->listed = 'unlisted'; // configured, but no longer a member
+            } else {
+                unset($this->members[$key]);
+            }
+        }
+    }
+
+    // ---- helpers ----------------------------------------------------------
+
+    /**
+     * Whether $sql writes, for read-your-writes: anything but a statement
+     * whose first keyword (after whitespace, comments and opening
+     * parentheses) is SELECT, SHOW, EXPLAIN, DESCRIBE, DESC, VALUES, WITH or
+     * USE.
+     *
+     * @internal
+     */
+    public static function isWrite(string $sql): bool
+    {
+        $i = 0;
+        $n = strlen($sql);
+        while ($i < $n) {
+            $two = substr($sql, $i, 2);
+            if (str_contains(" \t\n\r\v\f(", $sql[$i])) {
+                $i++;
+            } elseif ($two === '--') {
+                $j = strpos($sql, "\n", $i);
+                $i = $j === false ? $n : $j + 1;
+            } elseif ($two === '/*') {
+                $j = strpos($sql, '*/', $i + 2);
+                $i = $j === false ? $n : $j + 2;
+            } else {
+                break;
+            }
+        }
+        preg_match('/[A-Za-z_]*/A', $sql, $word, 0, $i);
+        return !in_array(strtolower($word[0] ?? ''), self::READ_KEYWORDS, true);
+    }
+
+    /**
+     * Whether a failed dial says something about the member's health. A
+     * refused login is the caller's problem, not the member's — except a
+     * capacity refusal, which is the member being full.
+     *
+     * @internal
+     */
+    public static function memberFault(\Throwable $e): bool
+    {
+        $msg = $e->getMessage();
+        if (str_starts_with($msg, 'authentication denied')) {
+            return str_contains($msg, 'too many connections:');
+        }
+        return !str_starts_with($msg, 'server signature mismatch');
+    }
+
+    /** Monotonic seconds. */
+    private static function now(): float
+    {
+        return hrtime(true) / 1e9;
+    }
+
+    /**
+     * Connection constructor arguments with positional ones named, so the
+     * pool can read the seeds and dial with its own endpoint order.
+     *
+     * @param array<int|string, mixed> $args
+     * @return array<string, mixed>
+     */
+    private static function named(array $args): array
+    {
+        $names = [];
+        foreach ((new \ReflectionMethod(Connection::class, '__construct'))->getParameters() as $p) {
+            $names[] = $p->getName();
+        }
+        $out = [];
+        foreach ($args as $k => $v) {
+            if (is_string($k)) {
+                $out[$k] = $v;
+            } elseif (isset($names[$k])) {
+                $out[$names[$k]] = $v;
+            }
+        }
+        return $out;
     }
 }

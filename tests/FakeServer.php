@@ -136,10 +136,19 @@ final class FakeServer
 
     private bool $corruptServerSignature;
 
+    /** @var (callable():bool)|null asked (in the child) at each accept: true closes the new connection unanswered */
+    private $refuse;
+
     private int $iterations = 1000;
 
     /** True inside the forked child, which must not tear the parent's state down. */
     private bool $child = false;
+
+    /**
+     * The process that made this server. Another fake server's child holds a
+     * copy of this object too, and its exit must not stop this server.
+     */
+    private int $owner;
 
     /** Set by SIGUSR1; the select loop closes every client at its next safe point. */
     private bool $dropAll = false;
@@ -150,11 +159,15 @@ final class FakeServer
      *   handle   — fn(array $req): string|string[]|null, called for every
      *              post-handshake request; Hello is answered with Ddl unless
      *              the handler returns something.
+     *   refuse   — fn(): bool, called at every accept; true closes the new
+     *              connection before the handshake (a node at capacity).
      */
     public function __construct(array $opts = [])
     {
         $this->password = $opts['password'] ?? 'secret';
         $this->handler = $opts['handle'] ?? fn (array $req) => null;
+        $this->refuse = $opts['refuse'] ?? null;
+        $this->owner = getmypid();
         $this->corruptServerSignature = $opts['corruptServerSignature'] ?? false;
         $this->log = tempnam(sys_get_temp_dir(), 'skaidb-fake-');
     }
@@ -200,7 +213,7 @@ final class FakeServer
 
     public function stop(): void
     {
-        if ($this->child) {
+        if ($this->child || getmypid() !== $this->owner) {
             return;
         }
         if ($this->pid > 0) {
@@ -282,6 +295,10 @@ final class FakeServer
             foreach ($read as $sock) {
                 if ($sock === $this->listener) {
                     $client = @stream_socket_accept($this->listener, 0);
+                    if ($client !== false && $this->refuse !== null && ($this->refuse)()) {
+                        fclose($client);
+                        continue;
+                    }
                     if ($client !== false) {
                         stream_set_blocking($client, false);
                         $conns[(int) $client] = ['sock' => $client, 'buf' => '', 'state' => 'start',

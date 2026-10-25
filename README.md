@@ -12,8 +12,8 @@ the bundled `hash` extension; `openssl` for TLS).
   prepared statements with typed parameters, one-round-trip batches,
   streaming result sets, full type fidelity (Int, Float, Decimal, UUID,
   Bytes, Timestamp, Array, Document).
-- Multi-seed failover, transparent reconnect, TLS, connection pooling,
-  stream subscriptions.
+- Multi-seed failover, transparent reconnect, TLS, connection pooling
+  balanced across the cluster's members, stream subscriptions.
 
 Full documentation: this README, the [`docs/`](docs/) folder
 ([getting started](docs/getting-started.md) · [API reference](docs/api.md) ·
@@ -276,10 +276,32 @@ $pool->close();
 
 `$connectionArgs` are the `Connection` constructor arguments (positional, or
 named as `['user' => ..., 'seeds' => [...]]`), so pooled connections inherit
-seeds, TLS and the session database. `maxsize` bounds the connections kept
-**idle**, not the number checked out: a burst opens extras and the surplus
-is closed on release. PHP is share-nothing per request, so a pool pays off
-in a worker or a long-running CLI job. See [docs/pooling.md](docs/pooling.md).
+TLS, credentials and the session database. `maxsize` bounds the connections
+kept **idle**, not the number checked out: a burst opens extras and the
+surplus is closed on release. PHP is share-nothing per request, so a pool
+pays off in a worker or a long-running CLI job.
+
+The pool balances across the cluster's members by the rules every skaidb
+driver shares ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):
+
+```php
+$pool = new Pool(['seeds' => ['db1:7000', 'db2:7000', 'db3:7000'], 'user' => 'app', 'password' => $pw], 8,
+    loadBalancing: 'least_latency',   // 'random' (default) | 'round_robin' | 'least_latency'
+    discover: true,                   // members from SHOW ENDPOINTS; resyncing ones skipped
+    readYourWrites: 2.0,              // seconds: a key's reads follow its last write's member
+);
+$pool->withConnection(fn (Connection $c) => $c->prepare('UPDATE users SET seen = ? WHERE id = ?')
+    ->execute([time(), $userId]), $userId);   // the affinity key for readYourWrites
+print_r($pool->members());            // endpoint, canonical, state, latency_ms, in_use, idle, seed
+```
+
+A member that keeps failing, or turns much slower than the others, is
+ejected for a backoff (`ejectErrors`, `ejectLatencyFactor`,
+`ejectBackoff`, …; never the last usable one); `idleOrder: 'fifo'` keeps
+every idle connection in use. PHP has no background threads, so the probe
+that re-admits an ejected member runs on the first `acquire()` after its
+backoff, and the discovery refresh on the first `acquire()` after the
+refresh interval. See [docs/pooling.md](docs/pooling.md).
 
 ## Type mapping
 
@@ -332,7 +354,7 @@ autocommit one by one, as described above.
 
 After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
-(the package version, `1.1.0`). An older server without the opcode ignores
+(the package version, `1.2.0`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
 client-side fallback automatically), batches ≥ 0.87.0, streaming a server
 with the streaming opcode, multiple result sets a server with `EMIT`.

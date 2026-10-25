@@ -4,6 +4,31 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-10-25
+
+### Added
+- **Pool load balancing across members** (the rules every skaidb driver
+  shares, PROTOCOL.md §6.1): `loadBalancing: 'round_robin'` /
+  `'least_latency'` (power of two choices on the round-trip average ×
+  checked-out connections, re-measuring a member not used for 2 s;
+  `'random'` stays the default), `idleOrder: 'fifo'`, health ejection
+  (consecutive transport failures, or a latency average far above the other
+  members') with a probe that re-admits the member, `discover: true`
+  (members from `SHOW ENDPOINTS`, server ≥ 0.327: joiners added, leavers
+  dropped, resyncing/unreachable members skipped and re-checked every 5 s),
+  and `readYourWrites: <seconds>` with `acquire($key)` /
+  `withConnection($fn, $key)` — reads follow the member that took the key's
+  last write. `Pool::members()` reports each member's state, latency and
+  connections. PHP has no background threads, so the probe runs on the
+  first checkout after a member's backoff and the discovery refresh on the
+  first checkout after the refresh interval.
+- `Connection::endpoint()`: the `host:port` the connection reached.
+
+### Changed
+- A pooled connection that re-dials does so in the pool's order (usable
+  members first, the one it lost last), and a pooled dial whose handshake
+  the member drops or refuses for capacity moves on to the next member.
+
 ## [1.1.0] - 2026-09-26
 
 ### Added
