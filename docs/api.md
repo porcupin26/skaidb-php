@@ -7,7 +7,7 @@ error is a `Skaidb\SkaidbException`.
 
 | Constant | Value |
 |---|---|
-| `Skaidb::VERSION` | the package version, e.g. `'1.2.0'`; what the Hello frame reports and what a release tag must equal |
+| `Skaidb::VERSION` | the package version, e.g. `'1.3.0'`; what the Hello frame reports and what a release tag must equal |
 | `Skaidb::CLIENT_NAME` | `'php'` |
 
 ## `new Connection(...)`
@@ -66,14 +66,24 @@ Returns a `Statement` to `execute()` with parameters. Nothing is sent until
 `execute()`; the server-side prepare happens on the first execute with
 parameters and is cached per connection (up to 240 distinct statements).
 
-### `stream(string $sql, int|string|null $consistency = null): Generator`
+### `stream(string $sql, array $params = [], int|string|null $consistency = null): Generator`
 
 Runs `$sql` with the streaming opcode and yields one associative row at a
-time, holding one chunk in memory. No parameters. The connection is busy
-until the generator finishes; see [streaming](streaming.md). After the last
-row, `getReturn()` on the generator gives `['kind' => 'rows'|'mutation'|'ddl',
-'columns' => [...], 'affected' => int]`: the column names even when no row
-came, and the affected count of a non-row statement.
+time, holding one chunk in memory. `$params` bind the `?` placeholders in
+order as typed values, exactly as a prepared `Statement::execute()` sends
+them (associative arrays are re-indexed), and travel in
+`OP_QUERY_STREAM_PARAMS`, which needs server ≥ 0.330; an older server
+answers with an error the driver throws as `server does not support
+parameterised streaming (skaidb >= 0.330): …`, and the connection stays
+usable. A value that cannot be bound throws before anything is sent.
+Without parameters the request is `OP_QUERY_STREAM`. An int or string in
+the `$params` position with no `$consistency` is the consistency:
+`stream($sql, 'ONE')` equals `stream($sql, consistency: 'ONE')`. The
+connection is busy until the generator finishes; see
+[streaming](streaming.md). After the last row, `getReturn()` on the
+generator gives `['kind' => 'rows'|'mutation'|'ddl', 'columns' => [...],
+'affected' => int]`: the column names even when no row came, and the
+affected count of a non-row statement.
 
 ### `subscribe(string $stream, ?string $after = null, float $poll = 0.5): Generator`
 

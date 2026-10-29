@@ -4,6 +4,25 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-10-29
+
+### Added
+- **Parameterised streaming**: `$db->stream($sql, $params)` binds `?`
+  placeholders with the typed values a prepared `execute($params)` sends
+  (associative arrays re-indexed), over `OP_QUERY_STREAM_PARAMS` (server
+  >= 0.330) — a range-bounded export no longer needs its values spliced
+  into the SQL. The signature is `stream(string $sql, $params = [],
+  $consistency = null)`. An older server's refusal throws `server does not
+  support parameterised streaming (skaidb >= 0.330): …` and leaves the
+  connection usable; a value that cannot be bound throws before anything is
+  sent. Without parameters the request is the original `OP_QUERY_STREAM`,
+  byte for byte, so it works against every server that streams.
+  `stream($sql, 'ONE')` (a consistency in the second position) still means
+  the consistency, and `consistency:` by name works as before.
+- The conformance suite's `stream_params` case: `conformance/vectors.json`
+  and `conformance/README.md` re-vendored, and the harness passes a
+  `query_stream` case's `call.params` to `stream()`.
+
 ## [1.2.0] - 2026-10-25
 
 ### Added

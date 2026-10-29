@@ -28,8 +28,7 @@ for ($i = 1; $i <= 5000; $i++) {
 }
 $db->prepare('INSERT INTO readings (id, v) VALUES (?, ?)')->executeBatch($rows);
 
-// Full scan, one chunk in memory at a time. Name the columns: on a cluster
-// a bare `SELECT *` only streams page by page at consistency ONE.
+// Full scan, one chunk in memory at a time.
 $n = 0;
 $sum = 0.0;
 foreach ($db->stream('SELECT id, v FROM readings ORDER BY id') as $row) {

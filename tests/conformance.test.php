@@ -65,7 +65,8 @@ function cf_run_call(Connection $conn, array $call): ?array
                 $st->execute();
                 return cf_statement_result($st);
             case 'query_stream':
-                $gen = $conn->stream($call['sql']);
+                // With call.params, the parameterised form (OP_QUERY_STREAM_PARAMS).
+                $gen = $conn->stream($call['sql'], array_map('cf_native', $call['params'] ?? []));
                 $rows = [];
                 try {
                     foreach ($gen as $row) {

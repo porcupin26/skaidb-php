@@ -144,6 +144,20 @@ try {
     }
     check($db->isUsable() && $db->query("SELECT count(*) AS n FROM {$big}")->fetchColumn() === 2500, 'abandoned stream leaves the connection usable');
 
+    // ---- parameterised stream (OP_QUERY_STREAM_PARAMS, server >= 0.330) -----------
+    try {
+        $ids = [];
+        foreach ($db->stream("SELECT id FROM {$big} WHERE id > ? AND id <= ? ORDER BY id", [2490, 2495]) as $row) {
+            $ids[] = $row['id'];
+        }
+        check($ids === [2491, 2492, 2493, 2494, 2495], 'a parameterised stream binds its ? placeholders');
+    } catch (SkaidbException $e) {
+        if (!str_contains($e->getMessage(), 'does not support parameterised streaming')) {
+            throw $e;
+        }
+        check($db->isUsable(), 'a server before 0.330 refuses a parameterised stream, connection still usable: ' . $e->getMessage());
+    }
+
     // ---- errors -----------------------------------------------------------------
     try {
         $db->query("SELECT nope FROM {$prefix}does_not_exist");

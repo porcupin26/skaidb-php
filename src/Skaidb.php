@@ -63,7 +63,7 @@ class Unpreparable extends SkaidbException
  */
 final class Skaidb
 {
-    public const VERSION = '1.2.0';
+    public const VERSION = '1.3.0';
 
     /** The client_name the driver reports in the server's `drivers` table. */
     public const CLIENT_NAME = 'php';
@@ -599,6 +599,19 @@ class Connection
      * exports and large scans.
      *
      *     foreach ($db->stream('SELECT ...') as $row) { ... }
+     *     foreach ($db->stream('SELECT id, v FROM t WHERE ts >= ? AND ts < ?', [$from, $to]) as $row) { ... }
+     *
+     * $params bind the statement's '?' placeholders in order — typed, as a
+     * prepared Statement::execute() sends them (associative arrays are
+     * re-indexed; there is no client-side quoting fallback on a stream).
+     * They travel in OP_QUERY_STREAM_PARAMS (server >= 0.330), as the same
+     * parameter vector OP_EXECUTE carries; an older server's refusal throws
+     * "server does not support parameterised streaming (skaidb >= 0.330): …"
+     * and leaves the connection usable. Without parameters the request is
+     * the original OP_QUERY_STREAM, so a parameterless stream works against
+     * every server. A consistency in the second position, stream($sql,
+     * 'ONE') — the signature before $params existed — still means the
+     * consistency.
      *
      * The connection is busy for the whole stream (PROTOCOL.md §3.4): any
      * other statement on it throws until the stream ends. Abandoning it —
@@ -607,25 +620,45 @@ class Connection
      * connection stays usable; a drain that cannot complete marks the
      * connection broken instead, so it re-dials rather than answering the next
      * statement with a leftover frame.
-     * Takes no parameters — the streaming opcode carries SQL text.
      *
      * Once the generator has run to the end, getReturn() describes the
      * statement: ['kind' => 'rows'|'mutation'|'ddl', 'columns' => [...],
      * 'affected' => int]. That is how a stream with no rows still reports its
      * column names, and how a non-row statement reports its affected count.
      *
+     * @param array<int|string,mixed>|int|string|null $params values for the '?' placeholders, in order
+     *                                                        (an int or string here, with no $consistency, is the consistency)
      * @param int|string|null $consistency 'ONE'/'QUORUM'/'ALL' or 0/1/2; default the connection's
      * @return \Generator<int,array<string,mixed>,mixed,array{kind:string,columns:array<int,string>,affected:int}>
      */
-    public function stream(string $sql, $consistency = null): \Generator
+    public function stream(string $sql, $params = [], $consistency = null): \Generator
     {
+        if (!is_array($params)) {
+            if ($params !== null) {
+                if ($consistency !== null) {
+                    $t = is_object($params) ? get_class($params) : gettype($params);
+                    throw new SkaidbException("stream() takes its parameters as an array, got {$t}");
+                }
+                // stream($sql, 'ONE'): the signature before $params existed.
+                $consistency = $params;
+            }
+            $params = [];
+        }
+        $params = array_values($params);
         $level = $consistency === null ? $this->consistency : self::resolveConsistency($consistency);
         $this->assertNotStreaming();
         $this->ensureLive();
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
-        $req = pack('C', 5) . pack('C', $level) . pack('V', strlen($sql)) . $sql;
+        // OP_QUERY_STREAM=5: consistency u8, u32 LE sql_len, sql bytes. With
+        // parameters, OP_QUERY_STREAM_PARAMS=9: the same, then the parameter
+        // vector. Built before anything is sent, so a value that cannot be
+        // bound throws with the connection still at a request boundary.
+        $req = pack('C', $params === [] ? 5 : 9) . pack('C', $level) . pack('V', strlen($sql)) . $sql;
+        if ($params !== []) {
+            $req .= self::encodeParams($params);
+        }
         $started = hrtime(true);
         try {
             $this->writeFrame($req);
@@ -656,10 +689,14 @@ class Connection
                 throw $e;
             }
             if ($tag === 3) {
+                // One ordinary Error frame before any header: the statement
+                // failed and the connection is at a request boundary.
                 $msg = $r->text();
-                throw new SkaidbException(
-                    str_contains($msg, 'unknown opcode') ? "server does not support streaming: {$msg}" : $msg
-                );
+                if (str_contains($msg, 'unknown opcode')) {
+                    $what = $params === [] ? 'streaming' : 'parameterised streaming (skaidb >= 0.330)';
+                    throw new SkaidbException("server does not support {$what}: {$msg}");
+                }
+                throw new SkaidbException($msg);
             }
             $this->noteStatement($sql);
             if ($tag === 1) { // Mutation: not row-producing
@@ -807,12 +844,7 @@ class Connection
      */
     public function execPrepared(int $id, array $params, int $consistency): array
     {
-        $req = pack('C', 3) . pack('C', $consistency) . pack('V', $id)
-            . pack('v', count($params));
-        foreach ($params as $p) {
-            $v = self::encodeValue($p);
-            $req .= pack('V', strlen($v)) . $v;
-        }
+        $req = pack('C', 3) . pack('C', $consistency) . pack('V', $id) . self::encodeParams($params);
         return $this->roundtrip($req);
     }
 
@@ -830,13 +862,30 @@ class Connection
         $req = pack('C', 7) . pack('C', $consistency) . pack('V', $id)
             . pack('V', count($rows));
         foreach ($rows as $params) {
-            $req .= pack('v', count($params));
-            foreach ($params as $p) {
-                $v = self::encodeValue($p);
-                $req .= pack('V', strlen($v)) . $v;
-            }
+            $req .= self::encodeParams($params);
         }
         return $this->roundtrip($req);
+    }
+
+    /**
+     * A parameter vector as OP_EXECUTE carries it — u16 LE count, then each
+     * value (§4) behind its u32 LE length — and so OP_EXECUTE_BATCH per row
+     * and OP_QUERY_STREAM_PARAMS.
+     *
+     * @param array<int,mixed> $params
+     */
+    private static function encodeParams(array $params): string
+    {
+        $n = count($params);
+        if ($n > 0xFFFF) {
+            throw new SkaidbException("too many parameters: {$n} (a request carries at most 65535)");
+        }
+        $out = pack('v', $n);
+        foreach ($params as $p) {
+            $v = self::encodeValue($p);
+            $out .= pack('V', strlen($v)) . $v;
+        }
+        return $out;
     }
 
     /**

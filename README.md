@@ -146,7 +146,7 @@ connection or per statement:
 $db = new Connection(/* ... */, consistency: 'ONE');
 $db->setConsistency('ALL');                 // from now on
 $stmt->setConsistency('QUORUM');            // this statement only
-foreach ($db->stream('SELECT ...', 'ONE') as $row) { ... }
+foreach ($db->stream('SELECT ...', consistency: 'ONE') as $row) { ... }
 ```
 
 `Connection::ONE`, `Connection::QUORUM` and `Connection::ALL` hold the
@@ -212,11 +212,15 @@ $stmt->fetchAll();       // the LAST set (the call's own result)
 $stmt->resultSets();     // every set, in emission order: [['columns' => [...], 'rows' => [...]], ...]
 ```
 
-## Streaming large results — `$db->stream($sql, $consistency = null)`
+## Streaming large results — `$db->stream($sql, $params = [], $consistency = null)`
 
 `query()` buffers the whole result; a large scan is also bounded by the
 server's scan budgets. `stream()` asks the server to deliver the rows in
-chunks and yields them one at a time, holding one chunk in memory:
+chunks and yields them one at a time, holding one chunk in memory. The
+server executes a plain `SELECT` page by page, and no scan budget applies to
+a streamed page (server ≥ 0.330; the rules are under "Streamed queries" in
+the [query syntax](https://skaidb.org/docs/query_syntax.html), and `EXPLAIN`
+says which statements page):
 
 ```php
 foreach ($db->stream('SELECT id, v FROM readings') as $row) {
@@ -224,14 +228,29 @@ foreach ($db->stream('SELECT id, v FROM readings') as $row) {
 }
 ```
 
-It takes **no parameters** (the streaming opcode carries SQL text only). A
-non-row statement streamed this way yields nothing; once the generator has
+`$params` bind the statement's `?` placeholders in order, sent as typed
+values exactly as a prepared `execute()` sends them:
+
+```php
+foreach ($db->stream('SELECT id, ts, body FROM events WHERE ts >= ? AND ts < ?', [$from, $to]) as $row) {
+    export($row);
+}
+```
+
+A parameterised stream needs server ≥ 0.330; an older server's refusal
+throws `server does not support parameterised streaming (skaidb >= 0.330):
+…` and leaves the connection usable. A stream without parameters sends the
+original streaming opcode, so it works against any server that streams.
+`$consistency` overrides the connection's level for the statement;
+`stream($sql, 'ONE')`, a consistency in the second position, means the same
+as `stream($sql, consistency: 'ONE')`.
+
+A non-row statement streamed this way yields nothing; once the generator has
 finished, `getReturn()` gives `['kind' => 'rows'|'mutation'|'ddl',
 'columns' => [...], 'affected' => n]`. An error before any row
 is an ordinary statement error; an error partway through (a node dying
 mid-scan, a scan budget tripping) is thrown after the rows already yielded,
-which are valid. On a cluster, name the columns: a bare `SELECT *` only
-streams page by page at consistency `ONE`.
+which are valid.
 
 **The connection is busy for the whole stream.** Any other statement on it
 throws `connection is busy streaming a result set` until the stream ends.
@@ -354,10 +373,11 @@ autocommit one by one, as described above.
 
 After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
-(the package version, `1.2.0`). An older server without the opcode ignores
+(the package version, `1.3.0`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
 client-side fallback automatically), batches ≥ 0.87.0, streaming a server
-with the streaming opcode, multiple result sets a server with `EMIT`.
+with the streaming opcode, parameterised streaming ≥ 0.330, multiple result
+sets a server with `EMIT`.
 
 ## Development
 

@@ -4,7 +4,8 @@
 
 Results decode from skaidb's typed wire values; parameters encode back to
 them when a statement is prepared on the server (the normal path whenever
-you pass values to `execute()` or `executeBatch()`).
+you pass values to `execute()` or `executeBatch()`) and when they travel
+with a streamed statement (`stream($sql, $params)`).
 
 | skaidb type | Result value | Accepted as a parameter |
 |---|---|---|

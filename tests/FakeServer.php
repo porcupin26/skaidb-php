@@ -465,6 +465,15 @@ final class FakeServer
                 return ['op' => $op, 'consistency' => $c, 'id' => $id, 'rows' => $rows];
             case 8:
                 return ['op' => $op, 'name' => $r->text(), 'version' => $r->text()];
+            case 9: // OP_QUERY_STREAM_PARAMS: OP_QUERY_STREAM, then OP_EXECUTE's parameter vector
+                $c = $r->u8();
+                $sql = $r->text();
+                $n = $r->u16();
+                $params = [];
+                for ($i = 0; $i < $n; $i++) {
+                    $params[] = Connection::decodeValue(new Reader($r->blob()));
+                }
+                return ['op' => $op, 'consistency' => $c, 'sql' => $sql, 'params' => $params];
             default:
                 return ['op' => $op, 'raw' => $payload];
         }
