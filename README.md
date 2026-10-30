@@ -247,7 +247,11 @@ as `stream($sql, consistency: 'ONE')`.
 
 A non-row statement streamed this way yields nothing; once the generator has
 finished, `getReturn()` gives `['kind' => 'rows'|'mutation'|'ddl',
-'columns' => [...], 'affected' => n]`. An error before any row
+'columns' => [...], 'affected' => n]`. A `CALL` whose body `EMIT`s result
+sets is answered with all of them in one frame even when streamed: the
+generator yields the rows `fetch()` would return (the last set), and
+`getReturn()` adds `'result_sets'`, every set as `resultSets()` returns
+them. An error before any row
 is an ordinary statement error; an error partway through (a node dying
 mid-scan, a scan budget tripping) is thrown after the rows already yielded,
 which are valid.
@@ -373,7 +377,7 @@ autocommit one by one, as described above.
 
 After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
-(the package version, `1.3.0`). An older server without the opcode ignores
+(the package version, `1.4.0`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
 client-side fallback automatically), batches ≥ 0.87.0, streaming a server
 with the streaming opcode, parameterised streaming ≥ 0.330, multiple result

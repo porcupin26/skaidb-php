@@ -7,7 +7,7 @@ error is a `Skaidb\SkaidbException`.
 
 | Constant | Value |
 |---|---|
-| `Skaidb::VERSION` | the package version, e.g. `'1.3.0'`; what the Hello frame reports and what a release tag must equal |
+| `Skaidb::VERSION` | the package version, e.g. `'1.4.0'`; what the Hello frame reports and what a release tag must equal |
 | `Skaidb::CLIENT_NAME` | `'php'` |
 
 ## `new Connection(...)`
@@ -83,7 +83,11 @@ connection is busy until the generator finishes; see
 [streaming](streaming.md). After the last row, `getReturn()` on the
 generator gives `['kind' => 'rows'|'mutation'|'ddl', 'columns' => [...],
 'affected' => int]`: the column names even when no row came, and the
-affected count of a non-row statement.
+affected count of a non-row statement. A `CALL` whose body `EMIT`s result
+sets is answered with all of them in one frame even when streamed: the
+generator yields the rows `fetch()` would return (the last set) and
+`getReturn()` adds `'result_sets'`, every set as `resultSets()` returns
+them.
 
 ### `subscribe(string $stream, ?string $after = null, float $poll = 0.5): Generator`
 

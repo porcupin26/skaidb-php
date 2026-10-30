@@ -215,6 +215,49 @@ test('stream: a parameterised stream reads rows, a mutation, an error and an ear
     $srv->stop();
 });
 
+test('stream: a CALL whose body EMITs returns every set in order; the connection stays usable', function () {
+    // One ResultSets frame, as Statement::execute() receives it: [a: x, y] then [b: z].
+    $sets = F::resultSets([[['a'], [['x'], ['y']]], [['b'], [['z']]]]);
+    $five = '0100' . '09000000' . '020500000000000000';   // one parameter: Int 5
+    with_exact_server([
+        [req_query_stream_params(1, 'CALL report(?)', $five), [$sets]],
+        [req_query_stream(1, 'CALL report()'), [$sets]],
+        [req_query_stream(1, 'CALL report()'), [$sets]],
+        [req_query_stream(1, 'SELECT n FROM t'), reply_one_row()],
+        [req_query_stream(1, 'SELECT n FROM t'), reply_one_row()],
+    ], function (Connection $conn) {
+        foreach ([['CALL report(?)', [5]], ['CALL report()', []]] as [$sql, $params]) {
+            $gen = $conn->stream($sql, $params);
+            // The rows fetch() would return: the call's final result, the last set ...
+            assert_eq([['b' => 'z']], iterator_to_array($gen), $sql);
+            // ... and every set, in emission order, as Statement::resultSets() returns them.
+            assert_eq([
+                'kind' => 'rows',
+                'columns' => ['b'],
+                'affected' => 0,
+                'result_sets' => [
+                    ['columns' => ['a'], 'rows' => [['a' => 'x'], ['a' => 'y']]],
+                    ['columns' => ['b'], 'rows' => [['b' => 'z']]],
+                ],
+            ], $gen->getReturn(), $sql);
+            assert_true($conn->isUsable(), 'one frame: nothing is left in flight');
+        }
+        // The connection is free while the rows are read, and the CALL's
+        // generator finishing does not release a stream started meanwhile.
+        $inner = null;
+        foreach ($conn->stream('CALL report()') as $row) {
+            assert_eq(['b' => 'z'], $row);
+            $inner = $conn->stream('SELECT n FROM t');
+            assert_eq(['n' => 1], $inner->current());
+        }
+        assert_true(!$conn->isUsable(), 'the inner stream still owns the connection');
+        assert_eq([['n' => 1]], iterator_to_array($inner));
+        // Nothing was left on the socket: the same connection reads its own reply.
+        assert_eq([['n' => 1]], iterator_to_array($conn->stream('SELECT n FROM t')));
+        assert_true($conn->isUsable());
+    });
+});
+
 test('stream: an older server refusing OP_QUERY_STREAM_PARAMS says so; the connection stays usable', function () {
     // A server before 0.330 knows OP_QUERY_STREAM but not opcode 9, and
     // answers the unknown opcode with one ordinary Error frame.

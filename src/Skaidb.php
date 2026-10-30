@@ -63,7 +63,7 @@ class Unpreparable extends SkaidbException
  */
 final class Skaidb
 {
-    public const VERSION = '1.3.0';
+    public const VERSION = '1.4.0';
 
     /** The client_name the driver reports in the server's `drivers` table. */
     public const CLIENT_NAME = 'php';
@@ -626,10 +626,16 @@ class Connection
      * 'affected' => int]. That is how a stream with no rows still reports its
      * column names, and how a non-row statement reports its affected count.
      *
+     * A CALL whose body EMITs result sets is answered with all of them in one
+     * frame, streamed or not: the generator yields the rows fetch() would
+     * return (the call's final result, the last set), getReturn() adds
+     * 'result_sets' — every set, in order, as Statement::resultSets() returns
+     * them — and the connection is free again before the first row arrives.
+     *
      * @param array<int|string,mixed>|int|string|null $params values for the '?' placeholders, in order
      *                                                        (an int or string here, with no $consistency, is the consistency)
      * @param int|string|null $consistency 'ONE'/'QUORUM'/'ALL' or 0/1/2; default the connection's
-     * @return \Generator<int,array<string,mixed>,mixed,array{kind:string,columns:array<int,string>,affected:int}>
+     * @return \Generator<int,array<string,mixed>,mixed,array{kind:string,columns:array<int,string>,affected:int,result_sets?:array<int,array{columns:array<int,string>,rows:array<int,array<string,mixed>>}>}>
      */
     public function stream(string $sql, $params = [], $consistency = null): \Generator
     {
@@ -670,6 +676,7 @@ class Connection
         // is already part of the stream's exchange.
         $this->streaming = true;
         $live = false; // true only once the header promises RowsChunk frames
+        $released = false; // the exchange ended before the rows were yielded
         try {
             try {
                 $frame = $this->readFrame();
@@ -704,6 +711,23 @@ class Connection
             }
             if ($tag === 2) { // Ddl
                 return ['kind' => 'ddl', 'columns' => [], 'affected' => 0];
+            }
+            if ($tag === 8) {
+                // ResultSets: a CALL whose body EMITted is answered with
+                // every set in ONE frame, streamed or not — the frame
+                // Statement::execute() receives, decoded by the same code.
+                // Nothing follows it, so the connection is handed back
+                // before the first row reaches the caller (who may use it),
+                // and the finally below must not release it a second time:
+                // by then it may belong to a stream the caller started.
+                $sets = self::assocSets(self::readResultSets($r)['result_sets']);
+                $this->finishStream(false);
+                $released = true;
+                $last = $sets === [] ? ['columns' => [], 'rows' => []] : $sets[count($sets) - 1];
+                foreach ($last['rows'] as $row) {
+                    yield $row;
+                }
+                return ['kind' => 'rows', 'columns' => $last['columns'], 'affected' => 0, 'result_sets' => $sets];
             }
             if ($tag !== 5) {
                 // We cannot know what else this reply left queued behind it.
@@ -750,7 +774,9 @@ class Connection
             }
             return ['kind' => 'rows', 'columns' => $columns, 'affected' => 0];
         } finally {
-            $this->finishStream($live);
+            if (!$released) {
+                $this->finishStream($live);
+            }
         }
     }
 
@@ -960,51 +986,11 @@ class Connection
         $r = new Reader($this->exchange($req));
         $tag = $r->u8();
         if ($tag === 0) { // Rows
-            $ncols = $r->u32();
-            $columns = [];
-            for ($i = 0; $i < $ncols; $i++) {
-                $columns[] = $r->text();
-            }
-            $nrows = $r->u32();
-            $rows = [];
-            for ($i = 0; $i < $nrows; $i++) {
-                $ncells = $r->u32();
-                $row = [];
-                for ($c = 0; $c < $ncells; $c++) {
-                    // Each cell is a length-prefixed blob holding one Value.
-                    $cell = new Reader($r->blob());
-                    $row[] = self::decodeValue($cell);
-                }
-                $rows[] = $row;
-            }
-            return ['kind' => 'rows', 'columns' => $columns, 'rows' => $rows, 'affected' => 0];
+            $set = self::readRows($r);
+            return ['kind' => 'rows', 'columns' => $set['columns'], 'rows' => $set['rows'], 'affected' => 0];
         }
         if ($tag === 8) { // ResultSets: a CALL whose body EMITted
-            $sets = [];
-            $nsets = $r->u32();
-            for ($s = 0; $s < $nsets; $s++) {
-                $ncols = $r->u32();
-                $columns = [];
-                for ($i = 0; $i < $ncols; $i++) {
-                    $columns[] = $r->text();
-                }
-                $nrows = $r->u32();
-                $rows = [];
-                for ($i = 0; $i < $nrows; $i++) {
-                    $ncells = $r->u32();
-                    $row = [];
-                    for ($c = 0; $c < $ncells; $c++) {
-                        $row[] = self::decodeValue(new Reader($r->blob()));
-                    }
-                    $rows[] = $row;
-                }
-                $sets[] = ['columns' => $columns, 'rows' => $rows];
-            }
-            // The last set (the call's final result) is the result's own
-            // columns/rows; every set, in order, is under result_sets.
-            $last = $sets === [] ? ['columns' => [], 'rows' => []] : $sets[count($sets) - 1];
-            return ['kind' => 'rows', 'columns' => $last['columns'], 'rows' => $last['rows'],
-                    'affected' => 0, 'result_sets' => $sets];
+            return self::readResultSets($r);
         }
         if ($tag === 1) { // Mutation
             $affected = $r->u64();
@@ -1017,6 +1003,79 @@ class Connection
             throw new SkaidbException($r->text());
         }
         throw new SkaidbException("unknown response tag {$tag}");
+    }
+
+    /**
+     * A Rows body (PROTOCOL.md §3.2), also one set of ResultSets; $r sits
+     * just past the tag.
+     *
+     * @return array{columns:array<int,string>, rows:array<int,array<int,mixed>>}
+     */
+    private static function readRows(Reader $r): array
+    {
+        $ncols = $r->u32();
+        $columns = [];
+        for ($i = 0; $i < $ncols; $i++) {
+            $columns[] = $r->text();
+        }
+        $nrows = $r->u32();
+        $rows = [];
+        for ($i = 0; $i < $nrows; $i++) {
+            $ncells = $r->u32();
+            $row = [];
+            for ($c = 0; $c < $ncells; $c++) {
+                // Each cell is a length-prefixed blob holding one Value.
+                $row[] = self::decodeValue(new Reader($r->blob()));
+            }
+            $rows[] = $row;
+        }
+        return ['columns' => $columns, 'rows' => $rows];
+    }
+
+    /**
+     * A ResultSets body (a CALL whose body EMITted), $r just past the tag.
+     * The buffered path and a stream request both receive this frame, and
+     * both decode it here: the last set (the call's final result) is the
+     * result's own columns/rows; every set, in order, is under result_sets.
+     *
+     * @return array{kind:string, columns:array<int,string>, rows:array<int,array<int,mixed>>, affected:int,
+     *               result_sets:array<int,array{columns:array<int,string>,rows:array<int,array<int,mixed>>}>}
+     */
+    private static function readResultSets(Reader $r): array
+    {
+        $sets = [];
+        $nsets = $r->u32();
+        for ($s = 0; $s < $nsets; $s++) {
+            $sets[] = self::readRows($r);
+        }
+        $last = $sets === [] ? ['columns' => [], 'rows' => []] : $sets[count($sets) - 1];
+        return ['kind' => 'rows', 'columns' => $last['columns'], 'rows' => $last['rows'],
+                'affected' => 0, 'result_sets' => $sets];
+    }
+
+    /**
+     * Every set of a ResultSets reply with its rows keyed by column name, as
+     * Statement::resultSets() and a stream's getReturn() hand them out.
+     *
+     * @internal
+     * @param array<int,array{columns:array<int,string>,rows:array<int,array<int,mixed>>}> $sets
+     * @return array<int,array{columns:array<int,string>,rows:array<int,array<string,mixed>>}>
+     */
+    public static function assocSets(array $sets): array
+    {
+        $out = [];
+        foreach ($sets as $set) {
+            $rows = [];
+            foreach ($set['rows'] as $row) {
+                $assoc = [];
+                foreach ($set['columns'] as $i => $name) {
+                    $assoc[$name] = $row[$i] ?? null;
+                }
+                $rows[] = $assoc;
+            }
+            $out[] = ['columns' => $set['columns'], 'rows' => $rows];
+        }
+        return $out;
     }
 
     // ---- pool reporting ---------------------------------------------------
@@ -1912,19 +1971,7 @@ class Statement
         if ($this->resultSets === null) {
             return null;
         }
-        $out = [];
-        foreach ($this->resultSets as $set) {
-            $rows = [];
-            foreach ($set['rows'] as $row) {
-                $assoc = [];
-                foreach ($set['columns'] as $i => $name) {
-                    $assoc[$name] = $row[$i] ?? null;
-                }
-                $rows[] = $assoc;
-            }
-            $out[] = ['columns' => $set['columns'], 'rows' => $rows];
-        }
-        return $out;
+        return Connection::assocSets($this->resultSets);
     }
 
     /**

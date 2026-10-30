@@ -4,6 +4,21 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-10-29
+
+### Fixed
+- A streamed `CALL` whose procedure body `EMIT`s result sets returns them.
+  The server answers such a call with every set in one `ResultSets` frame
+  (tag 8) even to a stream request, and `$db->stream()`, with or without
+  parameters, threw `unexpected response tag 8 to stream request` and
+  marked the connection broken. The frame is now decoded by the code
+  `Statement::execute()` uses: the generator yields the rows `fetch()`
+  would return (the call's final result, the last set), and `getReturn()`
+  adds `'result_sets'`, every set in order exactly as
+  `Statement::resultSets()` returns them. The exchange is complete in that
+  one frame, so the connection is handed back before the first row is
+  yielded and stays usable.
+
 ## [1.3.0] - 2026-10-29
 
 ### Added

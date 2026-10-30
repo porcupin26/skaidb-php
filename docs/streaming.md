@@ -49,6 +49,12 @@ foreach ($db->stream('SELECT id, v FROM readings ORDER BY id') as $row) {
   foreach ($gen as $row) {}
   $gen->getReturn()['affected'];   // rows deleted
   ```
+- A `CALL` whose procedure body `EMIT`s result sets answers with all of them
+  in one frame, as it does to `execute()`: the generator yields the rows
+  `fetch()` would return (the call's final result, the last set), and
+  `getReturn()` adds `'result_sets'` — every set, in order, as
+  `Statement::resultSets()` returns them. Nothing is left in flight, so the
+  connection is free again before the first row is yielded.
 - An error before any row throws an ordinary `SkaidbException`. An error
   partway through (a node dying mid-scan, a scan budget tripping) throws
   after the rows already yielded, which are valid.
