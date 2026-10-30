@@ -82,6 +82,15 @@ function cf_run_call(Connection $conn, array $call): ?array
                     ]];
                 }
                 $summary = $gen->getReturn();
+                // A CALL that EMITs: the stream yields the last set (what
+                // fetch() returns) and getReturn() carries every set.
+                $sets = $summary['result_sets'] ?? null;
+                if ($sets !== null && count($sets) > 1) {
+                    if (!cf_same($sets[count($sets) - 1]['rows'], $rows)) {
+                        fail('the stream yielded ' . cf_show($rows) . ', not the last result set');
+                    }
+                    return ['result_sets' => array_map(fn ($s) => cf_rows($s['columns'], $s['rows']), $sets)];
+                }
                 return match ($summary['kind']) {
                     'rows' => ['rows' => cf_rows($summary['columns'], $rows)],
                     'mutation' => ['affected' => (string) $summary['affected']],
