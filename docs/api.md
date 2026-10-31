@@ -7,7 +7,7 @@ error is a `Skaidb\SkaidbException`.
 
 | Constant | Value |
 |---|---|
-| `Skaidb::VERSION` | the package version, e.g. `'1.4.0'`; what the Hello frame reports and what a release tag must equal |
+| `Skaidb::VERSION` | the package version, e.g. `'1.4.1'`; what the Hello frame reports and what a release tag must equal |
 | `Skaidb::CLIENT_NAME` | `'php'` |
 
 ## `new Connection(...)`
@@ -237,7 +237,8 @@ or `$ejectErrors < 1` throws `SkaidbException`.
   `endpoint` (what the pool dials), `canonical` (the member's own name once
   discovered, else `null`), `state` (`'ready'`, `'ejected'`, `'resyncing'`,
   `'unreachable'`, `'unlisted'`), `latency_ms` (the round-trip average,
-  `null` until measured), `in_use`, `idle`, `seed`.
+  `null` until its first three round trips seed it), `in_use`, `idle`,
+  `seed`.
 - `close(): void` — closes every idle connection; `acquire()` then throws
   `pool is closed`.
 

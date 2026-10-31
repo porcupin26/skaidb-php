@@ -321,7 +321,12 @@ print_r($pool->members());            // endpoint, canonical, state, latency_ms,
 A member that keeps failing, or turns much slower than the others, is
 ejected for a backoff (`ejectErrors`, `ejectLatencyFactor`,
 `ejectBackoff`, …; never the last usable one); `idleOrder: 'fifo'` keeps
-every idle connection in use. PHP has no background threads, so the probe
+every idle connection in use. The fastest of a member's first three round
+trips seeds its latency average, so a statement that stalls in your own
+process (a CPU-bound start-up) cannot get a healthy member ejected; each
+ejection goes to the PHP error log (`error_log()`) with its reason — for a
+latency one the average, the median and the slowest of the member's last
+10 round trips. PHP has no background threads, so the probe
 that re-admits an ejected member runs on the first `acquire()` after its
 backoff, and the discovery refresh on the first `acquire()` after the
 refresh interval. See [docs/pooling.md](docs/pooling.md).
@@ -377,7 +382,7 @@ autocommit one by one, as described above.
 
 After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
-(the package version, `1.4.0`). An older server without the opcode ignores
+(the package version, `1.4.1`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
 client-side fallback automatically), batches ≥ 0.87.0, streaming a server
 with the streaming opcode, parameterised streaming ≥ 0.330, multiple result

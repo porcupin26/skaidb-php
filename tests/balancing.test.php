@@ -179,6 +179,44 @@ function lb_inside(Pool $p, \Closure $fn): mixed
     return \Closure::bind($fn, $p, Pool::class)();
 }
 
+/**
+ * Stand-ins for connections to each member, to feed the pool's latency
+ * measurements (Pool::roundTrip) round trips of a chosen length.
+ *
+ * @param array<int,FakeMember> $members
+ * @return array<string,Connection> by member name
+ */
+function lb_fakes(array $members): array
+{
+    $fakes = [];
+    foreach ($members as $m) {
+        $conn = (new \ReflectionClass(Connection::class))->newInstanceWithoutConstructor();
+        (fn () => $this->connected = $m->endpoint)->call($conn);
+        $fakes[$m->name] = $conn;
+    }
+    return $fakes;
+}
+
+/**
+ * Run $fn with PHP's error log, where the pool writes its warnings, pointed
+ * at a temp file.
+ *
+ * @return array{0:mixed,1:array<int,string>} what $fn returned, and the lines logged meanwhile (timestamps cut)
+ */
+function lb_logged(\Closure $fn): array
+{
+    $file = tempnam(sys_get_temp_dir(), 'skaidb-log-');
+    $prev = ini_set('error_log', $file);
+    try {
+        $out = $fn();
+    } finally {
+        ini_set('error_log', $prev === false ? '' : $prev);
+        $lines = file($file, FILE_IGNORE_NEW_LINES) ?: [];
+        @unlink($file);
+    }
+    return [$out, array_map(fn (string $l) => preg_replace('/^\[[^\]]*\] /', '', $l), $lines)];
+}
+
 /** Every member lists these [endpoint => state] for SHOW ENDPOINTS. */
 function lb_list(array $members, array $states): void
 {
@@ -289,9 +327,10 @@ test('balancing: a failing member is ejected, then the first checkout after the 
     [$a, $b, $c] = lb_members('a', 'b', 'c');
     $b->set('refuse', true);
     $p = lb_pool([$a, $b, $c], loadBalancing: 'round_robin', ejectErrors: 2, ejectBackoff: 0.5);
-    $served = lb_serve($p, 12);
+    [$served, $log] = lb_logged(fn () => lb_serve($p, 12));
     assert_true(!in_array('b', $served, true), implode(',', $served));
     assert_eq('ejected', lb_state($p, $b));
+    assert_eq(["skaidb pool: ejecting {$b->endpoint} (2 consecutive connection failures)"], $log);
     // Healthy again, but nothing probes before the backoff is over.
     $b->set('refuse', false);
     lb_who($p);
@@ -301,11 +340,13 @@ test('balancing: a failing member is ejected, then the first checkout after the 
     $m->samples = 50;
     // No background thread: the first checkout after the backoff probes b.
     usleep(550_000);
-    lb_who($p);
+    [, $log] = lb_logged(fn () => lb_who($p));
     assert_eq('ready', lb_state($p, $b));
+    assert_eq(["skaidb pool: re-admitted {$b->endpoint}"], $log);
     assert_eq(0, $m->errors, 'a re-admitted member starts with its errors cleared');
-    // ... and a fresh average (this checkout may have measured one sample).
-    assert_true($m->samples <= 1 && $m->ewma !== 9.9, "samples {$m->samples}");
+    // ... and a fresh average (this checkout may have measured one sample,
+    // too few to seed it).
+    assert_true($m->samples <= 1 && $m->ewma === null, "samples {$m->samples}");
     assert_true(in_array('b', lb_serve($p, 6), true));
     $p->close();
 });
@@ -395,6 +436,70 @@ test('balancing: one slow statement does not eject a member', function () {
     $p->close();
 });
 
+test('balancing: a slow first round trip does not eject a member', function () {
+    // The first statements on b stall in the client — a CPU-bound worker
+    // starting up holds the process — and b answers fast from then on: the
+    // fastest of its first round trips seeds its average, so b stays in
+    // rotation. (Seeded by its first round trip alone, b's average still
+    // read 3.8 s once another member had 10 samples, and b was ejected.)
+    [$a, $b, $c] = $ms = lb_members('a', 'b', 'c');
+    $p = lb_pool($ms, loadBalancing: 'round_robin', ejectLatencyFloor: 0.05);
+    $conn = lb_fakes($ms);
+    $p->roundTrip($conn['b'], 6.6);
+    $p->roundTrip($conn['b'], 3.0);
+    for ($i = 0; $i < 12; $i++) {
+        foreach (['a', 'b', 'c'] as $name) {
+            $p->roundTrip($conn[$name], 0.0002);
+        }
+    }
+    assert_eq('ready', lb_state($p, $b));
+    $ewma = lb_member($p, $b)->ewma;
+    assert_true($ewma < 0.05, "b's average is {$ewma} s");
+    $p->close();
+});
+
+test('balancing: a member slow from its first round trip is ejected, and the log names its slowest round trip', function () {
+    [$a, $b, $c] = $ms = lb_members('a', 'b', 'c');
+    $p = lb_pool($ms, loadBalancing: 'round_robin', ejectLatencyFloor: 0.05, ejectBackoff: 30.0);
+    $conn = lb_fakes($ms);
+    [, $log] = lb_logged(function () use ($p, $conn) {
+        for ($i = 0; $i < 12; $i++) {
+            $p->roundTrip($conn['a'], 0.0002);
+            $p->roundTrip($conn['c'], 0.0002);
+            $p->roundTrip($conn['b'], $i === 5 ? 0.9 : 0.5);
+        }
+    });
+    assert_eq('ejected', lb_state($p, $b));
+    $ejected = array_values(array_filter($log, fn (string $l) => str_contains($l, 'ejecting')));
+    assert_eq(1, count($ejected), json_encode($log));
+    assert_match('/^skaidb pool: ejecting ' . preg_quote($b->endpoint, '/') . ' \(latency 5\d\d\.\d ms vs median 0\.2 ms; '
+        . 'slowest of the last 10 round trips 900\.0 ms\)$/', $ejected[0]);
+    $p->close();
+});
+
+test('balancing: a re-admitted member is seeded afresh', function () {
+    [$a, $b, $c] = $ms = lb_members('a', 'b', 'c');
+    $p = lb_pool($ms, loadBalancing: 'round_robin');
+    $conn = lb_fakes($ms);
+    $m = lb_member($p, $b);
+    foreach ([0.004, 0.003, 0.002] as $t) {
+        $p->roundTrip($conn['b'], $t);
+    }
+    assert_eq(0.002, $m->ewma);
+    // Ejected, then re-admitted by the probe (run here directly) ...
+    for ($i = 0; $i < 3; $i++) {
+        lb_inside($p, fn () => $this->failed($b->endpoint));
+    }
+    assert_eq('ejected', lb_state($p, $b));
+    lb_inside($p, fn () => $this->probe($m));
+    assert_eq('ready', lb_state($p, $b));
+    // ... with nothing left of its round trips before.
+    assert_eq([null, [], [], 0], [$m->ewma, $m->firsts, $m->recent, $m->samples]);
+    $p->roundTrip($conn['b'], 0.007);
+    assert_eq(null, $m->ewma, 'not measured until its first three round trips');
+    $p->close();
+});
+
 test('balancing: a failed dial falls through to the next member', function () {
     [$a, $b, $c] = lb_members('a', 'b', 'c');
     $b->set('refuse', true); // closes each connection before the handshake
@@ -466,11 +571,13 @@ test('balancing: discovered members join; resyncing ones get no connections unti
     // interval) lets it in, measured afresh.
     $m = lb_member($p, $c);
     $m->ewma = 9.9;
+    $m->firsts = [9.9];
+    $m->recent = [9.9];
     $m->samples = 50;
     lb_list($ms, [$a->endpoint => 'ready', $b->endpoint => 'ready', $c->endpoint => 'ready']);
     usleep(350_000);
     lb_who($p);
-    assert_eq([null, 0], [$m->ewma, $m->samples]);
+    assert_eq([null, [], [], 0], [$m->ewma, $m->firsts, $m->recent, $m->samples]);
     assert_eq('ready', lb_state($p, $c));
     assert_true(in_array('c', lb_serve($p, 6), true));
     $p->close();
@@ -579,7 +686,7 @@ test('balancing: statement classification for read-your-writes', function () {
 test('balancing: members() reports state, latency and connections per member', function () {
     [$a, $b] = lb_members('a', 'b');
     $p = lb_pool([$a, $b], loadBalancing: 'round_robin');
-    lb_serve($p, 2);
+    lb_serve($p, 6); // three round trips each: their averages are seeded
     $held = [$p->acquire(), $p->acquire(), $p->acquire()];
     $rows = $p->members();
     $eps = [$a->endpoint, $b->endpoint];

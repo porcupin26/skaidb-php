@@ -65,7 +65,7 @@ $pool = new Pool(['user' => 'app', 'password' => $pw, 'database' => 'app',
 | `discover` | `false` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) when a member is first reached and every `refreshInterval` after. New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members the server reports `resyncing` or `unreachable` get no new connections until they are `ready` again — the pool re-reads the list every 5 s while one is not. A member that comes back starts with a fresh latency average. An older server (an error) or a standalone one (no rows) leaves the seeds as they are, and the pool stops asking. |
 | `refreshInterval` | `60.0` | Seconds between discovery refreshes. |
 | `ejectErrors` | `3` | Consecutive transport failures (dial, I/O, timeout, capacity refusal) that eject a member. Statement errors and refused logins do not count. |
-| `ejectLatencyFactor`, `ejectLatencyFloor` | `3.0`, `0.05` | A member whose round-trip average is above factor × the other members' median **and** more than floor seconds above it is ejected (after 10 samples on it and on another member). A factor of `0` disables it. |
+| `ejectLatencyFactor`, `ejectLatencyFloor` | `3.0`, `0.05` | A member whose round-trip average is above factor × the other members' median **and** more than floor seconds above it is ejected (after 10 samples on it and on another member). The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up — cannot get a healthy member ejected; the warning in the PHP error log names the average, the median and the slowest of the member's last 10 round trips. A factor of `0` disables it. |
 | `ejectBackoff`, `ejectBackoffMax` | `5.0`, `60.0` | Seconds an ejection lasts, doubling per repeat; a member healthy for `ejectBackoffMax` after its re-admission starts over at `ejectBackoff`. The last usable member is never ejected — a slow or flaky member beats none. |
 | `readYourWrites` | `0.0` | Seconds after a write during which checkouts with the same affinity key go to the member that took the write. `0` turns it off. |
 
@@ -75,8 +75,9 @@ A checkout that targets a member takes an idle connection to it, or dials
 it; a failed dial (refused, dropped before the handshake, at capacity)
 falls through to the other usable members in random order, then to the
 ones that are not usable. Every round trip (request to the first response
-frame) feeds the member's latency average, which moves 5 % per sample, so
-one slow statement barely moves it.
+frame) feeds the member's latency average: the fastest of its first three
+seeds it, and each one after moves it 5 %, so one slow statement barely
+moves it.
 
 ### Upkeep happens inside `acquire()`
 
@@ -141,10 +142,23 @@ ejected or not `ready`.
 
 `endpoint` is what the pool dials, `canonical` the member's own name once
 discovered, `state` one of `ready`, `ejected`, `resyncing`, `unreachable` or
-`unlisted`, `latency_ms` the round-trip average (`null` until measured).
+`unlisted`, `latency_ms` the round-trip average (`null` until measured — its
+first three round trips seed it).
 `Connection::endpoint()` tells which member a connection reached. The rules
 are the same in every skaidb driver
 ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
+
+Each ejection and re-admission is written with `error_log()` — wherever the
+`error_log` setting points, stderr in the CLI when it is unset — with the
+reason. A latency ejection names the member's average, the median it was
+compared with and the slowest of its last 10 round trips, which tells a
+slow member from one slow statement:
+
+```
+skaidb pool: ejecting db2:7000 (latency 516.3 ms vs median 0.2 ms; slowest of the last 10 round trips 900.0 ms)
+skaidb pool: ejecting db3:7000 (3 consecutive connection failures)
+skaidb pool: re-admitted db2:7000
+```
 
 ## When a pool helps
 

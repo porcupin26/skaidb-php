@@ -63,7 +63,7 @@ class Unpreparable extends SkaidbException
  */
 final class Skaidb
 {
-    public const VERSION = '1.4.0';
+    public const VERSION = '1.4.1';
 
     /** The client_name the driver reports in the server's `drivers` table. */
     public const CLIENT_NAME = 'php';
@@ -2085,8 +2085,14 @@ final class PoolMember
     /** 'ready' | 'resyncing' | 'unreachable' | 'unlisted' */
     public string $listed = 'ready';
 
-    /** Round-trip average in seconds; null until measured. */
+    /** Round-trip average in seconds; null until measured (seeded by its first round trips). */
     public ?float $ewma = null;
+
+    /** @var array<int, float> round trips before the average is seeded */
+    public array $firsts = [];
+
+    /** @var array<int, float> the last round trips, oldest first */
+    public array $recent = [];
 
     public int $samples = 0;
 
@@ -2113,6 +2119,15 @@ final class PoolMember
      */
     public function __construct(public readonly string $endpoint, public readonly bool $seed)
     {
+    }
+
+    /** Measure the member afresh (a re-admission, back to ready). */
+    public function resetLatency(): void
+    {
+        $this->ewma = null;
+        $this->firsts = [];
+        $this->recent = [];
+        $this->samples = 0;
     }
 }
 
@@ -2142,7 +2157,8 @@ final class PoolMember
  *   latency average above `ejectLatencyFactor` × the other members' median
  *   and more than `ejectLatencyFloor` seconds above it, takes a member out
  *   for `ejectBackoff` seconds (doubling per repeat, up to `ejectBackoffMax`).
- *   The last usable member is never ejected.
+ *   The last usable member is never ejected. Ejections and re-admissions go
+ *   to the PHP error log (error_log()).
  * - `readYourWrites`: seconds after a write during which checkouts with the
  *   same affinity key go to the member that took it. 0 (default) = off.
  *
@@ -2170,15 +2186,22 @@ class Pool
     public const FIFO = 'fifo';
 
     /**
-     * Latency EWMA: each round trip moves a member's average 5% toward it,
-     * and no sample counts for more than 10x the larger of the current
-     * average and the ejection floor — one slow query does not eject a
-     * healthy member, a member that stays slow is ejected within a few dozen
-     * statements.
+     * Latency EWMA: the fastest of a member's first round trips seeds it (a
+     * round trip is only ever lengthened — by the member, the network or this
+     * process stalling — so a slow first statement cannot set it); then each
+     * round trip moves it 5% toward it, and no sample counts for more than
+     * 10x the larger of the current average and the ejection floor — one slow
+     * query does not eject a healthy member, a member that stays slow is
+     * ejected within a few dozen statements.
      */
+    private const EWMA_SEED_SAMPLES = 3;
+
     private const EWMA_WEIGHT = 0.05;
 
     private const EWMA_CLAMP = 10.0;
+
+    /** Round trips a latency ejection's warning reports the slowest of. */
+    private const RECENT_SAMPLES = 10;
 
     /** Round trips a member (and at least one other) needs before its average can eject it. */
     private const EWMA_MIN_SAMPLES = 10;
@@ -2592,8 +2615,16 @@ class Pool
             return;
         }
         $m->errors = 0;
+        $m->recent[] = $elapsed;
+        if (count($m->recent) > self::RECENT_SAMPLES) {
+            array_shift($m->recent);
+        }
         if ($m->ewma === null) {
-            $m->ewma = $elapsed;
+            $m->firsts[] = $elapsed;
+            if (count($m->firsts) >= self::EWMA_SEED_SAMPLES) {
+                $m->ewma = min($m->firsts);
+                $m->firsts = [];
+            }
         } else {
             $cap = self::EWMA_CLAMP * max($m->ewma, $this->ejectFloor);
             $m->ewma += self::EWMA_WEIGHT * (min($elapsed, $cap) - $m->ewma);
@@ -2602,7 +2633,8 @@ class Pool
         $m->lastSample = self::now();
         // Only a member still in rotation: round trips finishing on
         // connections checked out before an ejection must not eject it again.
-        if (!self::usable($m) || $m->samples < self::EWMA_MIN_SAMPLES || $this->ejectFactor <= 0) {
+        if (!self::usable($m) || $m->ewma === null || $m->samples < self::EWMA_MIN_SAMPLES
+            || $this->ejectFactor <= 0) {
             return;
         }
         $others = [];
@@ -2617,7 +2649,13 @@ class Pool
         sort($others);
         $median = $others[intdiv(count($others) - 1, 2)]; // the lower middle when even
         if ($m->ewma > $this->ejectFactor * $median && $m->ewma - $median > $this->ejectFloor) {
-            $this->eject($m);
+            $this->eject($m, sprintf(
+                'latency %.1F ms vs median %.1F ms; slowest of the last %d round trips %.1F ms',
+                $m->ewma * 1000,
+                $median * 1000,
+                count($m->recent),
+                max($m->recent) * 1000
+            ));
         }
     }
 
@@ -2635,7 +2673,7 @@ class Pool
         }
         $m->errors++;
         if ($m->errors >= $this->ejectErrors && $m->ejectedUntil === null) {
-            $this->eject($m);
+            $this->eject($m, "{$m->errors} consecutive connection failures");
         }
     }
 
@@ -2708,7 +2746,7 @@ class Pool
     // ---- ejection and re-admission ----------------------------------------
 
     /** Take $m out of rotation — unless it is the last usable member: a slow or flaky member beats none. */
-    private function eject(PoolMember $m): void
+    private function eject(PoolMember $m, string $why): void
     {
         $others = false;
         foreach ($this->members as $o) {
@@ -2726,6 +2764,7 @@ class Pool
         }
         $m->ejections++;
         $m->ejectedUntil = $now + $this->backoffFor($m);
+        self::warn("ejecting {$m->endpoint} ({$why})");
         $keep = [];
         $drop = [];
         foreach ($this->idle as $c) {
@@ -2786,9 +2825,9 @@ class Pool
         } elseif (($this->members[$m->endpoint] ?? null) === $m) {
             $m->ejectedUntil = null;
             $m->errors = 0;
-            $m->ewma = null;
-            $m->samples = 0;
+            $m->resetLatency();
             $m->readmittedAt = self::now();
+            self::warn("re-admitted {$m->endpoint}");
             if (count($this->idle) < $this->maxsize) {
                 $this->slots[$conn] = (object) ['ep' => $m->endpoint, 'out' => false, 'key' => ''];
                 $this->idle[] = $conn;
@@ -2897,8 +2936,7 @@ class Pool
             $state = in_array($state, ['ready', 'resyncing', 'unreachable'], true) ? $state : 'ready';
             if ($state === 'ready' && $m->listed !== 'ready') {
                 // Back in rotation: measured afresh, like a re-admission.
-                $m->ewma = null;
-                $m->samples = 0;
+                $m->resetLatency();
                 $m->errors = 0;
             }
             $m->listed = $state;
@@ -2968,6 +3006,20 @@ class Pool
     private static function now(): float
     {
         return hrtime(true) / 1e9;
+    }
+
+    /**
+     * Log an ejection or a re-admission with error_log() (stderr in the CLI
+     * unless the error_log setting points elsewhere). Never load-bearing: not
+     * trigger_error(), which a framework may turn into an exception thrown
+     * out of the round trip that saw it, and nothing where disable_functions
+     * removed error_log().
+     */
+    private static function warn(string $message): void
+    {
+        if (function_exists('error_log')) {
+            error_log("skaidb pool: {$message}");
+        }
     }
 
     /**
