@@ -7,7 +7,7 @@ error is a `Skaidb\SkaidbException`.
 
 | Constant | Value |
 |---|---|
-| `Skaidb::VERSION` | the package version, e.g. `'1.4.1'`; what the Hello frame reports and what a release tag must equal |
+| `Skaidb::VERSION` | the package version, e.g. `'1.5.0'`; what the Hello frame reports and what a release tag must equal |
 | `Skaidb::CLIENT_NAME` | `'php'` |
 
 ## `new Connection(...)`
@@ -65,6 +65,39 @@ Mirrors `PDO::query`.
 Returns a `Statement` to `execute()` with parameters. Nothing is sent until
 `execute()`; the server-side prepare happens on the first execute with
 parameters and is cached per connection (up to 240 distinct statements).
+
+### `transaction(callable $body, int $attempts = 3, string $begin = 'BEGIN'): mixed`
+
+Runs `$body` inside a transaction on this connection: sends `$begin`, calls
+`$body($connection)`, sends `COMMIT`, and returns what `$body` returned.
+
+- `$attempts < 1` throws `SkaidbException` (`attempts must be >= 1`) before
+  anything is sent.
+- `$begin` fails: its error is thrown; `$body` never runs and nothing else
+  is sent.
+- `$body` throws (any `Throwable`): `ROLLBACK` is sent, whatever it answers
+  is ignored, and the body's exception is rethrown unchanged. It is never
+  run again for that, even when the exception is a
+  `TransactionConflictException`.
+- `COMMIT` is refused with a `TransactionConflictException`: the whole
+  transaction runs again from `$begin`, with no pause, until it has run
+  `$attempts` times; then the conflict is thrown.
+- `COMMIT` fails any other way: its error is thrown, with no further run
+  and no `ROLLBACK`.
+
+`$body` can run more than once, so it must be safe to repeat and should do
+nothing outside the database that a repeat would do twice. A stream it
+starts must be finished before it returns. `$begin` is sent verbatim:
+`'BEGIN'` on a standalone server, `'BEGIN ATOMIC'` or `'BEGIN ATOMIC
+PARTITION (col = literal)'` on a cluster.
+
+From `$begin` to the `COMMIT` the connection does not re-dial: once the
+transport is lost, a further statement of the body, or the `COMMIT`, throws
+`connection lost inside a transaction: …` without being sent, because on a
+new connection it would run outside the transaction (the clean-up
+`ROLLBACK` is not sent either). The transport error itself is thrown as
+usual and is not retried; the connection re-dials on the first statement
+after the call. See [Transactions](../README.md#transactions).
 
 ### `stream(string $sql, array $params = [], int|string|null $consistency = null): Generator`
 
@@ -129,7 +162,10 @@ and marks the connection broken. The next statement re-dials through the
 seed list (a pooled connection: through the pool's members, usable ones
 first and the one it lost last), re-authenticates, re-sends `USE`, re-sends
 the Hello and clears the prepared-statement cache, then runs. The failed
-statement is never retried by the driver.
+statement is never retried by the driver. The new session has no
+transaction open: a statement sent after a transport error inside a
+hand-written `BEGIN` … `COMMIT` autocommits, so stop and start the
+transaction again (`transaction()` refuses to send it).
 
 ## `Statement`
 
@@ -233,6 +269,12 @@ or `$ejectErrors < 1` throws `SkaidbException`.
 - `withConnection(callable $fn, string|int|null $affinity = null): mixed` —
   `acquire($affinity)`, call `$fn($conn)`, `release()` however `$fn` ends;
   returns what `$fn` returns.
+- `transaction(callable $body, int $attempts = 3, string $begin = 'BEGIN',
+  string|int|null $affinity = null): mixed` — checks out one connection,
+  runs `Connection::transaction($body, $attempts, $begin)` on it (every
+  statement and every run on that connection) and releases it however the
+  transaction ends. `$attempts < 1` throws before a connection is checked
+  out.
 - `members(): array` — one array per member, sorted by endpoint:
   `endpoint` (what the pool dials), `canonical` (the member's own name once
   discovered, else `null`), `state` (`'ready'`, `'ejected'`, `'resyncing'`,
@@ -251,9 +293,18 @@ value objects that make a parameter travel as the typed Bytes, Decimal or
 Uuid value. `->value` holds the normalized input; `Uuid::bytes()` the 16
 raw bytes. See [types](types.md).
 
-## `SkaidbException` · `Unpreparable`
+## `SkaidbException` · `TransactionConflictException` · `Unpreparable`
 
 `SkaidbException extends \Exception` is thrown for every driver error.
+`TransactionConflictException extends SkaidbException` is a server error
+whose message starts with `transaction conflict:`
+(`TransactionConflictException::PREFIX`; only the prefix is matched): the
+server refused a `COMMIT` because another writer changed a row the
+transaction writes after its `BEGIN`. Nothing was committed, the
+transaction is over and the connection stays usable. It is thrown by every
+call that runs a statement — `exec()`, `query()`, `execute()`,
+`executeBatch()`, `stream()` — with the server's message unchanged, and it
+counts nothing against a pool member. `transaction()` retries on it.
 `Unpreparable extends SkaidbException` is what `prepareServer()` (an
 `@internal` method) throws when the server declines to prepare a statement;
 `execute()` catches it and falls back, so user code never sees it.

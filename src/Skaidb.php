@@ -56,6 +56,23 @@ class Unpreparable extends SkaidbException
 }
 
 /**
+ * The server refused a COMMIT because another writer changed a row the
+ * transaction writes after its BEGIN: a server error whose message starts
+ * with "transaction conflict:" (PROTOCOL.md §6). Nothing was committed, the
+ * transaction is over, and the connection is back in autocommit and usable.
+ * Running the whole transaction again from BEGIN is safe; that is what
+ * Connection::transaction() does.
+ *
+ * A statement error like any other, so `catch (SkaidbException $e)` still
+ * catches it, and getMessage() is the server's message, unchanged.
+ */
+class TransactionConflictException extends SkaidbException
+{
+    /** What the server's message starts with. Only the prefix is matched: the rest may change. */
+    public const PREFIX = 'transaction conflict:';
+}
+
+/**
  * Package identity. VERSION is the single source of truth for the driver
  * version: composer.json carries none (Composer takes it from the git tag),
  * the Hello frame reports this value to the server, and the release
@@ -63,7 +80,7 @@ class Unpreparable extends SkaidbException
  */
 final class Skaidb
 {
-    public const VERSION = '1.4.1';
+    public const VERSION = '1.5.0';
 
     /** The client_name the driver reports in the server's `drivers` table. */
     public const CLIENT_NAME = 'php';
@@ -188,6 +205,14 @@ class Connection
      * cannot hand the connection out mid-stream.
      */
     private bool $streaming = false;
+
+    /**
+     * transaction() is between its BEGIN and its COMMIT or ROLLBACK. A
+     * transport lost in there is not re-dialled (see ensureLive): a
+     * transaction lives on one connection, and a fresh one would autocommit
+     * whatever the body sent next.
+     */
+    private bool $inTransaction = false;
 
     /** Everything a redial needs, captured at construction. */
     private array $dialArgs = [];
@@ -496,6 +521,94 @@ class Connection
     }
 
     /**
+     * Run $body inside a transaction on this connection and return what it
+     * returns, running it again when the server refuses the COMMIT with a
+     * transaction conflict.
+     *
+     *     $left = $db->transaction(function (Connection $c) use ($id) {
+     *         $st = $c->prepare('SELECT n FROM stock WHERE id = ?');
+     *         $st->execute([$id]);
+     *         $n = $st->fetchColumn() - 1;
+     *         $c->prepare('UPDATE stock SET n = ? WHERE id = ?')->execute([$n, $id]);
+     *         return $n;
+     *     });
+     *
+     * Sends $begin, calls $body($this), then sends COMMIT:
+     *
+     * - $begin fails: its error is thrown. $body never runs and nothing else
+     *   is sent — going on would autocommit each statement.
+     * - $body throws: ROLLBACK is sent, whatever it answers is ignored, and
+     *   the body's exception is rethrown unchanged. Never run again, not
+     *   even when the exception is a TransactionConflictException.
+     * - COMMIT is refused with a TransactionConflictException (another
+     *   writer changed a row this transaction writes): nothing was
+     *   committed, so the whole transaction runs again from $begin, at once
+     *   — the other writer has already finished — until it has run
+     *   $attempts times; then the conflict is thrown.
+     * - COMMIT fails any other way: its error is thrown, with no further run
+     *   and no ROLLBACK (a failed COMMIT has ended the transaction).
+     *
+     * $body can therefore run more than once: it must be safe to repeat, and
+     * should do nothing outside the database that a repeat would do twice.
+     * A stream it starts must be finished before it returns (the connection
+     * is busy until then, so the COMMIT could not be sent).
+     *
+     * Every statement of the transaction must travel on this one connection,
+     * so a transport failure is never retried here, and from $begin to the
+     * COMMIT a lost connection is not re-dialled: on a fresh connection the
+     * statements that follow would autocommit. They throw instead, and the
+     * connection re-dials on the first statement after this call.
+     *
+     * $begin is sent verbatim: 'BEGIN' on a standalone server, 'BEGIN
+     * ATOMIC' or 'BEGIN ATOMIC PARTITION (col = literal)' on a cluster.
+     *
+     * @param callable(Connection):mixed $body
+     * @param int                        $attempts how many times the transaction may run in all (>= 1)
+     * @param string                     $begin    the opening statement
+     *
+     * @return mixed whatever $body returned on the run that committed
+     *
+     * @throws SkaidbException when $attempts is below 1 (before anything is sent), and for every error above
+     */
+    public function transaction(callable $body, int $attempts = 3, string $begin = 'BEGIN')
+    {
+        if ($attempts < 1) {
+            throw new SkaidbException('attempts must be >= 1');
+        }
+        $outer = $this->inTransaction;
+        for ($run = 1; ; $run++) {
+            $this->exec($begin);
+            $this->inTransaction = true;
+            try {
+                try {
+                    $value = $body($this);
+                } catch (\Throwable $e) {
+                    try {
+                        $this->exec('ROLLBACK');
+                    } catch (\Throwable $ignored) {
+                        // Clean-up only. A server may answer a ROLLBACK that
+                        // finds nothing open with an error, and a lost
+                        // connection cannot take one at all; the error to
+                        // report is the body's.
+                    }
+                    throw $e;
+                }
+                try {
+                    $this->exec('COMMIT');
+                } catch (TransactionConflictException $e) {
+                    if ($run >= $attempts) {
+                        throw $e;
+                    }
+                    continue;
+                }
+                return $value;
+            } finally {
+                $this->inTransaction = $outer;
+            }
+        }
+    }
+
+    /**
      * Yield a stream's events as they arrive, forever.
      *
      * A dependency-free helper over the stream's log: pages it with the
@@ -703,7 +816,7 @@ class Connection
                     $what = $params === [] ? 'streaming' : 'parameterised streaming (skaidb >= 0.330)';
                     throw new SkaidbException("server does not support {$what}: {$msg}");
                 }
-                throw new SkaidbException($msg);
+                throw self::serverError($msg);
             }
             $this->noteStatement($sql);
             if ($tag === 1) { // Mutation: not row-producing
@@ -766,7 +879,7 @@ class Connection
                     $live = false;
                 } elseif ($t === 3) {
                     $live = false;
-                    throw new SkaidbException($fr->text());
+                    throw self::serverError($fr->text());
                 } else {
                     $live = false;
                     throw new SkaidbException("unexpected frame tag {$t} in stream");
@@ -855,7 +968,14 @@ class Connection
             return [$id, $nparams];
         }
         if ($tag === 3) {
-            throw new Unpreparable($r->text());
+            $msg = $r->text();
+            if (str_starts_with($msg, TransactionConflictException::PREFIX)) {
+                // Never "declined to prepare": the fallback to client-side
+                // binding would swallow the conflict and send the statement
+                // again.
+                throw new TransactionConflictException($msg);
+            }
+            throw new Unpreparable($msg);
         }
         throw new SkaidbException("unexpected prepare response tag {$tag}");
     }
@@ -1000,9 +1120,23 @@ class Connection
             return ['kind' => 'ddl', 'columns' => [], 'rows' => [], 'affected' => 0];
         }
         if ($tag === 3) { // Error
-            throw new SkaidbException($r->text());
+            throw self::serverError($r->text());
         }
         throw new SkaidbException("unknown response tag {$tag}");
+    }
+
+    /**
+     * The exception for a server Error reply: the typed conflict error when
+     * the message starts with its prefix, a plain SkaidbException otherwise.
+     * Either way the message is the server's, unchanged. An Error reply is a
+     * completed round trip: the connection stays at a request boundary and a
+     * pool counts nothing against the member.
+     */
+    private static function serverError(string $msg): SkaidbException
+    {
+        return str_starts_with($msg, TransactionConflictException::PREFIX)
+            ? new TransactionConflictException($msg)
+            : new SkaidbException($msg);
     }
 
     /**
@@ -1156,6 +1290,14 @@ class Connection
         }
         if (!$this->broken) {
             return;
+        }
+        if ($this->inTransaction) {
+            // Inside transaction(): nothing is sent and the connection stays
+            // broken, so it re-dials once the helper has returned.
+            throw new SkaidbException(
+                'connection lost inside a transaction: the statement was not sent '
+                . '(on a new connection it would run outside the transaction)'
+            );
         }
         $this->preparedCache = [];
         if (is_resource($this->sock)) {
@@ -2423,6 +2565,35 @@ class Pool
         } finally {
             $this->release($conn);
         }
+    }
+
+    /**
+     * Run $body inside a transaction on ONE checked-out connection — every
+     * statement of it, and of every run a conflict causes, travels on that
+     * connection — and return the connection however it ends. The rules are
+     * Connection::transaction()'s.
+     *
+     * @param callable(Connection):mixed $body
+     * @param int                        $attempts how many times the transaction may run in all (>= 1)
+     * @param string                     $begin    the opening statement, sent verbatim
+     * @param string|int|null            $affinity read-your-writes key, as for acquire()
+     *
+     * @return mixed whatever $body returned on the run that committed
+     */
+    public function transaction(
+        callable $body,
+        int $attempts = 3,
+        string $begin = 'BEGIN',
+        string|int|null $affinity = null
+    ) {
+        if ($attempts < 1) {
+            // Here too: a checkout may dial, and nothing is to be sent.
+            throw new SkaidbException('attempts must be >= 1');
+        }
+        return $this->withConnection(
+            fn (Connection $conn) => $conn->transaction($body, $attempts, $begin),
+            $affinity
+        );
     }
 
     /**

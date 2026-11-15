@@ -39,6 +39,10 @@ $pool->close();
   still streaming, its member is ejected, not `ready` or gone, or the pool
   is full or closed.
 - `withConnection()` releases in a `finally`, whatever the callback does.
+- `transaction($body)` checks one connection out, runs
+  [`Connection::transaction()`](api.md) on it — `BEGIN`, the body, `COMMIT`,
+  and every run a conflict causes, all on that connection — and releases it
+  however the transaction ends. A transaction never spans checkouts.
 
 ## Balancing across members
 

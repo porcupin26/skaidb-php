@@ -107,6 +107,21 @@ $db->prepare('INSERT INTO users (id, name) VALUES (?, ?)')
 
 One round-trip for all rows; each row autocommits on its own.
 
+## All or nothing
+
+```php
+$db->transaction(function (Connection $c) {
+    $c->prepare('INSERT INTO orders (id, customer) VALUES (?, ?)')->execute([7, 1]);
+    $c->prepare('UPDATE users SET orders = ? WHERE id = ?')->execute([3, 1]);
+});
+```
+
+`BEGIN`, the callback, `COMMIT` on this one connection; `ROLLBACK` if the
+callback throws. A `COMMIT` the server refuses because another writer
+changed a row the transaction writes (`TransactionConflictException`) runs
+the callback again, so it must be safe to repeat. On a cluster pass
+`begin: 'BEGIN ATOMIC'`. See [Transactions](../README.md#transactions).
+
 ## Big results
 
 ```php

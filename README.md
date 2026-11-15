@@ -13,7 +13,8 @@ the bundled `hash` extension; `openssl` for TLS).
   streaming result sets, full type fidelity (Int, Float, Decimal, UUID,
   Bytes, Timestamp, Array, Document).
 - Multi-seed failover, transparent reconnect, TLS, connection pooling
-  balanced across the cluster's members, stream subscriptions.
+  balanced across the cluster's members, transactions with a retry on
+  conflict, stream subscriptions.
 
 Full documentation: this README, the [`docs/`](docs/) folder
 ([getting started](docs/getting-started.md) · [API reference](docs/api.md) ·
@@ -158,6 +159,7 @@ numeric codes (0, 1, 2).
 $db->exec(string $sql): int            // run; returns the affected-row count (0 for DDL)
 $db->query(string $sql): Statement     // run without parameters; fetch the result
 $db->prepare(string $sql): Statement   // then $stmt->execute([...])
+$db->transaction(callable $body): mixed // BEGIN, $body($db), COMMIT; see Transactions
 
 $stmt->execute(array $params = []): bool
 $stmt->fetch(): ?array                 // next row as ['column' => value], or null
@@ -294,6 +296,8 @@ $n = $pool->withConnection(fn (Connection $c) => $c->query('SELECT count(*) AS n
 $conn = $pool->acquire();
 try { $conn->exec('...'); } finally { $pool->release($conn); }
 
+$pool->transaction(fn (Connection $c) => $c->exec('...'));   // one connection from BEGIN to COMMIT
+
 $pool->close();
 ```
 
@@ -358,7 +362,9 @@ Every error the driver raises is a `Skaidb\SkaidbException` (an `Exception`
 subclass, modeled on `PDOException`).
 
 - **Statement errors** (`SELECT nope` → `no such column …`) throw; the
-  connection stays usable.
+  connection stays usable. A `COMMIT` the server refuses because of a
+  conflicting write throws the subclass
+  `Skaidb\TransactionConflictException` (see Transactions).
 - **Transport errors** throw `connection closed by server` / `connection
   timed out` and mark the connection *broken*, not closed. The next statement
   **re-dials** (through the seed walk), re-authenticates, re-sends `USE
@@ -372,21 +378,97 @@ subclass, modeled on `PDOException`).
 
 ## Transactions
 
-Every statement autocommits; the driver adds no transaction API of its own
-(no `beginTransaction`/`commit`). Whatever transaction statements your server
-version supports are plain SQL sent through `exec()` on one connection —
-note that on a **cluster** the server does not accept `BEGIN`. Batch rows
-autocommit one by one, as described above.
+A transaction is plain SQL on **one connection**: an opening statement, the
+statements, then `COMMIT` or `ROLLBACK`. A standalone server opens one with
+`BEGIN`; a cluster with `BEGIN ATOMIC` or `BEGIN ATOMIC PARTITION (col =
+literal)`. Outside a transaction every statement autocommits, and so does
+each row of a batch.
+
+```php
+$left = $db->transaction(function (Connection $c) use ($id) {
+    $st = $c->prepare('SELECT n FROM stock WHERE id = ?');
+    $st->execute([$id]);
+    $n = $st->fetchColumn() - 1;
+    $c->prepare('UPDATE stock SET n = ? WHERE id = ?')->execute([$n, $id]);
+    return $n;                                    // what transaction() returns
+});
+
+$db->transaction($body, attempts: 5, begin: 'BEGIN ATOMIC');
+```
+
+`transaction(callable $body, int $attempts = 3, string $begin = 'BEGIN')`
+sends `$begin`, calls `$body($connection)`, sends `COMMIT` and returns what
+the body returned. If the body throws, it sends `ROLLBACK` and rethrows the
+body's exception unchanged.
+
+A standalone server (≥ 0.346.0) refuses a `COMMIT` when another writer
+changed a row the transaction writes after its `BEGIN`. The driver throws
+that as `Skaidb\TransactionConflictException`: a `SkaidbException` for a
+server error whose message starts with `transaction conflict:`, from
+whichever call ran the statement. Nothing was committed, the transaction is
+over, and the connection is back in autocommit and usable, so running the
+whole transaction again is safe. `transaction()` does that, at once, until
+the transaction has run `$attempts` times; if that `COMMIT` is refused too,
+the conflict is thrown. **The body can therefore run more than once**: make
+it safe to repeat, and keep out of it whatever a repeat would do twice
+outside the database (an e-mail, an HTTP call). Nothing else is retried: an
+exception out of the body (a conflict included), a `COMMIT` that fails for
+another reason and a connection error are thrown as they come. `$attempts`
+below 1 throws before anything is sent.
+
+The same by hand:
+
+```php
+$db->exec('BEGIN');                               // throws? stop here
+try {
+    $db->prepare('UPDATE accounts SET balance = ? WHERE id = ?')->execute([$left, $from]);
+    $db->prepare('UPDATE accounts SET balance = ? WHERE id = ?')->execute([$right, $to]);
+} catch (\Throwable $e) {
+    try {
+        $db->exec('ROLLBACK');
+    } catch (SkaidbException $ignored) {
+        // clean-up only: $e is the error to report
+    }
+    throw $e;
+}
+$db->exec('COMMIT');                              // TransactionConflictException: start again from BEGIN
+```
+
+The rules, with the helper or without:
+
+- **One connection for the whole transaction.** With a pool, use
+  `$pool->transaction($body)` — it checks one connection out, runs
+  `transaction()` on it and returns it — or do everything inside one
+  `withConnection()`; never spread a transaction over several checkouts.
+- **Stop if the opening statement fails.** No transaction is open then, and
+  every statement after it would autocommit on its own.
+- **A connection error ends the transaction.** The reconnect described
+  above gives the next statement a new session with no transaction open,
+  where it would autocommit. Inside `transaction()` nothing more is sent
+  once the connection is lost: a further statement of the body, or the
+  `COMMIT`, throws `connection lost inside a transaction` instead of
+  re-dialling, and the connection reconnects on the first statement after
+  the call. By hand, stop and start again from the opening statement. A
+  connection error on the `COMMIT` itself leaves its outcome unknown.
+
+A failed `COMMIT` has ended the transaction, whatever the reason. A
+statement that fails inside one has not: the transaction stays open, to
+continue or to roll back. A `ROLLBACK` that finds no transaction open is an
+error on servers before 0.347.0, so never let a clean-up `ROLLBACK` replace
+the error being handled. A stream started in the body must be finished
+before the body returns — the connection is busy until then and cannot take
+the `COMMIT`.
 
 ## Client identification
 
 After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
-(the package version, `1.4.1`). An older server without the opcode ignores
+(the package version, `1.5.0`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
 client-side fallback automatically), batches ≥ 0.87.0, streaming a server
 with the streaming opcode, parameterised streaming ≥ 0.330, multiple result
-sets a server with `EMIT`.
+sets a server with `EMIT`, the transaction conflict error a standalone
+server ≥ 0.346.0.
 
 ## Development
 

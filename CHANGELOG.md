@@ -4,6 +4,35 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-11-15
+
+### Added
+- **`TransactionConflictException`**, a subclass of `SkaidbException`, for
+  a server error whose message starts with `transaction conflict:` — a
+  standalone server (>= 0.346.0) refusing a `COMMIT` because another writer
+  changed a row the transaction writes after its `BEGIN`. Every call that
+  runs a statement throws it (`exec()`, `query()`, `execute()`,
+  `executeBatch()`, `stream()`), with the server's message unchanged; code
+  that catches `SkaidbException` catches it as before. It is a statement
+  error: the connection stays usable and a pool counts nothing against the
+  member.
+- **`$db->transaction(callable $body, int $attempts = 3, string $begin =
+  'BEGIN')`** sends `$begin`, calls `$body($connection)`, sends `COMMIT`
+  and returns what the body returned. A `COMMIT` refused with a conflict
+  runs the whole transaction again, with no pause, until it has run
+  `$attempts` times; then the conflict is thrown. A body that throws is
+  rolled back and its exception rethrown unchanged, whatever the `ROLLBACK`
+  answers, and is not run again. A refused `$begin` is thrown before the
+  body runs, any other `COMMIT` error without a retry or a `ROLLBACK`, and
+  `$attempts < 1` before anything is sent. `$begin` is sent verbatim
+  (`'BEGIN ATOMIC'` on a cluster).
+- Inside `transaction()` a lost connection is not re-dialled: a statement
+  that would have run on a new connection, outside the transaction, throws
+  `connection lost inside a transaction` and is not sent. The connection
+  re-dials on the first statement after the call.
+- **`$pool->transaction($body, $attempts, $begin, $affinity)`**: the same
+  on one checked-out connection, released however the transaction ends.
+
 ## [1.4.1] - 2026-10-31
 
 ### Fixed
