@@ -383,10 +383,14 @@ or `$ejectErrors < 1` throws `SkaidbException`.
   read-your-writes key (a user or session id; `null` = the pool-wide key).
   Runs the pool's upkeep first: probes one ejected member whose backoff is
   over, and refreshes discovery when it is due.
-- `release(Connection $c): void` — returns it; closes it instead if it is
-  broken, mid-stream, its member is ejected, not `ready` or gone, a `USE`
-  moved it out of the pool's `database` (any `USE`, when the pool was given
-  none), or the pool already holds `$maxsize` idle connections.
+- `release(Connection $c): void` — returns it, first putting its session
+  back into the pool's own state where the borrower changed it: `ROLLBACK`
+  for a transaction left open, `USE` of the pool's `database` (`USE
+  default` when the pool was given none), `SET SCAN BUDGET DEFAULT`, `SET
+  CONSISTENCY DEFAULT` — only the ones needed, none for a borrower that
+  changed nothing. Closes it instead if it is broken, mid-stream, its
+  member is ejected, not `ready` or gone, the pool already holds `$maxsize`
+  idle connections, or one of those statements fails.
 - `withConnection(callable $fn, string|int|null $affinity = null): mixed` —
   `acquire($affinity)`, call `$fn($conn)`, `release()` however `$fn` ends;
   returns what `$fn` returns.

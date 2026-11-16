@@ -1550,7 +1550,7 @@ test('pool: a connection re-dialled while a borrower holds it keeps the borrower
     });
     assert_eq(
         ['connect', 'USE "app"', 'SET CONSISTENCY ALL', 'SET SCAN BUDGET ROWS 1', 'SELECT count(*) FROM notes'],
-        array_slice(session_seen($srv), 4)
+        array_slice(session_seen($srv), 4, 5)
     );
     $pool->close();
     $srv->stop();
@@ -1804,28 +1804,19 @@ test('pool: idle connections are reused, broken ones discarded, surplus closed',
     $srv->stop();
 });
 
-test('pool: a borrower\'s USE does not reach the next borrower, and a re-dialled pooled connection is in its database', function () {
+test('pool: a re-dialled pooled connection is in the pool\'s database, and in its borrower\'s while it is held', function () {
     $srv = session_server();
     $count = 'SELECT count(*) FROM notes';
     $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret', 'database' => 'app'], 4);
-    // A pooled connection lost while idle, re-dialled inside one checkout:
-    // back in the pool's database before anything else is sent.
+    // A pooled connection lost while a borrower holds it, re-dialled inside
+    // the checkout: back in the pool's database before anything else is
+    // sent.
     $pool->withConnection(fn (Connection $c) => $c->query($count));
     $pool->withConnection(function (Connection $c) use ($srv, $count) {
         $srv->closeAll();
         assert_eq(3, $c->query($count)->fetchColumn());
     });
     assert_eq(['connect', 'USE "app"', $count, 'connect', 'USE "app"', $count], session_seen($srv));
-    assert_eq(1, $pool->members()[0]['idle']);
-    // A borrower moves the session elsewhere. Kept in the pool, that
-    // connection would run the next borrower's statements in "other", not
-    // in the database the pool was given: it is closed on release instead.
-    $pool->withConnection(fn (Connection $c) => $c->exec('USE other'));
-    assert_eq(0, $pool->members()[0]['idle'], 'the connection went back to the pool in the borrower\'s database');
-    assert_eq(3, $pool->withConnection(fn (Connection $c) => $c->query($count)->fetchColumn()));
-    assert_eq(['USE other', 'connect', 'USE "app"', $count], array_slice(session_seen($srv), 6));
-    // A USE of the pool's own database costs nothing.
-    $pool->withConnection(fn (Connection $c) => $c->exec('USE app'));
     assert_eq(1, $pool->members()[0]['idle']);
     // Inside one checkout the borrower's database is the session's: a
     // re-dial there enters it, not the pool's.
@@ -1834,21 +1825,173 @@ test('pool: a borrower\'s USE does not reach the next borrower, and a re-dialled
         $srv->closeAll();
         assert_eq(3, $c->query($count)->fetchColumn());
     });
-    assert_eq(['USE app', 'USE other', 'connect', 'USE "other"', $count], array_slice(session_seen($srv), 10));
-    assert_eq(0, $pool->members()[0]['idle']);
+    assert_eq(['USE other', 'connect', 'USE "other"', $count], array_slice(session_seen($srv), 6, 4));
     $pool->close();
     $srv->stop();
+});
 
-    // A pool given no database dials into the server's default one, and
-    // holds its connections to that too.
-    $srv = session_server();
-    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 4);
-    $pool->withConnection(fn (Connection $c) => $c->query($count));
-    assert_eq(1, $pool->members()[0]['idle']);
-    $pool->withConnection(fn (Connection $c) => $c->exec('USE app'));
-    assert_eq(0, $pool->members()[0]['idle'], 'the connection went back to the pool in the borrower\'s database');
-    $pool->withConnection(fn (Connection $c) => $c->query($count));
-    assert_eq(['connect', $count, 'USE app', 'connect', $count], session_seen($srv));
+/**
+ * A server for a pool's session state. $refused maps a statement to the
+ * arrivals of it (1 = the first) that are answered with an Error, or to
+ * true for all of them: a server that will not take it.
+ *
+ * @param array<string,array<int,int>|bool> $refused
+ */
+function pool_state_server(array $refused = []): FakeServer
+{
+    return (new FakeServer(['handle' => function (array $req) use ($refused) {
+        static $arrivals = [];
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        $n = $arrivals[$req['sql']] = ($arrivals[$req['sql']] ?? 0) + 1;
+        $refuse = $refused[$req['sql']] ?? false;
+        if ($refuse === true || (is_array($refuse) && in_array($n, $refuse, true))) {
+            return F::error("refused here: {$req['sql']}");
+        }
+        if (str_starts_with($req['sql'], 'SELECT')) {
+            return F::rows(['n'], [[3]]);
+        }
+        return str_starts_with($req['sql'], 'INSERT') ? F::mutation(1) : F::ddl();
+    }]))->start();
+}
+
+test('pool: every borrower gets the pool\'s own session state — what the one before changed is put back', function () {
+    $count = 'SELECT count(*) FROM notes';
+    // A pool of one, so both borrowers get the same connection — with the
+    // pool's database given, and with none (the server's "default").
+    foreach (['app' => ['USE "app"'], '' => []] as $database => $dialled) {
+        $home = $database === '' ? 'USE default' : 'USE "app"';
+        $srv = pool_state_server();
+        $args = ['127.0.0.1', $srv->port, 'ada', 'secret'] + ($database === '' ? [] : ['database' => $database]);
+        $pool = new Pool($args, 1);
+        $seen = fn () => array_slice(session_seen($srv), 1 + count($dialled));
+        $borrow = fn (string ...$statements) => $pool->withConnection(function (Connection $c) use ($statements) {
+            foreach ($statements as $sql) {
+                $c->exec($sql);
+            }
+        });
+
+        // Borrower 1 moves the session and tightens it; borrower 2 just
+        // counts. It must run in the pool's database, at the request's own
+        // consistency and under no scan budget of anybody else's.
+        $borrow('USE other', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL');
+        assert_eq(3, $pool->withConnection(fn (Connection $c) => $c->query($count)->fetchColumn()));
+        assert_eq([
+            'USE other', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL',
+            $home, 'SET SCAN BUDGET DEFAULT', 'SET CONSISTENCY DEFAULT',
+            $count,
+        ], $seen(), "pool database '{$database}'");
+        assert_eq([1, 1], [$srv->connections(), $pool->members()[0]['idle']], 'the same connection, kept');
+
+        // Only what is needed: a borrower that changed nothing costs no
+        // round trip, and one that changed one thing costs one.
+        $from = count($seen());
+        $pool->withConnection(fn (Connection $c) => $c->query($count));
+        $borrow('SET SCAN BUDGET BYTES 4096');
+        $borrow('SET CONSISTENCY ONE');
+        $borrow('USE other');
+        // What the borrower undid itself needs no undoing.
+        $borrow('USE other', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL', $home, 'SET CONSISTENCY DEFAULT', 'SET SCAN BUDGET DEFAULT');
+        assert_eq([
+            $count,
+            'SET SCAN BUDGET BYTES 4096', 'SET SCAN BUDGET DEFAULT',
+            'SET CONSISTENCY ONE', 'SET CONSISTENCY DEFAULT',
+            'USE other', $home,
+            'USE other', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL', $home, 'SET CONSISTENCY DEFAULT', 'SET SCAN BUDGET DEFAULT',
+        ], array_slice($seen(), $from), "pool database '{$database}'");
+        // A USE of the pool's own database is no move at all.
+        $from = count($seen());
+        $borrow($database === '' ? 'USE default' : 'USE app');
+        assert_eq(1, count($seen()) - $from);
+
+        // The notes went with the state: a re-dial for the NEXT borrower
+        // puts the pool's state back, not the last borrower's — whether
+        // the connection is lost under that borrower's hands, or replaced
+        // at the checkout.
+        $borrow('USE other', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL');
+        $from = count(session_seen($srv));
+        $pool->withConnection(function (Connection $c) use ($srv, $count) {
+            $srv->closeAll();
+            assert_eq(3, $c->query($count)->fetchColumn());
+        });
+        assert_eq(['connect', ...$dialled, $count], array_slice(session_seen($srv), $from), "pool database '{$database}'");
+        $borrow('USE other', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL');
+        $srv->closeAll();
+        $from = count(session_seen($srv));
+        assert_eq(3, $pool->withConnection(fn (Connection $c) => $c->query($count)->fetchColumn()));
+        assert_eq(['connect', ...$dialled, $count], array_slice(session_seen($srv), $from), "pool database '{$database}'");
+
+        // A transaction the borrower left open is rolled back first: the
+        // next borrower's statements must not join it.
+        $from = count(session_seen($srv));
+        $borrow('BEGIN', 'INSERT INTO notes (id) VALUES (1)');
+        $borrow('BEGIN', 'INSERT INTO notes (id) VALUES (2)', 'USE other');
+        $borrow('INSERT INTO notes (id) VALUES (3)');
+        assert_eq([
+            'BEGIN', 'INSERT INTO notes (id) VALUES (1)', 'ROLLBACK',
+            'BEGIN', 'INSERT INTO notes (id) VALUES (2)', 'USE other', 'ROLLBACK', $home,
+            'INSERT INTO notes (id) VALUES (3)',
+        ], array_slice(session_seen($srv), $from), "pool database '{$database}'");
+        assert_eq([3, 1], [$srv->connections(), $pool->members()[0]['idle']]);
+        $pool->close();
+        $srv->stop();
+    }
+});
+
+test('pool: a connection that cannot be put back is closed, and the next borrower gets a new one', function () {
+    $count = 'SELECT count(*) FROM notes';
+    // Each case: what the borrower does, and the one restoring statement
+    // this server refuses — an older server has no SET CONSISTENCY DEFAULT.
+    $cases = [
+        'SET CONSISTENCY DEFAULT' => ['USE other', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL'],
+        'SET SCAN BUDGET DEFAULT' => ['SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL'],
+        'USE "app"' => ['USE other', 'SET CONSISTENCY ALL'],
+        'ROLLBACK' => ['BEGIN', 'SET CONSISTENCY ALL'],
+    ];
+    foreach ($cases as $refused => $statements) {
+        // The pool's own USE "app" is taken when a connection is dialled
+        // (its first and third arrival) and refused in between.
+        $srv = pool_state_server([$refused => $refused === 'USE "app"' ? [2] : true]);
+        $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret', 'database' => 'app'], 1);
+        $held = null;
+        $pool->withConnection(function (Connection $c) use ($statements, &$held) {
+            $held = $c;
+            foreach ($statements as $sql) {
+                $c->exec($sql);
+            }
+        });
+        // Not pooled in a state the pool did not choose, and nothing after
+        // the refusal was tried on it.
+        assert_eq(0, $pool->members()[0]['idle'], $refused);
+        assert_throws(SkaidbException::class, fn () => $held->query($count), '/^connection is closed$/');
+        $last = session_seen($srv);
+        assert_eq($refused, end($last), "{$refused}: the refused statement is the last one that connection was sent");
+        assert_eq(3, $pool->withConnection(fn (Connection $c) => $c->query($count)->fetchColumn()), $refused);
+        assert_eq(['connect', 'USE "app"', $count], array_slice(session_seen($srv), count($last)), $refused);
+        assert_eq([2, 1], [$srv->connections(), $pool->members()[0]['idle']], $refused);
+        $pool->close();
+        $srv->stop();
+    }
+    // A connection lost under its borrower with a transaction open, or
+    // released from inside transaction(): there is nothing to put back.
+    $srv = pool_state_server();
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 1);
+    $pool->withConnection(function (Connection $c) use ($srv) {
+        $c->exec('BEGIN');
+        $srv->closeAll(FakeServer::HALF);
+    });
+    assert_eq(0, $pool->members()[0]['idle']);
+    assert_eq(['connect', 'BEGIN'], session_seen($srv));
+    assert_throws(SkaidbException::class, fn () => $pool->withConnection(fn (Connection $c) => $c->transaction(function (Connection $c) use ($pool) {
+        $c->exec('INSERT INTO notes (id) VALUES (1)');
+        $pool->release($c);
+        assert_throws(SkaidbException::class, fn () => $c->exec('INSERT INTO notes (id) VALUES (2)'), '/^connection is closed$/');
+    }, 3, 'START TRANSACTION')), '/^connection is closed$/');
+    assert_eq(0, $pool->members()[0]['idle']);
+    assert_eq(['connect', 'START TRANSACTION', 'INSERT INTO notes (id) VALUES (1)'], array_slice(session_seen($srv), 2));
+    usleep(50_000);
+    assert_eq(0, $srv->strayBytes());
     $pool->close();
     $srv->stop();
 });

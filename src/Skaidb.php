@@ -1815,6 +1815,57 @@ class Connection
         return $this->database;
     }
 
+    /**
+     * Put the session back into a pool's own state, for the next borrower:
+     * no transaction open, in $home — the pool's database, or with null the
+     * one every new connection starts in, `default` — with no consistency
+     * override and no scan budget. The driver's notes say what the last
+     * borrower changed, and only that is sent: ROLLBACK for a transaction
+     * left open, then USE, SET SCAN BUDGET DEFAULT, SET CONSISTENCY
+     * DEFAULT. A borrower that changed nothing costs no round trip.
+     *
+     * The notes are the pool's again afterwards, so a later re-dial puts
+     * the pool's state back and not that borrower's. False when the session
+     * could not be put back — a statement was refused (a server before
+     * 0.349 has no SET CONSISTENCY DEFAULT), the connection is gone, or it
+     * is still inside transaction(): the caller closes the connection
+     * instead of pooling it.
+     *
+     * @internal
+     */
+    public function resetSession(?string $home): bool
+    {
+        if ($this->inTransaction || !$this->isUsable()) {
+            return false;
+        }
+        try {
+            if ($this->transactionNoted) {
+                $this->exec('ROLLBACK');
+            }
+            if ($home !== null) {
+                if ($this->database !== $home) {
+                    $this->exec('USE "' . str_replace('"', '""', $home) . '"');
+                }
+            } else {
+                if ($this->database !== null && $this->database !== 'default') {
+                    $this->exec('USE default');
+                }
+                // Where a new connection is anyway: a re-dial has no USE
+                // to send.
+                $this->database = null;
+            }
+            if ($this->scanBudgetNote !== null) {
+                $this->exec('SET SCAN BUDGET DEFAULT');
+            }
+            if ($this->consistencyNote !== null) {
+                $this->exec('SET CONSISTENCY DEFAULT');
+            }
+        } catch (SkaidbException $e) {
+            return false;
+        }
+        return $this->isUsable();
+    }
+
     // ---- framing ----------------------------------------------------------
 
     /**
@@ -3028,6 +3079,12 @@ final class PoolMember
  * credentials and the session database; `host`/`port`/`seeds` name the
  * members the pool starts from.
  *
+ * A connection reaches every borrower in the pool's own session state: its
+ * database (the `database` argument, else the server's `default`), no
+ * consistency override, no scan budget, no transaction open. What a
+ * borrower changed is put back when it releases the connection (see
+ * release()).
+ *
  * Load balancing follows the rules every skaidb driver shares (PROTOCOL.md
  * §6.1; see docs/pooling.md):
  *
@@ -3122,7 +3179,11 @@ class Pool
     /** @var array<string, mixed> named Connection constructor arguments */
     private array $args;
 
-    /** The database every connection is dialled into: the `database` argument, null for none. */
+    /**
+     * The database every connection is dialled into, and put back into
+     * before its next borrower: the `database` argument, null for none (the
+     * one a new connection starts in, `default`).
+     */
     private ?string $database;
 
     private string $policy;
@@ -3280,10 +3341,17 @@ class Pool
 
     /**
      * Return a connection, closing it instead if it is broken or mid-stream,
-     * its member is ejected, not ready or gone, or the pool is full or closed
-     * — and if a USE of the borrower's left it in another database than the
-     * one the pool dials into: kept, it would run the next borrower's
-     * statements there.
+     * its member is ejected, not ready or gone, or the pool is full or
+     * closed.
+     *
+     * A connection that is kept reaches its next borrower in the pool's own
+     * session state: what this borrower changed — the database, a
+     * consistency override, a scan budget, a transaction left open — is put
+     * back here (see Connection::resetSession), with as many statements as
+     * there are things to undo and none when there are none. If that fails
+     * the connection is closed too: kept, it would run the next borrower's
+     * statements in another database, under another borrower's limits, or
+     * inside its transaction.
      */
     public function release(Connection $conn): void
     {
@@ -3295,9 +3363,9 @@ class Pool
                 $m->inUse--;
             }
         }
-        if (!$this->closed && $conn->isUsable() && $m !== null && self::usable($m)
-            && $conn->sessionDatabase() === $this->database
-            && count($this->idle) < $this->maxsize) {
+        if (!$this->closed && $m !== null && self::usable($m)
+            && count($this->idle) < $this->maxsize
+            && $conn->resetSession($this->database)) {
             $this->idle[] = $conn;
 
             return;

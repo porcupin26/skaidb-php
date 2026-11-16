@@ -345,10 +345,18 @@ kept **idle**, not the number checked out: a burst opens extras and the
 surplus is closed on release. PHP is share-nothing per request, so a pool
 pays off in a worker or a long-running CLI job.
 
-Give the pool its database as the `database` argument rather than running
-`USE` on a checked-out connection: a connection a `USE` moved out of the
-pool's database is closed on release, not kept, so the next borrower never
-runs in a database the one before it chose.
+**Every borrower gets the pool's own session state**: the pool's database
+(its `database` argument; without one, the database every new connection
+starts in, `default`), no consistency override, no scan budget, no
+transaction open. What a borrower changes on its connection — `USE other`,
+`SET CONSISTENCY ALL`, `SET SCAN BUDGET ROWS 1`, a `BEGIN` it never ended —
+is its own until it releases the connection, also across a reconnect, and
+is put back on release: `ROLLBACK`, `USE <the pool's database>`, `SET SCAN
+BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`, only the ones that are needed,
+so a borrower that changed nothing costs no round trip. If one of them is
+refused (a server before 0.349 has no `SET CONSISTENCY DEFAULT`) the
+connection is closed instead of kept. Name the database in the pool's
+arguments rather than switching on every checkout.
 
 The pool balances across the cluster's members by the rules every skaidb
 driver shares ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):

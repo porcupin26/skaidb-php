@@ -39,15 +39,24 @@ $pool->close();
   pool's order: usable members first, the one it lost last), like any other
   connection.
 - `release()` closes a connection instead of pooling it when it is broken,
-  still streaming, its member is ejected, not `ready` or gone, or the pool
-  is full or closed.
-- The pool's connections are in the pool's database: the `database`
-  argument, or the server's default one without it. A borrower that runs
-  `USE` is in that database until it releases the connection (also across a
-  re-dial); a connection a `USE` moved out of the pool's database — any
-  `USE`, when the pool was given none — is closed on release, so the next
-  borrower never inherits it. Name the database in the pool's arguments
-  instead of switching on a checked-out connection.
+  still streaming, its member is ejected, not `ready` or gone, the pool is
+  full or closed, or its session cannot be put back (next point).
+- A pooled connection reaches each borrower in the pool's own session
+  state: in the pool's database (the `database` argument; without it
+  `default`, the database every new connection starts in), with no
+  consistency override, no scan budget and no transaction open. A borrower
+  that runs `USE`, `SET CONSISTENCY …`, `SET SCAN BUDGET …` or `BEGIN` has
+  that state until it releases the connection, also across a re-dial. On
+  release the pool puts back what the driver noted as changed, in this
+  order and only where needed: `ROLLBACK` for a transaction left open, `USE
+  "<the pool's database>"` (`USE default` without the argument), `SET SCAN
+  BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`. A borrower that changed
+  nothing costs no round trip. If one of these fails — a server before
+  0.349 answers `SET CONSISTENCY DEFAULT` with a parse error — the
+  connection is closed and the next borrower gets a new one. The driver's
+  notes go back to the pool's state with it, so a connection that re-dials
+  for a later borrower is not put into an earlier borrower's database or
+  settings.
 - `withConnection()` releases in a `finally`, whatever the callback does.
 - `transaction($body)` checks one connection out, runs
   [`Connection::transaction()`](api.md) on it — `BEGIN`, the body, `COMMIT`,
