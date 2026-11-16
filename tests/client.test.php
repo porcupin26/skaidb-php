@@ -142,6 +142,26 @@ test('query: Mutation and Ddl replies; exec() returns the affected count', funct
     $srv->stop();
 });
 
+test('query: a ? in a quoted identifier or a comment does not stop a statement sent without parameters', function () {
+    $srv = scripted_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $statements = ['SELECT id AS "ok?" FROM t', "SELECT id FROM t -- really?", "SELECT 'is it?' AS q"];
+    foreach ($statements as $sql) {
+        assert_eq($sql, $db->query($sql)->fetchColumn(), $sql);
+    }
+    $db->prepare($statements[0])->execute();
+    assert_eq(0, $db->exec('CREATE TABLE "why?" (PRIMARY KEY (id)) -- because?'));
+    // A placeholder with nothing to bind is still refused before anything
+    // is sent.
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT ? AS "ok?"'), '/^query has placeholders but no parameters given$/');
+    assert_eq(
+        [...$statements, $statements[0], 'CREATE TABLE "why?" (PRIMARY KEY (id)) -- because?'],
+        array_values(array_map(fn ($r) => $r['sql'], array_filter($srv->requests(), fn ($r) => $r['op'] === 1)))
+    );
+    $db->close();
+    $srv->stop();
+});
+
 test('query: an Error reply is a SkaidbException and the connection stays usable', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');

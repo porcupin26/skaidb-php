@@ -2455,7 +2455,18 @@ class Connection
     // ---- client-side parameter binding (§5) -------------------------------
 
     /**
-     * Interpolate '?' placeholders in $sql with quoted $params.
+     * What the server's lexer reads past whole, where a `?` is text and no
+     * placeholder: a single-quoted string, a double-quoted identifier, a
+     * `--` comment to the end of its line. A doubled quote inside a string
+     * reads as two strings back to back, which covers the same bytes; one
+     * left unterminated runs to the end of the statement.
+     */
+    private const NOT_CODE = '\'[^\']*+(?:\'|\z)|"[^"]*+(?:"|\z)|--[^\n]*+';
+
+    /**
+     * Interpolate '?' placeholders in $sql with quoted $params. A `?` is a
+     * placeholder where the server reads one: not inside a string literal,
+     * a quoted identifier or a comment (see NOT_CODE).
      *
      * @internal
      *
@@ -2465,52 +2476,29 @@ class Connection
     {
         // Re-index in case of associative input.
         $params = array_values($params);
-
-        if (count($params) === 0) {
-            if (strpos(self::stripStrings($sql), '?') !== false) {
-                throw new SkaidbException('query has placeholders but no parameters given');
-            }
+        $total = count($params);
+        if ($total === 0 && !str_contains($sql, '?')) {
             return $sql;
         }
-
-        $out = '';
-        $inStr = false;
-        $i = 0;
-        $n = strlen($sql);
         $used = 0;
-        $total = count($params);
-        while ($i < $n) {
-            $ch = $sql[$i];
-            if ($inStr) {
-                $out .= $ch;
-                if ($ch === "'") {
-                    if ($i + 1 < $n && $sql[$i + 1] === "'") {
-                        $out .= "'";
-                        $i += 2;
-                        continue;
-                    }
-                    $inStr = false;
+        $out = preg_replace_callback(
+            '/' . self::NOT_CODE . '|\?/',
+            function (array $m) use ($params, $total, &$used): string {
+                if ($m[0] !== '?') {
+                    return $m[0];
                 }
-                $i++;
-                continue;
-            }
-            if ($ch === "'") {
-                $inStr = true;
-                $out .= $ch;
-                $i++;
-                continue;
-            }
-            if ($ch === '?') {
+                if ($total === 0) {
+                    throw new SkaidbException('query has placeholders but no parameters given');
+                }
                 if ($used >= $total) {
                     throw new SkaidbException('more placeholders than parameters');
                 }
-                $out .= self::quote($params[$used]);
-                $used++;
-                $i++;
-                continue;
-            }
-            $out .= $ch;
-            $i++;
+                return self::quote($params[$used++]);
+            },
+            $sql
+        );
+        if ($out === null) {
+            throw new SkaidbException('cannot read the statement for its placeholders: ' . preg_last_error_msg());
         }
         if ($used < $total) {
             throw new SkaidbException('more parameters than placeholders');
@@ -2565,37 +2553,6 @@ class Connection
         }
         $type = is_object($arg) ? get_class($arg) : gettype($arg);
         throw new SkaidbException("cannot bind value of type {$type}");
-    }
-
-    /** Return $sql with single-quoted literals blanked, for placeholder counting. */
-    private static function stripStrings(string $sql): string
-    {
-        $out = '';
-        $inStr = false;
-        $i = 0;
-        $n = strlen($sql);
-        while ($i < $n) {
-            $ch = $sql[$i];
-            if ($inStr) {
-                if ($ch === "'") {
-                    if ($i + 1 < $n && $sql[$i + 1] === "'") {
-                        $i += 2;
-                        continue;
-                    }
-                    $inStr = false;
-                }
-                $i++;
-                continue;
-            }
-            if ($ch === "'") {
-                $inStr = true;
-                $i++;
-                continue;
-            }
-            $out .= $ch;
-            $i++;
-        }
-        return $out;
     }
 }
 

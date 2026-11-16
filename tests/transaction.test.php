@@ -455,6 +455,20 @@ test('transaction: a custom begin statement is sent verbatim, on every run', fun
     assert_eq([$begin, 'UPDATE t SET n = 1', 'COMMIT', $begin, 'UPDATE t SET n = 1', 'COMMIT'], txn_statements($srv));
     $db->transaction(fn (Connection $c) => 0, begin: 'begin  atomic -- as typed');
     assert_eq(['begin  atomic -- as typed', 'COMMIT'], array_slice(txn_statements($srv), 6));
+    // Verbatim also where it holds a question mark that is no placeholder.
+    $db->transaction(fn (Connection $c) => 0, begin: 'BEGIN ATOMIC PARTITION ("why?" = \'because?\') -- ready?');
+    assert_eq(['BEGIN ATOMIC PARTITION ("why?" = \'because?\') -- ready?', 'COMMIT'], array_slice(txn_statements($srv), 8));
+    // It takes no parameters: a placeholder in it is refused before
+    // anything is sent, and the body does not run.
+    $runs = 0;
+    assert_throws(
+        SkaidbException::class,
+        fn () => $db->transaction(function () use (&$runs) {
+            $runs++;
+        }, 3, 'BEGIN ATOMIC PARTITION (tenant = ?)'),
+        '/^query has placeholders but no parameters given$/'
+    );
+    assert_eq([0, 10], [$runs, count(txn_statements($srv))]);
     $db->close();
     $srv->stop();
 });

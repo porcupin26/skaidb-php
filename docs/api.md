@@ -56,7 +56,11 @@ Constants: `Connection::ONE = 0`, `Connection::QUORUM = 1`,
 ### `exec(string $sql): int`
 
 Runs `$sql` and returns the affected-row count (0 for DDL and for
-row-producing statements). Mirrors `PDO::exec`.
+row-producing statements). Mirrors `PDO::exec`. The text is sent as it is;
+a `?` placeholder in it, with no values to bind, throws `query has
+placeholders but no parameters given` before anything is sent. A `?` inside
+a string literal, a double-quoted identifier or a `--` comment is text, not
+a placeholder — here and wherever the driver binds values client-side.
 
 ### `query(string $sql): Statement`
 
@@ -94,7 +98,10 @@ Runs `$body` inside a transaction on this connection: sends `$begin`, calls
 `$body` can run more than once, so it must be safe to repeat and should do
 nothing outside the database that a repeat would do twice. `$begin` is sent
 verbatim: `'BEGIN'` on a standalone server, `'BEGIN ATOMIC'` or `'BEGIN
-ATOMIC PARTITION (col = literal)'` on a cluster.
+ATOMIC PARTITION (col = literal)'` on a cluster. It takes no parameters: a
+`?` placeholder in it throws `query has placeholders but no parameters
+given` before anything is sent, so write the partition's value into the
+text as a literal.
 
 A stream `$body` starts must be finished before it returns. If one is still
 in flight when `$body` ends (the generator was returned, or kept

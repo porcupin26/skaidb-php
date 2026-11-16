@@ -182,8 +182,9 @@ $stmt->columns(): array                // column names
 $stmt->resultSets(): ?array            // every set of a CALL that EMITs, else null
 ```
 
-Placeholders are `?`, positional, in order; a `?` inside a string literal is
-left alone. Statements on one connection run one at a time.
+Placeholders are `?`, positional, in order; a `?` inside a string literal,
+a double-quoted identifier or a `--` comment is left alone, as the server
+reads it. Statements on one connection run one at a time.
 
 With parameters the driver **prepares the statement on the server** (once
 per distinct SQL text per connection; the 240 most recently used stay
