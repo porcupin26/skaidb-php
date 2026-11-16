@@ -1360,6 +1360,18 @@ class Connection
         return $name === '' ? null : $name;
     }
 
+    /**
+     * The database the session is in, as far as the driver knows: the
+     * constructor's, or the one the last USE the server accepted named. Null
+     * when neither named one. A pool compares it with the database it dials
+     * its connections into.
+     *
+     * @internal
+     */
+    public function sessionDatabase(): ?string
+    {
+        return $this->database;
+    }
 
     // ---- framing ----------------------------------------------------------
 
@@ -2581,6 +2593,9 @@ class Pool
     /** @var array<string, mixed> named Connection constructor arguments */
     private array $args;
 
+    /** The database every connection is dialled into: the `database` argument, null for none. */
+    private ?string $database;
+
     private string $policy;
 
     private bool $fifo;
@@ -2675,6 +2690,8 @@ class Pool
         $this->backoff = $ejectBackoff;
         $this->backoffMax = $ejectBackoffMax;
         $this->args = self::named($connectionArgs);
+        $database = $this->args['database'] ?? null;
+        $this->database = $database === null || $database === '' ? null : (string) $database;
         $this->slots = new \WeakMap();
         // The seeds, exactly as Connection would dial them.
         $seeds = $this->args['seeds'] ?? [];
@@ -2733,7 +2750,10 @@ class Pool
 
     /**
      * Return a connection, closing it instead if it is broken or mid-stream,
-     * its member is ejected, not ready or gone, or the pool is full or closed.
+     * its member is ejected, not ready or gone, or the pool is full or closed
+     * — and if a USE of the borrower's left it in another database than the
+     * one the pool dials into: kept, it would run the next borrower's
+     * statements there.
      */
     public function release(Connection $conn): void
     {
@@ -2746,6 +2766,7 @@ class Pool
             }
         }
         if (!$this->closed && $conn->isUsable() && $m !== null && self::usable($m)
+            && $conn->sessionDatabase() === $this->database
             && count($this->idle) < $this->maxsize) {
             $this->idle[] = $conn;
 

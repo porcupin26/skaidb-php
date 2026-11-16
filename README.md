@@ -314,6 +314,11 @@ kept **idle**, not the number checked out: a burst opens extras and the
 surplus is closed on release. PHP is share-nothing per request, so a pool
 pays off in a worker or a long-running CLI job.
 
+Give the pool its database as the `database` argument rather than running
+`USE` on a checked-out connection: a connection a `USE` moved out of the
+pool's database is closed on release, not kept, so the next borrower never
+runs in a database the one before it chose.
+
 The pool balances across the cluster's members by the rules every skaidb
 driver shares ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):
 

@@ -300,8 +300,9 @@ or `$ejectErrors < 1` throws `SkaidbException`.
   Runs the pool's upkeep first: probes one ejected member whose backoff is
   over, and refreshes discovery when it is due.
 - `release(Connection $c): void` — returns it; closes it instead if it is
-  broken, mid-stream, its member is ejected, not `ready` or gone, or the
-  pool already holds `$maxsize` idle connections.
+  broken, mid-stream, its member is ejected, not `ready` or gone, a `USE`
+  moved it out of the pool's `database` (any `USE`, when the pool was given
+  none), or the pool already holds `$maxsize` idle connections.
 - `withConnection(callable $fn, string|int|null $affinity = null): mixed` —
   `acquire($affinity)`, call `$fn($conn)`, `release()` however `$fn` ends;
   returns what `$fn` returns.

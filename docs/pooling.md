@@ -38,6 +38,13 @@ $pool->close();
 - `release()` closes a connection instead of pooling it when it is broken,
   still streaming, its member is ejected, not `ready` or gone, or the pool
   is full or closed.
+- The pool's connections are in the pool's database: the `database`
+  argument, or the server's default one without it. A borrower that runs
+  `USE` is in that database until it releases the connection (also across a
+  re-dial); a connection a `USE` moved out of the pool's database — any
+  `USE`, when the pool was given none — is closed on release, so the next
+  borrower never inherits it. Name the database in the pool's arguments
+  instead of switching on a checked-out connection.
 - `withConnection()` releases in a `finally`, whatever the callback does.
 - `transaction($body)` checks one connection out, runs
   [`Connection::transaction()`](api.md) on it — `BEGIN`, the body, `COMMIT`,

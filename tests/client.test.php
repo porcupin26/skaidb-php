@@ -709,6 +709,57 @@ test('pool: idle connections are reused, broken ones discarded, surplus closed',
     $srv->stop();
 });
 
+test('pool: a borrower\'s USE does not reach the next borrower, and a re-dialled pooled connection is in its database', function () {
+    $srv = session_server();
+    $count = 'SELECT count(*) FROM notes';
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret', 'database' => 'app'], 4);
+    // A pooled connection lost while idle, re-dialled inside one checkout:
+    // back in the pool's database before anything else is sent.
+    $pool->withConnection(fn (Connection $c) => $c->query($count));
+    $srv->closeAll();
+    $pool->withConnection(function (Connection $c) use ($count) {
+        assert_throws(SkaidbException::class, fn () => $c->query($count), '/^connection closed by server/');
+        assert_eq(3, $c->query($count)->fetchColumn());
+    });
+    assert_eq(['connect', 'USE "app"', $count, 'connect', 'USE "app"', $count], session_seen($srv));
+    assert_eq(1, $pool->members()[0]['idle']);
+    // A borrower moves the session elsewhere. Kept in the pool, that
+    // connection would run the next borrower's statements in "other", not
+    // in the database the pool was given: it is closed on release instead.
+    $pool->withConnection(fn (Connection $c) => $c->exec('USE other'));
+    assert_eq(0, $pool->members()[0]['idle'], 'the connection went back to the pool in the borrower\'s database');
+    assert_eq(3, $pool->withConnection(fn (Connection $c) => $c->query($count)->fetchColumn()));
+    assert_eq(['USE other', 'connect', 'USE "app"', $count], array_slice(session_seen($srv), 6));
+    // A USE of the pool's own database costs nothing.
+    $pool->withConnection(fn (Connection $c) => $c->exec('USE app'));
+    assert_eq(1, $pool->members()[0]['idle']);
+    // Inside one checkout the borrower's database is the session's: a
+    // re-dial there enters it, not the pool's.
+    $pool->withConnection(function (Connection $c) use ($srv, $count) {
+        $c->exec('USE other');
+        $srv->closeAll();
+        assert_throws(SkaidbException::class, fn () => $c->query($count), '/^connection closed by server/');
+        assert_eq(3, $c->query($count)->fetchColumn());
+    });
+    assert_eq(['USE app', 'USE other', 'connect', 'USE "other"', $count], array_slice(session_seen($srv), 10));
+    assert_eq(0, $pool->members()[0]['idle']);
+    $pool->close();
+    $srv->stop();
+
+    // A pool given no database dials into the server's default one, and
+    // holds its connections to that too.
+    $srv = session_server();
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 4);
+    $pool->withConnection(fn (Connection $c) => $c->query($count));
+    assert_eq(1, $pool->members()[0]['idle']);
+    $pool->withConnection(fn (Connection $c) => $c->exec('USE app'));
+    assert_eq(0, $pool->members()[0]['idle'], 'the connection went back to the pool in the borrower\'s database');
+    $pool->withConnection(fn (Connection $c) => $c->query($count));
+    assert_eq(['connect', $count, 'USE app', 'connect', $count], session_seen($srv));
+    $pool->close();
+    $srv->stop();
+});
+
 test('framing: a 0-length frame and a large frame both round-trip', function () {
     $srv = (new FakeServer(['handle' => function (array $req) {
         if ($req['op'] === 1 && $req['sql'] === 'SELECT big') {
