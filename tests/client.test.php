@@ -415,6 +415,81 @@ test('prepared: a prepare refused because the server\'s table is full is the sta
     $srv->stop();
 });
 
+test('prepared: after a re-dial a held statement is prepared again — it never runs under an id of the lost connection', function () {
+    $a = 'UPDATE t SET v = ? WHERE id = ?';
+    $b = 'DELETE FROM t WHERE v = ? AND id = ?';   // the same parameter count, another effect
+    $srv = table_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $stA = $db->prepare($a);
+    $stB = $db->prepare($b);
+    $stA->execute(['x', 1]);   // id 0 on the first connection
+    $stB->execute(['y', 2]);   // id 1
+    assert_eq([$a, $b], [$stA->fetchColumn(), $stB->fetchColumn()]);
+    // The connection is lost while idle. B runs first on the new one, where
+    // it takes id 0 — the id A had on the lost connection.
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $stB->execute(['y', 3]), '/^connection closed by server/');
+    $stB->execute(['y', 3]);
+    assert_eq(['ran' => $b, 'params' => ['y', 3]], $stB->fetch());
+    $stA->execute(['x', 4]);
+    assert_eq(['ran' => $a, 'params' => ['x', 4]], $stA->fetch(), 'A ran under an id issued by the lost connection');
+    // A batch through the held statement likewise: 2 as the UPDATE it is,
+    // 1002 had it run as the DELETE.
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $stB->executeBatch([['y', 5]]), '/^connection closed by server/');
+    assert_eq(1001, $stB->executeBatch([['y', 5]]));
+    assert_eq(2, $stA->executeBatch([['x', 6], ['x', 7]]), 'the batch ran under an id issued by the lost connection');
+    // Per connection: prepare before execute, and never an id the server
+    // did not issue on that connection.
+    $ops = [];
+    foreach ($srv->requests() as $r) {
+        if ($r['op'] === 'connect') {
+            $ops[] = 'connect';
+        } elseif ($r['op'] === 2) {
+            $ops[] = 'prepare ' . ($r['sql'] === $a ? 'A' : 'B');
+        } elseif ($r['op'] === 3 || $r['op'] === 7) {
+            $ops[] = ($r['op'] === 3 ? 'execute ' : 'batch ') . $r['id'];
+        }
+    }
+    assert_eq([
+        'connect', 'prepare A', 'execute 0', 'prepare B', 'execute 1',
+        'connect', 'prepare B', 'execute 0', 'prepare A', 'execute 1',
+        'connect', 'prepare B', 'batch 0', 'prepare A', 'batch 1',
+    ], $ops);
+    $db->close();
+    $srv->stop();
+});
+
+test('prepared: a statement belongs to its connection — on a pool it runs there, under that connection\'s ids', function () {
+    $a = 'UPDATE t SET v = ? WHERE id = ?';
+    $b = 'DELETE FROM t WHERE v = ? AND id = ?';
+    $srv = table_server();
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 4);
+    $one = $pool->acquire();
+    $two = $pool->acquire();
+    assert_true($one !== $two);
+    $stA = $one->prepare($a);
+    $stA->execute(['x', 1]);                    // id 0 on connection one
+    $two->prepare($b)->execute(['y', 2]);       // id 0 on connection two
+    $pool->release($one);
+    $pool->release($two);
+    // A Statement cannot be moved to another connection: there is no call
+    // that takes one. Kept after its connection went back to the pool, it
+    // still runs on that connection, as itself.
+    $stA->execute(['x', 3]);
+    assert_eq(['ran' => $a, 'params' => ['x', 3]], $stA->fetch());
+    // The same SQL prepared through the other connection gets that
+    // connection's own id.
+    $other = $two->prepare($a);
+    $other->execute(['x', 4]);
+    assert_eq(['ran' => $a, 'params' => ['x', 4]], $other->fetch());
+    // Once the pool has closed the connection, its statements are closed
+    // with it.
+    $pool->close();
+    assert_throws(SkaidbException::class, fn () => $stA->execute(['x', 5]), '/^connection is closed$/');
+    $srv->stop();
+});
+
 test('batch: one OP_EXECUTE_BATCH carries every row typed; total affected returned', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
