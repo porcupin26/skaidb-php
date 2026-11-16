@@ -20,7 +20,7 @@ new Connection(
     string $password = '',
     int|string $consistency = 'QUORUM',   // 'ONE' | 'QUORUM' | 'ALL' | 0 | 1 | 2
     float $timeout = 10.0,                // connect + read timeout, seconds
-    ?string $database = null,             // USE <database> after the handshake, and after every reconnect
+    ?string $database = null,             // the session database: entered after the handshake, and after every reconnect
     bool $tls = false,
     ?string $tlsCa = null,                // PEM bundle; implies $tls
     bool $tlsInsecure = false,            // no verification; implies $tls
@@ -174,14 +174,25 @@ server's session ends with the socket, and with it a transaction left open
 in it — also after a read timeout, when the server is still there. The
 next statement re-dials through the seed list (a pooled connection: through
 the pool's members, usable ones first and the one it lost last),
-re-authenticates, re-sends `USE`, re-sends the Hello and clears the
-prepared-statement cache, then runs. The failed statement is never retried
-by the driver. A re-dial that fails — no endpoint reachable, or a server
-that turns the new connection away — throws its own error and leaves the
-connection broken, so the statement after it dials again. The new session
-has no transaction open: a statement sent after a transport error inside a
-hand-written `BEGIN` … `COMMIT` autocommits, so stop and start the
-transaction again (`transaction()` refuses to send it).
+re-authenticates, re-sends the Hello, enters the session database again
+and clears the prepared-statement cache, then runs. The failed statement is
+never retried by the driver. A re-dial that fails — no endpoint reachable,
+or a server that turns the new connection away — throws its own error and
+leaves the connection broken, so the statement after it dials again. The
+new session has no transaction open: a statement sent after a transport
+error inside a hand-written `BEGIN` … `COMMIT` autocommits, so stop and
+start the transaction again (`transaction()` refuses to send it).
+
+The session database is the constructor's `$database`, or the one named by
+the last `USE` the server accepted. The driver reads a statement that is
+exactly one `USE [DATABASE] <name>` — the name bare or in double quotes
+(`""` for a quote inside), an optional trailing `;` — sent through
+`exec()`, `query()`, `execute()` or `stream()`; a `USE` written any other
+way (with a comment, as one of two statements) is not noticed. Every dial
+sends `USE "<that database>"` before anything else, so a re-dialled
+connection is in the database the lost one was in. If that `USE` fails,
+the statement that caused the re-dial throws its error and is not sent; it
+never runs in another database, and the next statement tries again.
 
 ## `Statement`
 

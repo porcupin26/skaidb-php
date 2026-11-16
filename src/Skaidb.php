@@ -221,6 +221,16 @@ class Connection
     private array $dialArgs = [];
 
     /**
+     * The database this session is in, as far as the driver can know: the
+     * constructor's $database, then the one named by the last USE the server
+     * accepted (see noteStatement). Null: neither named one. It is session
+     * state, so every dial enters it again (see dial) — a re-dialled
+     * connection is in the database the lost one was in, never back in the
+     * server's default with a table of the same name.
+     */
+    private ?string $database = null;
+
+    /**
      * The Pool that owns this connection (see Pool), or null outside one:
      * told each round trip's latency, each transport failure and each write,
      * and asked for the dial order when the connection re-dials.
@@ -287,6 +297,7 @@ class Connection
             'tls', 'tlsCa', 'tlsInsecure', 'tlsServerName', 'seeds',
             'tlsClientCert', 'tlsClientKey', 'certAuth'
         );
+        $this->database = $database === '' ? null : $database;
         $this->dial();
     }
 
@@ -421,9 +432,12 @@ class Connection
         }
 
         $this->sendHello();
-        // USE is per-connection session state, so it runs on every dial.
-        if ($database !== null && $database !== '') {
-            $this->exec('USE "' . str_replace('"', '""', $database) . '"');
+        // The session database is per-connection state, so every dial
+        // enters it: the constructor's, or the one a later USE moved to. A
+        // dial that cannot enter it fails, and so does the statement behind
+        // it, rather than run in another database.
+        if ($this->database !== null) {
+            $this->exec('USE "' . str_replace('"', '""', $this->database) . '"');
         }
     }
 
@@ -1304,15 +1318,48 @@ class Connection
     }
 
     /**
-     * A statement succeeded: a pool with read-your-writes on remembers which
-     * member took a write.
+     * A statement succeeded. A USE moved the session to another database,
+     * the one a re-dial has to enter again (see dial); a pool with
+     * read-your-writes on remembers which member took a write.
      *
      * @internal
      */
     public function noteStatement(string $sql): void
     {
+        $database = self::usedDatabase($sql);
+        if ($database !== null) {
+            $this->database = $database;
+        }
         $this->pool?->statement($this, $sql);
     }
+
+    /**
+     * The database $sql enters when it is exactly one USE statement — USE
+     * [DATABASE] <name> with an optional trailing ';', the name bare or in
+     * double quotes ("" for a quote inside) — and null for anything else: a
+     * second statement, a comment, a placeholder. What is not read here is
+     * not tracked, so keep a USE plain.
+     *
+     * The name is taken as written: the server does not fold its case. A
+     * bare DATABASE is the keyword only when a name follows it, as the
+     * server reads it.
+     *
+     * @internal
+     */
+    public static function usedDatabase(string $sql): ?string
+    {
+        $matched = preg_match(
+            '/^\s*USE\s+(?:DATABASE\s+)?(?:"((?:[^"]|"")*)"|([A-Za-z_][A-Za-z0-9_]*))\s*;?\s*$/i',
+            $sql,
+            $m
+        );
+        if ($matched !== 1) {
+            return null;
+        }
+        $name = ($m[2] ?? '') !== '' ? $m[2] : str_replace('""', '"', $m[1]);
+        return $name === '' ? null : $name;
+    }
+
 
     // ---- framing ----------------------------------------------------------
 

@@ -375,10 +375,18 @@ subclass, modeled on `PDOException`).
   timed out` and mark the connection *broken*, not closed. Its socket is
   closed at once, so the server's session — and a transaction open in it —
   ends there, also after a read timeout. The next statement **re-dials**
-  (through the seed walk), re-authenticates, re-sends `USE <database>` and
-  clears the prepared-statement cache. Because the failed statement *may*
-  have executed, the driver never retries it for you: retry a write only if
-  it is idempotent. `isUsable()` reports the state.
+  (through the seed walk), re-authenticates, enters the session database
+  again and clears the prepared-statement cache. Because the failed
+  statement *may* have executed, the driver never retries it for you: retry
+  a write only if it is idempotent. `isUsable()` reports the state.
+- **The session database survives the re-dial.** It is the constructor's
+  `$database`, or the one the last `USE` the server accepted moved to: a
+  statement that is exactly `USE [DATABASE] <name>` (the name bare or in
+  double quotes, an optional `;`) sent through `exec()`, `query()`,
+  `execute()` or `stream()`. A `USE` written any other way (with a
+  comment, say) is not noticed, so keep it plain. If the database cannot be
+  entered on the new connection, the statement throws that error instead of
+  running in another database.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   rather than hand the next caller a misaligned reply; the next statement
   reconnects.

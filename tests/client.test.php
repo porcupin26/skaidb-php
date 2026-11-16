@@ -477,6 +477,170 @@ test('reconnect: a connection the server dropped re-dials on the next statement 
     $srv->stop();
 });
 
+/**
+ * A server for the session database: USE … answers Ddl (an Error when it
+ * names "gone"), a stream one row, SELECT one row, anything else a one-row
+ * mutation.
+ */
+function session_server(): FakeServer
+{
+    return (new FakeServer(['handle' => function (array $req) {
+        if (!in_array($req['op'], [1, 5], true)) {
+            return null;
+        }
+        if (preg_match('/^\s*use\b/i', $req['sql']) === 1) {
+            return str_contains($req['sql'], 'gone') ? F::error('database "gone" does not exist') : F::ddl();
+        }
+        if ($req['op'] === 5) {
+            return [F::header(['n']), F::chunk([[3]]), F::end()];
+        }
+        return str_starts_with($req['sql'], 'SELECT') ? F::rows(['n'], [[3]]) : F::mutation(1);
+    }]))->start();
+}
+
+/**
+ * What a server saw, connection by connection: 'connect', then each
+ * statement ("stream <sql>" for a streamed one). The Hello is left out.
+ *
+ * @return array<int,string>
+ */
+function session_seen(FakeServer $srv): array
+{
+    $out = [];
+    foreach ($srv->requests() as $r) {
+        if ($r['op'] === 'connect') {
+            $out[] = 'connect';
+        } elseif ($r['op'] === 1) {
+            $out[] = $r['sql'];
+        } elseif ($r['op'] === 5) {
+            $out[] = 'stream ' . $r['sql'];
+        }
+    }
+    return $out;
+}
+
+test('reconnect: the session database is entered again on the new connection, however it was entered', function () {
+    $count = 'SELECT count(*) FROM notes';
+    $insert = 'INSERT INTO notes (id) VALUES (1)';
+    $open = fn (FakeServer $srv, ?string $database = null) => new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 5.0, $database);
+    // Each way: what the first connection is sent, then what the new one
+    // must be sent before anything else.
+    $ways = [
+        'the database option' => [fn ($srv) => $open($srv, 'app'), ['USE "app"'], 'USE "app"'],
+        'USE through exec()' => [function ($srv) use ($open) {
+            $db = $open($srv);
+            $db->exec('USE app');
+            return $db;
+        }, ['USE app'], 'USE "app"'],
+        'USE DATABASE, quoted, with a semicolon, through query()' => [function ($srv) use ($open) {
+            $db = $open($srv);
+            $db->query('  use database "app" ; ');
+            return $db;
+        }, ['  use database "app" ; '], 'USE "app"'],
+        'USE through prepare()->execute()' => [function ($srv) use ($open) {
+            $db = $open($srv);
+            $db->prepare('USE app')->execute();
+            return $db;
+        }, ['USE app'], 'USE "app"'],
+        'USE through stream()' => [function ($srv) use ($open) {
+            $db = $open($srv);
+            iterator_to_array($db->stream('USE app'));
+            return $db;
+        }, ['stream USE app'], 'USE "app"'],
+        'a name that needs its quotes' => [function ($srv) use ($open) {
+            $db = $open($srv);
+            $db->exec('USE "app-2"');
+            return $db;
+        }, ['USE "app-2"'], 'USE "app-2"'],
+        'the option, then a USE elsewhere: the last one counts' => [function ($srv) use ($open) {
+            $db = $open($srv, 'other');
+            $db->exec('USE app');
+            return $db;
+        }, ['USE "other"', 'USE app'], 'USE "app"'],
+        'a USE the server refused does not count' => [function ($srv) use ($open) {
+            $db = $open($srv);
+            $db->exec('USE app');
+            assert_throws(SkaidbException::class, fn () => $db->exec('USE gone'), '/does not exist/');
+            return $db;
+        }, ['USE app', 'USE gone'], 'USE "app"'],
+    ];
+    foreach ($ways as $name => [$enter, $first, $reentered]) {
+        $srv = session_server();
+        $db = $enter($srv);
+        // The connection is lost while idle; the statement that finds out
+        // throws, and the next one re-dials.
+        $srv->closeAll();
+        assert_throws(SkaidbException::class, fn () => $db->query($count), '/^connection closed by server/');
+        assert_eq(3, $db->query($count)->fetchColumn(), $name);
+        assert_eq(1, $db->exec($insert), $name);
+        assert_eq(['connect', ...$first, 'connect', $reentered, $count, $insert], session_seen($srv), $name);
+        $db->close();
+        $srv->stop();
+    }
+});
+
+test('reconnect: only a statement that is exactly one USE moves the session database', function () {
+    $used = fn (string $sql) => Connection::usedDatabase($sql);
+    // USE [DATABASE] <name>, the name bare or in double quotes, an optional ';'.
+    assert_eq('app', $used('USE app'));
+    assert_eq('app', $used('use app;'));
+    assert_eq('App_2', $used("\n\tUse   App_2  ;  \n"), 'the name as written: the server does not fold case');
+    assert_eq('app', $used('USE DATABASE app'));
+    assert_eq('app', $used('use database "app";'));
+    assert_eq('app-2', $used('USE "app-2"'));
+    assert_eq('a "quoted" name', $used('USE "a ""quoted"" name"'));
+    assert_eq('database', $used('USE database'), 'a database named "database", as the server reads it');
+    assert_eq('database', $used('USE DATABASE database'));
+    // Anything else is left alone.
+    foreach ([
+        'SELECT 1', 'USE', 'USE ;', 'USE ?', "USE 'app'", 'USE app other', 'USE app; USE other', 'USE app -- why',
+        'USE app.notes', 'USE "app', 'USE app"', 'USE ""', 'USEapp', 'EXPLAIN USE app', 'USE app-2', 'CREATE TABLE use (PRIMARY KEY (id))',
+    ] as $sql) {
+        assert_eq(null, $used($sql), $sql);
+    }
+    // What is left alone stays where it was: the database before it is the
+    // one a re-dial enters.
+    $srv = session_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $db->exec('USE app');
+    $db->exec('USE other -- with a comment the driver does not read');
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
+    $db->query('SELECT 1');
+    assert_eq(['connect', 'USE "app"', 'SELECT 1'], array_slice(session_seen($srv), 3));
+    $db->close();
+    $srv->stop();
+});
+
+test('reconnect: a session database that cannot be entered again fails the statement — it never runs elsewhere', function () {
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        // The client's own USE is taken; the driver's, on a re-dial, is not
+        // (the database was dropped meanwhile) — until the third dial.
+        static $reentries = 0;
+        if ($req['sql'] === 'USE "app"') {
+            return ++$reentries < 3 ? F::error('database "app" does not exist') : F::ddl();
+        }
+        return str_starts_with($req['sql'], 'USE') ? F::ddl() : F::rows(['n'], [[3]]);
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $db->exec('USE app');
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT count(*) FROM notes'), '/^connection closed by server/');
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT count(*) FROM notes'), '/^database "app" does not exist$/');
+    assert_true(!$db->isUsable());
+    assert_throws(SkaidbException::class, fn () => $db->exec('INSERT INTO notes (id) VALUES (1)'), '/^database "app" does not exist$/');
+    // Neither statement reached a session outside "app".
+    assert_eq(['connect', 'USE app', 'connect', 'USE "app"', 'connect', 'USE "app"'], session_seen($srv));
+    // Once it can be entered again, the next statement runs — in it.
+    assert_eq(3, $db->query('SELECT count(*) FROM notes')->fetchColumn());
+    assert_eq(['connect', 'USE "app"', 'SELECT count(*) FROM notes'], array_slice(session_seen($srv), 6));
+    $db->close();
+    $srv->stop();
+});
+
 test('reconnect: a re-dial the server turns away in its handshake leaves the connection broken, not closed', function () {
     // A node at capacity closes a new connection unanswered (PROTOCOL.md
     // §6), and a node on its way up or down may do the same: a connection
