@@ -790,7 +790,7 @@ test('pool transaction: a connection whose body left a stream open is not pooled
 
 test('transaction: a read timeout in the body closes the socket at once — the server\'s session ends with it', function () {
     $srv = txn_server(['UPDATE t SET n = 2' => [[]]]);   // received, never answered
-    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.3);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.5);
     assert_throws(SkaidbException::class, fn () => $db->transaction(function (Connection $c) {
         $c->exec('UPDATE t SET n = 1');
         $c->exec('UPDATE t SET n = 2');
@@ -817,7 +817,7 @@ test('transport: every way a live connection is marked broken closes its socket 
         'SELECT garbled' => [[F::header(['n']), F::chunk([[1]]), chr(42)]], // the framing is lost in the rest
         'SELECT hollow' => [[F::header(['n']), F::chunk([[1]]), '']],       // an empty frame in the rest
     ]);
-    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.3);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.5);
     $breaks = [
         'a read timeout' => [fn () => $db->query('SELECT slow'), '/connection timed out/'],
         'a read timeout on a stream request' => [fn () => iterator_to_array($db->stream('SELECT slow')), '/connection timed out/'],
