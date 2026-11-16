@@ -436,6 +436,19 @@ test('reconnect: a connection the server dropped re-dials on the next statement 
     $srv->stop();
 });
 
+test('reconnect: close() is terminal for a broken connection too — its next statement does not dial', function () {
+    $srv = scripted_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
+    $db->close();
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection is closed$/');
+    assert_throws(SkaidbException::class, fn () => $db->prepare('SELECT ?')->execute([1]), '/^connection is closed$/');
+    assert_throws(SkaidbException::class, fn () => iterator_to_array($db->stream('SELECT 1')), '/^connection is closed$/');
+    assert_eq(1, $srv->connections());
+    $srv->stop();
+});
+
 test('pool: idle connections are reused, broken ones discarded, surplus closed', function () {
     $srv = scripted_server();
     $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 1);

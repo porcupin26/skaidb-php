@@ -1331,7 +1331,9 @@ class Connection
      */
     private function ensureLive(): void
     {
-        if ($this->sock === null && !$this->broken) {
+        // close() is terminal, also for a connection that was broken when
+        // it was closed: nothing dials again.
+        if ($this->closed || ($this->sock === null && !$this->broken)) {
             throw new SkaidbException('connection is closed');
         }
         if (!$this->broken) {
@@ -1380,9 +1382,6 @@ class Connection
      */
     private function markBroken(): void
     {
-        if ($this->closed) {
-            return; // closed is terminal: there is no socket, and nothing may re-dial
-        }
         $this->broken = true;
         if (is_resource($this->sock)) {
             @fclose($this->sock);
