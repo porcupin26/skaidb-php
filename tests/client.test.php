@@ -984,10 +984,13 @@ test('reconnect: a connection the server dropped re-dials on the next statement 
 });
 
 /**
- * A server for the session database: USE … answers Ddl (an Error when it
- * names "gone"), a stream one row, SELECT one row, anything else a one-row
- * mutation. A prepare is taken, an execute answers a one-row mutation and
- * a batch one row per row. $tls: `ssl` context options, to listen with TLS.
+ * A server for the session's state: USE … answers Ddl (an Error when it
+ * names "gone"), SET …, BEGIN …, COMMIT and ROLLBACK answer Ddl (a SET
+ * naming BOGUS a parse error), a stream one row, SELECT one row, anything
+ * else a one-row mutation. A prepare is taken — of a SET it is declined, as
+ * the real server declines one with a placeholder — an execute answers a
+ * one-row mutation and a batch one row per row. $tls: `ssl` context
+ * options, to listen with TLS.
  *
  * @param array<string,mixed>|null $tls
  */
@@ -996,7 +999,9 @@ function session_server(?array $tls = null): FakeServer
     return (new FakeServer(['tls' => $tls, 'handle' => function (array $req) {
         switch ($req['op']) {
             case 2:
-                return F::prepared(1, substr_count($req['sql'], '?'));
+                return preg_match('/^\s*set\b/i', $req['sql']) === 1
+                    ? F::error('unexpected token "Question", expected a positive integer')
+                    : F::prepared(1, substr_count($req['sql'], '?'));
             case 3:
                 return F::mutation(1);
             case 7:
@@ -1010,6 +1015,9 @@ function session_server(?array $tls = null): FakeServer
         }
         if (preg_match('/^\s*use\b/i', $req['sql']) === 1) {
             return str_contains($req['sql'], 'gone') ? F::error('database "gone" does not exist') : F::ddl();
+        }
+        if (preg_match('/^(\s|--[^\n]*)*(set|begin|commit|rollback)\b/i', $req['sql']) === 1) {
+            return str_contains($req['sql'], 'BOGUS') ? F::error('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT') : F::ddl();
         }
         if ($req['op'] !== 1) {
             return [F::header(['n']), F::chunk([[3]]), F::end()];
@@ -1368,6 +1376,183 @@ test('reconnect: a USE with a -- comment is read as the server reads it', functi
         array_slice(session_seen($srv), 3)
     );
     $db->close();
+    $srv->stop();
+});
+
+test('reconnect: SET CONSISTENCY and SET SCAN BUDGET are sent again on the new connection, before the statement', function () {
+    $count = 'SELECT count(*) FROM notes';
+    // Each case: the statements the application sends, then what a new
+    // connection must be sent before anything else — after the session
+    // database, the consistency first, then the scan budget.
+    $cases = [
+        'both, and a database' => [
+            ['USE app', 'SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL'],
+            ['USE "app"', 'SET CONSISTENCY ALL', 'SET SCAN BUDGET ROWS 1'],
+        ],
+        'only a scan budget' => [['SET SCAN BUDGET BYTES 4096'], ['SET SCAN BUDGET BYTES 4096']],
+        'only a consistency' => [['SET CONSISTENCY ONE'], ['SET CONSISTENCY ONE']],
+        'as written: case, spaces, a semicolon' => [
+            ["  set   consistency\tquorum ;  ", "Set Scan Budget Rows 10 Bytes 4096;"],
+            ["set   consistency\tquorum", 'Set Scan Budget Rows 10 Bytes 4096'],
+        ],
+        'comments are not part of it' => [
+            ["-- as agreed\nSET CONSISTENCY ALL -- for the audit", "SET SCAN BUDGET -- tight\n ROWS 2"],
+            ['SET CONSISTENCY ALL', "SET SCAN BUDGET \n ROWS 2"],
+        ],
+        'the last one accepted counts' => [
+            ['SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL', 'SET SCAN BUDGET BYTES 100 ROWS 5', 'SET CONSISTENCY ONE'],
+            ['SET CONSISTENCY ONE', 'SET SCAN BUDGET BYTES 100 ROWS 5'],
+        ],
+        'DEFAULT clears a setting: nothing is sent for it' => [
+            ['SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL', 'SET SCAN BUDGET DEFAULT'],
+            ['SET CONSISTENCY ALL'],
+        ],
+        'DEFAULT clears the other one too, however it is written' => [
+            ['SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL', "set consistency default; -- back"],
+            ['SET SCAN BUDGET ROWS 1'],
+        ],
+        'both cleared' => [['SET SCAN BUDGET ROWS 1', 'SET CONSISTENCY ALL', 'SET CONSISTENCY DEFAULT', 'SET SCAN BUDGET default'], []],
+        'a setting the server refused does not count' => [['SET CONSISTENCY ALL', 'SET CONSISTENCY BOGUS'], ['SET CONSISTENCY ALL']],
+        'what is not one such statement is left alone' => [
+            ['SET SCAN BUDGET ROWS 1', 'SET CONFIG scan.rows = 5', 'SET SCAN BUDGETS ROWS 9', 'SET CONSISTENCYALL', 'SETSCAN BUDGET ROWS 9'],
+            ['SET SCAN BUDGET ROWS 1'],
+        ],
+    ];
+    // The connection is lost while it sits idle, and under a statement:
+    // either way the next statement finds the settings in place.
+    $losses = [
+        'closed while idle' => fn (FakeServer $srv, Connection $db) => $srv->closeAll(),
+        'half-closed while idle' => fn (FakeServer $srv, Connection $db) => $srv->closeAll(FakeServer::HALF),
+        'lost under a statement' => function (FakeServer $srv, Connection $db) {
+            assert_throws(ConnectionException::class, fn () => $db->query('SELECT garbage'));
+        },
+    ];
+    foreach ($cases as $name => [$sent, $restored]) {
+        foreach ($losses as $how => $lose) {
+            $srv = (new FakeServer(['handle' => function (array $req) {
+                if ($req['op'] !== 1) {
+                    return null;
+                }
+                if ($req['sql'] === 'SELECT garbage') {
+                    return chr(42);
+                }
+                if (str_contains($req['sql'], 'BOGUS')) {
+                    return F::error('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT');
+                }
+                return str_starts_with($req['sql'], 'SELECT') ? F::rows(['n'], [[3]]) : F::ddl();
+            }]))->start();
+            $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+            foreach ($sent as $sql) {
+                try {
+                    $db->exec($sql);
+                } catch (SkaidbException $e) {
+                    assert_match('/^parse error: SET CONSISTENCY takes/', $e->getMessage(), $sql);
+                }
+            }
+            $lose($srv, $db);
+            $from = count(session_seen($srv));
+            assert_eq(3, $db->query($count)->fetchColumn(), "{$name}, {$how}");
+            assert_eq(['connect', ...$restored, $count], array_slice(session_seen($srv), $from), "{$name}, {$how}");
+            assert_eq(0, $srv->strayBytes());
+            // Once per connection: the next statement costs nothing extra.
+            $db->query($count);
+            assert_eq([$count], array_slice(session_seen($srv), $from + count($restored) + 2), "{$name}, {$how}");
+            $db->close();
+            $srv->stop();
+        }
+    }
+});
+
+test('reconnect: a setting is noted however it was sent, and only when the server took it', function () {
+    $ways = [
+        'exec()' => fn (Connection $c) => $c->exec('SET SCAN BUDGET ROWS 1'),
+        'query()' => fn (Connection $c) => $c->query('SET SCAN BUDGET ROWS 1'),
+        'prepare()->execute()' => fn (Connection $c) => $c->prepare('SET SCAN BUDGET ROWS 1')->execute(),
+        'a parameter, written into the text' => fn (Connection $c) => $c->prepare('SET SCAN BUDGET ROWS ?')->execute([1]),
+        'a batch: the last row' => fn (Connection $c) => $c->prepare('SET SCAN BUDGET ROWS ?')->executeBatch([[7], [1]]),
+        'stream()' => fn (Connection $c) => iterator_to_array($c->stream('SET SCAN BUDGET ROWS 1')),
+    ];
+    foreach ($ways as $name => $set) {
+        $srv = session_server();
+        $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+        $set($db);
+        $srv->closeAll();
+        $from = count(session_seen($srv));
+        $db->query('SELECT count(*) FROM notes');
+        assert_eq(['connect', 'SET SCAN BUDGET ROWS 1', 'SELECT count(*) FROM notes'], array_slice(session_seen($srv), $from), $name);
+        $db->close();
+        $srv->stop();
+    }
+    // What the driver reads, as the server reads it: exactly one statement
+    // whose first words are SET CONSISTENCY or SET SCAN BUDGET, comments
+    // and a trailing semicolon aside. The note is that text; DEFAULT is
+    // "no note".
+    $read = fn (string $sql) => Connection::sessionStatement($sql);
+    assert_eq(['consistency', 'SET CONSISTENCY ALL'], $read('SET CONSISTENCY ALL'));
+    assert_eq(['consistency', 'set consistency one'], $read(" set consistency one ;\n"));
+    assert_eq(['consistency', null], $read('SET CONSISTENCY DEFAULT'));
+    assert_eq(['consistency', null], $read("set consistency\n default -- back to the request's own level\n;"));
+    assert_eq(['scan', 'SET SCAN BUDGET ROWS 1'], $read('SET SCAN BUDGET ROWS 1'));
+    assert_eq(['scan', 'SET SCAN BUDGET BYTES 10 ROWS 2'], $read('SET SCAN BUDGET BYTES 10 ROWS 2; -- both'));
+    assert_eq(['scan', null], $read('SET SCAN BUDGET DEFAULT;'));
+    assert_eq(['scan', null], $read('set scan budget Default'));
+    assert_eq(['scan', 'SET SCAN BUDGET DEFAULTS'], $read('SET SCAN BUDGET DEFAULTS'), 'not the word DEFAULT: kept as it is, for the server to judge');
+    foreach ([
+        'SET', 'SET CONSISTENCYALL', 'SET CONSISTENCY ALL; SELECT 1', 'SET CONSISTENCY ALL; SET SCAN BUDGET ROWS 1', 'SET SCAN ROWS 1',
+        'SET SCAN BUDGETS ROWS 1', 'SET CONFIG a.b = 1', 'SETS CONSISTENCY ALL', '-- SET CONSISTENCY ALL', 'EXPLAIN SET CONSISTENCY ALL',
+        'SELECT 1', 'UPDATE t SET consistency = 1', 'INSERT INTO t (id, note) VALUES (1, \'SET CONSISTENCY ALL\')',
+    ] as $sql) {
+        assert_eq(null, $read($sql), $sql);
+    }
+});
+
+test('reconnect: a setting that cannot be applied again fails the statement — it never runs without it', function () {
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        // The client's own SET is taken; the driver's, on the next two
+        // dials, is not.
+        static $budgets = 0;
+        if ($req['sql'] === 'SET SCAN BUDGET ROWS 1') {
+            return in_array(++$budgets, [2, 3], true) ? F::error('scan budget: not on this member') : F::ddl();
+        }
+        return str_starts_with($req['sql'], 'SELECT') ? F::rows(['n'], [[3]]) : F::ddl();
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $db->exec('USE app');
+    $db->exec('SET CONSISTENCY ALL');
+    $db->exec('SET SCAN BUDGET ROWS 1');
+    $srv->closeAll();
+    $e = assert_throws(SkaidbException::class, fn () => $db->query('SELECT count(*) FROM notes'), '/^scan budget: not on this member$/');
+    assert_true(!$e instanceof ConnectionException);
+    assert_true(!$db->isUsable());
+    assert_throws(SkaidbException::class, fn () => $db->exec('INSERT INTO notes (id) VALUES (1)'), '/^scan budget: not on this member$/');
+    // Neither statement was sent: not under another budget, and not
+    // without one.
+    $dial = ['connect', 'USE "app"', 'SET CONSISTENCY ALL', 'SET SCAN BUDGET ROWS 1'];
+    assert_eq([...$dial, ...$dial], array_slice(session_seen($srv), 4));
+    // Once it is taken again the next statement runs, under it.
+    assert_eq(3, $db->query('SELECT count(*) FROM notes')->fetchColumn());
+    assert_eq([...$dial, 'SELECT count(*) FROM notes'], array_slice(session_seen($srv), 12));
+    $db->close();
+    $srv->stop();
+});
+
+test('pool: a connection re-dialled while a borrower holds it keeps the borrower\'s settings', function () {
+    $srv = session_server();
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret', 'database' => 'app'], 1);
+    $pool->withConnection(function (Connection $c) use ($srv) {
+        $c->exec('SET SCAN BUDGET ROWS 1');
+        $c->exec('SET CONSISTENCY ALL');
+        $srv->closeAll(FakeServer::HALF);
+        assert_eq(3, $c->query('SELECT count(*) FROM notes')->fetchColumn());
+    });
+    assert_eq(
+        ['connect', 'USE "app"', 'SET CONSISTENCY ALL', 'SET SCAN BUDGET ROWS 1', 'SELECT count(*) FROM notes'],
+        array_slice(session_seen($srv), 4)
+    );
+    $pool->close();
     $srv->stop();
 });
 

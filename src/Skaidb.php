@@ -286,6 +286,20 @@ class Connection
     private ?string $database = null;
 
     /**
+     * The session's consistency override and its scan budget, as far as the
+     * driver can know: the text of the last SET CONSISTENCY … and the last
+     * SET SCAN BUDGET … the server accepted (see sessionStatement), null
+     * when there was none or the last one said DEFAULT. Session state like
+     * the database, and restored like it: every dial sends them again,
+     * after the USE and before anything else — a re-dialled connection
+     * never reads at another consistency, or under no scan limit, than the
+     * application set.
+     */
+    private ?string $consistencyNote = null;
+
+    private ?string $scanBudgetNote = null;
+
+    /**
      * The Pool that owns this connection (see Pool), or null outside one:
      * told each round trip's latency, each transport failure and each write,
      * and asked for the dial order when the connection re-dials.
@@ -493,12 +507,21 @@ class Connection
         }
 
         $this->sendHello();
-        // The session database is per-connection state, so every dial
-        // enters it: the constructor's, or the one a later USE moved to. A
-        // dial that cannot enter it fails, and so does the statement behind
-        // it, rather than run in another database.
+        // The session's state is per-connection, so every dial puts it
+        // back: the database (the constructor's, or the one a later USE
+        // moved to), then the consistency override and the scan budget the
+        // application set with SET statements. A dial that cannot — the
+        // database is gone, a setting is refused — fails, and so does the
+        // statement behind it, rather than run in another database or
+        // under other settings.
         if ($this->database !== null) {
             $this->exec('USE "' . str_replace('"', '""', $this->database) . '"');
+        }
+        if ($this->consistencyNote !== null) {
+            $this->exec($this->consistencyNote);
+        }
+        if ($this->scanBudgetNote !== null) {
+            $this->exec($this->scanBudgetNote);
         }
     }
 
@@ -840,7 +863,9 @@ class Connection
         // OP_QUERY=1, consistency u8, u32 LE sql_len, sql bytes.
         $req = pack('C', 1) . pack('C', $consistency)
             . pack('V', strlen($sqlBytes)) . $sqlBytes;
-        return $this->roundtrip($req);
+        $res = $this->roundtrip($req);
+        $this->noteSession($sql);
+        return $res;
     }
 
     /**
@@ -955,6 +980,7 @@ class Connection
                 }
                 throw self::serverError($msg);
             }
+            $this->noteSession($sql);
             $this->noteStatement($sql);
             if ($tag === 1) { // Mutation: not row-producing
                 return ['kind' => 'mutation', 'columns' => [], 'affected' => $r->u64()];
@@ -1481,19 +1507,83 @@ class Connection
     }
 
     /**
-     * A statement succeeded. A USE moved the session to another database,
-     * the one a re-dial has to enter again (see dial); a pool with
-     * read-your-writes on remembers which member took a write.
+     * A statement succeeded: a pool with read-your-writes on remembers
+     * which member took a write.
      *
      * @internal
      */
     public function noteStatement(string $sql): void
     {
-        $database = self::usedDatabase($sql);
-        if ($database !== null) {
-            $this->database = $database;
-        }
         $this->pool?->statement($this, $sql);
+    }
+
+    /**
+     * The server accepted $sql, sent as text: if it changed the session's
+     * state in a way the driver can read, note it — a re-dial has to put
+     * that state back (see dial). A USE moved the session to another
+     * database; a SET CONSISTENCY or a SET SCAN BUDGET set the override or
+     * the limit, or cleared it with DEFAULT. Only text statements come
+     * through here: the server prepares none of these.
+     */
+    private function noteSession(string $sql): void
+    {
+        $read = self::sessionStatement($sql);
+        if ($read === null) {
+            return;
+        }
+        [$what, $value] = $read;
+        if ($what === 'use') {
+            $this->database = $value;
+        } elseif ($what === 'consistency') {
+            $this->consistencyNote = $value;
+        } else {
+            $this->scanBudgetNote = $value;
+        }
+    }
+
+    /**
+     * What $sql does to the session's state, when it is exactly one
+     * statement of a kind the driver notes, and null for anything else:
+     *
+     * - ['use', <name>]: USE [DATABASE] <name> (see usedDatabase);
+     * - ['consistency', <text>]: a statement whose first two words are SET
+     *   CONSISTENCY;
+     * - ['scan', <text>]: one whose first three are SET SCAN BUDGET.
+     *
+     * <text> is the statement as written, without its `--` comments and its
+     * trailing ';' — what a new connection is sent to get the setting back
+     * — and null when the word after those is DEFAULT, which clears the
+     * setting. The driver reads no further: which levels and limits exist
+     * is the server's to say, and only a statement it accepted is noted.
+     * Keywords in any case, any whitespace, as the server reads them.
+     *
+     * @internal
+     * @return array{0:string,1:?string}|null
+     */
+    public static function sessionStatement(string $sql): ?array
+    {
+        // Every text statement comes through here, some of them megabytes
+        // long: its first word, past whitespace and comments, settles it
+        // before anything is copied.
+        if (preg_match('/^(?:\s++|--[^\n]*+)*+(USE|SET)(?![A-Za-z0-9_])/i', $sql, $first) !== 1) {
+            return null;
+        }
+        if (strcasecmp($first[1], 'USE') === 0) {
+            $database = self::usedDatabase($sql);
+            return $database === null ? null : ['use', $database];
+        }
+        $text = trim(self::withoutLineComments($sql));
+        if (str_ends_with($text, ';')) {
+            $text = rtrim(substr($text, 0, -1));
+        }
+        if (str_contains($text, ';')
+            || preg_match('/^SET\s+(CONSISTENCY|SCAN\s+BUDGET)(?:\s+(DEFAULT(?![A-Za-z0-9_]))?|$)/i', $text, $m) !== 1) {
+            return null; // more than one statement, or another SET
+        }
+        return [
+            strcasecmp($m[1], 'CONSISTENCY') === 0 ? 'consistency' : 'scan',
+            ($m[2] ?? '') !== '' ? null : $text,
+        ];
     }
 
     /**

@@ -157,6 +157,13 @@ foreach ($db->stream('SELECT ...', consistency: 'ONE') as $row) { ... }
 `Connection::ONE`, `Connection::QUORUM` and `Connection::ALL` hold the
 numeric codes (0, 1, 2).
 
+That is the level each request carries. The server also takes a session
+override, `SET CONSISTENCY { ONE | QUORUM | ALL }`, sent as a statement:
+every statement on the connection then runs at that level whatever its
+request says, until `SET CONSISTENCY DEFAULT` (server ≥ 0.349) clears it.
+The driver keeps such an override across a reconnect; see Errors and
+reconnect.
+
 ## Statements and parameters
 
 ```php
@@ -439,6 +446,16 @@ try {
   Anything the driver cannot read as one such statement is not noticed. If
   the database cannot be entered on the new connection, the statement
   throws that error instead of running in another database.
+- **So do the session's settings.** A consistency override (`SET
+  CONSISTENCY ALL`) and a scan budget (`SET SCAN BUDGET ROWS 1000`) live on
+  the server's side of the connection, like the database. The driver keeps
+  the text of the last `SET CONSISTENCY …` and the last `SET SCAN BUDGET …`
+  the server accepted — one statement, comments and a trailing `;` aside,
+  however it was sent — and sends them again on a new connection, after the
+  `USE` and before the statement: the consistency first, then the budget. A
+  setting cleared with `… DEFAULT` is not sent. If one is refused there,
+  the statement throws that error and is not sent: it never runs under
+  other settings than the ones you set.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   rather than hand the next caller a misaligned reply; the next statement
   reconnects.

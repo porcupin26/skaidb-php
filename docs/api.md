@@ -216,6 +216,19 @@ in the database the lost one was in. If that `USE` fails, the statement
 that caused the re-dial throws its error and is not sent; it never runs in
 another database, and the next statement tries again.
 
+The session's consistency override and its scan budget are kept the same
+way. The driver reads a statement that is exactly one `SET CONSISTENCY …`
+or one `SET SCAN BUDGET …` (those first words, in any case; `--` comments
+and a trailing `;` aside) and, once the server has accepted it, keeps its
+text: one note per kind, the last accepted one wins, and a statement whose
+next word is `DEFAULT` clears the note. It reads no further — which levels
+and limits exist is the server's to say. Every dial sends the noted `SET
+CONSISTENCY …`, then the noted `SET SCAN BUDGET …`, after the `USE` and
+before the statement. A setting refused on the new connection fails the
+statement with that error, unsent, as a database that cannot be entered
+does. (A streamed `SET CONSISTENCY` is refused by the server and so never
+noted; send it with `exec()`.)
+
 ## `Statement`
 
 Created by `prepare()`/`query()`. Holds the whole result of the last
