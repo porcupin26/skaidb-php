@@ -556,9 +556,13 @@ test('transaction: the body swallows a lost connection and writes on — the wri
         assert_throws(SkaidbException::class, fn () => iterator_to_array($c->stream('INSERT INTO log (id) VALUES (?)', [7])), $lost);
         return 'all is well';
     };
-    // Not the body's value: the loss, and no claim about a COMMIT that was
-    // never sent having committed or not.
-    assert_throws(SkaidbException::class, fn () => $db->transaction($body), $lost);
+    // Not the body's value: the loss. The COMMIT was never sent, so the
+    // error can say what that means — nothing was committed.
+    assert_throws(
+        ConnectionException::class,
+        fn () => $db->transaction($body),
+        '/^connection lost inside a transaction: the COMMIT was not sent, and nothing was committed/'
+    );
     assert_eq(2, count($caught));
     assert_match('/^connection closed by server/', $caught[0], 'statement 2: the transport error');
     assert_match($lost, $caught[1], 'statement 3: refused, not sent');
@@ -647,10 +651,278 @@ test('transaction: a connection lost on the COMMIT is thrown — not retried, th
         $runs++;
         $c->exec('UPDATE t SET n = 1');
     };
-    assert_throws(SkaidbException::class, fn () => $db->transaction($body, 3), '/connection closed by server/');
+    assert_throws(ConnectionException::class, fn () => $db->transaction($body, 3), TXN_UNKNOWN);
     assert_eq(1, $runs);
     assert_eq(['BEGIN', 'UPDATE t SET n = 1', 'COMMIT'], txn_statements($srv));
     assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+// ---- a transaction the application writes itself ----------------------------
+
+/** The error of a statement that is not sent because its transaction's connection is gone. */
+const TXN_NOT_SENT = '/^connection lost inside a transaction: the statement was not sent/';
+
+/** The error of a COMMIT that is not sent for the same reason: nothing can have been committed. */
+const TXN_NOT_COMMITTED = '/^connection lost inside a transaction: the COMMIT was not sent, and nothing was committed/';
+
+/** The error of a COMMIT the connection was lost under: sent, never answered. */
+const TXN_UNKNOWN = '/^connection closed by server: the connection was lost under the COMMIT, so whether the transaction was committed is not known$/';
+
+test('hand-written: BEGIN, statements, COMMIT with nothing lost go as they always did', function () {
+    $srv = txn_server(['COMMIT' => [F::ddl(), F::error(TXN_CONFLICT), F::ddl()]]);
+    $db = txn_connect($srv);
+    assert_eq(0, $db->exec('BEGIN'));
+    assert_eq(1, $db->exec('INSERT INTO t (id) VALUES (1)'));
+    $st = $db->prepare('UPDATE t SET n = ? WHERE id = ?');
+    $st->execute([5, 1]);
+    assert_eq(0, $db->exec('COMMIT'));
+    // Rolled back, and a COMMIT the server refuses: each ends the
+    // transaction, and the connection goes on as an ordinary one.
+    $db->exec('BEGIN TRANSACTION');
+    $db->exec('INSERT INTO t (id) VALUES (2)');
+    assert_eq('ddl', $db->query('ROLLBACK')->kind());
+    $db->exec('begin');
+    $db->exec('INSERT INTO t (id) VALUES (3)');
+    assert_throws(TransactionConflictException::class, fn () => $db->exec('COMMIT'));
+    assert_eq([
+        'BEGIN', 'INSERT INTO t (id) VALUES (1)', 'prepare UPDATE t SET n = ? WHERE id = ?', 'execute [5,1]', 'COMMIT',
+        'BEGIN TRANSACTION', 'INSERT INTO t (id) VALUES (2)', 'ROLLBACK',
+        'begin', 'INSERT INTO t (id) VALUES (3)', 'COMMIT',
+    ], txn_statements($srv));
+    assert_eq(1, $srv->connections());
+    // No transaction is open now: a connection lost here is replaced like
+    // any other, and the statement runs.
+    $srv->closeAll();
+    assert_eq(1, $db->exec('INSERT INTO t (id) VALUES (4)'));
+    assert_eq(2, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('hand-written: after a lost connection nothing more of the transaction is sent, and COMMIT says nothing was committed', function () {
+    // PROTOCOL.md §6 rule 7 for a BEGIN the application sent itself. However
+    // the connection goes — closed while idle, half-closed (the write would
+    // still succeed), reset, or lost under row 2 — row 2 fails, row 3 fails
+    // unsent, and so does the COMMIT.
+    $losses = [
+        'closed while idle' => FakeServer::CLOSE,
+        'half-closed while idle' => FakeServer::HALF,
+        'reset while idle' => FakeServer::RESET,
+        'lost under the statement' => null,
+    ];
+    foreach ($losses as $how => $close) {
+        $srv = txn_server(['INSERT INTO t (id) VALUES (2)' => [FakeServer::DROP]]);
+        $db = txn_connect($srv);
+        $db->exec('BEGIN');
+        assert_eq(1, $db->exec('INSERT INTO t (id) VALUES (1)'));
+        if ($close !== null) {
+            $srv->closeAll($close);
+        }
+        $e = assert_throws(
+            ConnectionException::class,
+            fn () => $db->exec('INSERT INTO t (id) VALUES (2)'),
+            $close === null ? '/^connection closed by server$/' : TXN_NOT_SENT
+        );
+        // Every further statement, whichever way it is sent.
+        assert_throws(ConnectionException::class, fn () => $db->exec('INSERT INTO t (id) VALUES (3)'), TXN_NOT_SENT);
+        assert_throws(ConnectionException::class, fn () => $db->query('SELECT n FROM t'), TXN_NOT_SENT);
+        assert_throws(ConnectionException::class, fn () => $db->prepare('INSERT INTO t (id) VALUES (?)')->execute([3]), TXN_NOT_SENT);
+        assert_throws(ConnectionException::class, fn () => $db->prepare('INSERT INTO t (id) VALUES (?)')->executeBatch([[3]]), TXN_NOT_SENT);
+        assert_throws(ConnectionException::class, fn () => iterator_to_array($db->stream('SELECT n FROM t')), TXN_NOT_SENT);
+        assert_throws(ConnectionException::class, fn () => $db->exec('BEGIN'), TXN_NOT_SENT);
+        assert_true(!$db->isUsable(), $how);
+        // The COMMIT is not sent either, and says what that means: the
+        // server dropped the transaction with the connection.
+        $e = assert_throws(ConnectionException::class, fn () => $db->exec('COMMIT'), TXN_NOT_COMMITTED);
+        $sent = $close === null
+            ? ['BEGIN', 'INSERT INTO t (id) VALUES (1)', 'INSERT INTO t (id) VALUES (2)']
+            : ['BEGIN', 'INSERT INTO t (id) VALUES (1)'];
+        assert_eq($sent, txn_statements($srv), $how);
+        assert_eq(1, $srv->connections(), "{$how}: something was sent on a new session");
+        usleep(50_000);
+        assert_eq(0, $srv->strayBytes(), $how);
+        // That ended it: the next statement re-dials, as after any loss.
+        assert_eq(1, $db->exec('UPDATE t SET n = 9'));
+        assert_eq(['UPDATE t SET n = 9'], array_slice(txn_statements($srv), count($sent)), $how);
+        assert_eq(2, $srv->connections());
+        $db->close();
+        $srv->stop();
+    }
+});
+
+test('hand-written: ROLLBACK after a lost connection succeeds without being sent', function () {
+    $srv = txn_server();
+    $db = txn_connect($srv);
+    $rollbacks = [
+        'exec' => fn () => assert_eq(0, $db->exec('ROLLBACK')),
+        'query' => fn () => assert_eq('ddl', $db->query('rollback transaction;')->kind()),
+        'stream' => function () use ($db) {
+            $gen = $db->stream('ROLLBACK -- give up');
+            assert_eq([], iterator_to_array($gen));
+            assert_eq(['kind' => 'ddl', 'columns' => [], 'affected' => 0], $gen->getReturn());
+        },
+    ];
+    $connections = 1;
+    foreach ($rollbacks as $name => $rollback) {
+        $db->exec('BEGIN');
+        $db->exec('INSERT INTO t (id) VALUES (1)');
+        $srv->closeAll(FakeServer::HALF);
+        assert_throws(ConnectionException::class, fn () => $db->exec('INSERT INTO t (id) VALUES (2)'), TXN_NOT_SENT);
+        $from = count(txn_statements($srv));
+        // The server rolled the transaction back when the connection
+        // went: there is nothing to send, and nothing to report.
+        $rollback();
+        assert_eq($from, count(txn_statements($srv)), "{$name}: the ROLLBACK was sent");
+        assert_eq($connections, $srv->connections(), "{$name}: the ROLLBACK dialled");
+        // The transaction is over for the driver too.
+        assert_eq(1, $db->exec('UPDATE t SET n = 9'));
+        assert_eq(++$connections, $srv->connections(), $name);
+    }
+    usleep(50_000);
+    assert_eq(0, $srv->strayBytes());
+    // With the connection alive a ROLLBACK travels, like any statement.
+    $db->exec('BEGIN');
+    $db->exec('ROLLBACK');
+    assert_eq(['BEGIN', 'ROLLBACK'], array_slice(txn_statements($srv), -2));
+    $db->close();
+    $srv->stop();
+});
+
+test('hand-written: a COMMIT or ROLLBACK that is the first to find the connection gone is not sent either', function () {
+    foreach ([FakeServer::CLOSE, FakeServer::HALF, FakeServer::RESET] as $how) {
+        $srv = txn_server();
+        $db = txn_connect($srv);
+        // Nothing has failed yet: the COMMIT is what looks at the socket.
+        // Written to a half-closed connection it would go nowhere, and on a
+        // new one it would answer for another transaction, or for none.
+        $db->exec('BEGIN');
+        $db->exec('INSERT INTO t (id) VALUES (1)');
+        $srv->closeAll($how);
+        assert_throws(ConnectionException::class, fn () => $db->exec('COMMIT'), TXN_NOT_COMMITTED);
+        assert_eq(1, $db->exec('UPDATE t SET n = 9'), $how);
+        $db->exec('BEGIN');
+        $db->exec('INSERT INTO t (id) VALUES (2)');
+        $srv->closeAll($how);
+        assert_eq(0, $db->exec('ROLLBACK'), $how);
+        assert_eq(1, $db->exec('UPDATE t SET n = 9'), $how);
+        assert_eq(
+            ['BEGIN', 'INSERT INTO t (id) VALUES (1)', 'UPDATE t SET n = 9', 'BEGIN', 'INSERT INTO t (id) VALUES (2)', 'UPDATE t SET n = 9'],
+            txn_statements($srv),
+            $how
+        );
+        usleep(50_000);
+        assert_eq([3, 0], [$srv->connections(), $srv->strayBytes()], $how);
+        $db->close();
+        $srv->stop();
+    }
+});
+
+test('hand-written: a connection lost under the COMMIT itself leaves the outcome unknown, and the error says so', function () {
+    $srv = txn_server(['COMMIT' => [FakeServer::DROP], 'ROLLBACK' => [FakeServer::DROP]]);
+    $db = txn_connect($srv);
+    $db->exec('BEGIN');
+    $db->exec('INSERT INTO t (id) VALUES (1)');
+    // Sent, and never answered: the server may have applied it before its
+    // reply went missing.
+    $e = assert_throws(ConnectionException::class, fn () => $db->exec('COMMIT'), TXN_UNKNOWN);
+    assert_true($e->getPrevious() instanceof ConnectionException);
+    assert_eq(['BEGIN', 'INSERT INTO t (id) VALUES (1)', 'COMMIT'], txn_statements($srv));
+    // Either way the transaction is over: the connection re-dials.
+    assert_eq(1, $db->exec('UPDATE t SET n = 9'));
+    assert_eq(2, $srv->connections());
+    // Streamed, the same.
+    $db->exec('BEGIN');
+    assert_throws(ConnectionException::class, fn () => iterator_to_array($db->stream('COMMIT')), TXN_UNKNOWN);
+    assert_eq(1, $db->exec('UPDATE t SET n = 9'));
+    // A ROLLBACK lost that way: the plain transport error — there is
+    // nothing unknown about a transaction that was not committed — and the
+    // transaction is over as well.
+    $db->exec('BEGIN');
+    assert_throws(ConnectionException::class, fn () => $db->exec('ROLLBACK'), '/^connection closed by server$/');
+    assert_eq(1, $db->exec('UPDATE t SET n = 9'));
+    // A COMMIT with no transaction open that loses the connection is an
+    // ordinary lost statement.
+    assert_throws(ConnectionException::class, fn () => $db->exec('COMMIT'), '/^connection closed by server$/');
+    assert_eq(1, $db->exec('UPDATE t SET n = 9'));
+    assert_eq(5, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('hand-written: what opens and what ends a transaction, as the server reads it', function () {
+    $read = fn (string $sql) => Connection::sessionStatement($sql)[0] ?? null;
+    foreach (['BEGIN', 'begin', ' Begin ; ', 'BEGIN TRANSACTION', 'BEGIN ATOMIC', 'BEGIN ATOMIC TRANSACTION',
+        'BEGIN ATOMIC PARTITION (tenant = 7)', "-- start\nBEGIN -- now", 'begin  atomic -- as typed'] as $sql) {
+        assert_eq('begin', $read($sql), $sql);
+    }
+    foreach (['COMMIT', 'commit;', 'COMMIT TRANSACTION', " commit\ttransaction ; ", "COMMIT -- done"] as $sql) {
+        assert_eq('commit', $read($sql), $sql);
+    }
+    foreach (['ROLLBACK', 'rollback', 'ROLLBACK TRANSACTION;', "-- no\nROLLBACK"] as $sql) {
+        assert_eq('rollback', $read($sql), $sql);
+    }
+    foreach (['BEGINNING', 'COMMIT WORK', 'COMMIT; BEGIN', 'ROLLBACK TO SAVEPOINT a', 'COMMITTED', '-- COMMIT', 'ROLLBACKS',
+        'SELECT 1 -- COMMIT', 'INSERT INTO t (id, v) VALUES (1, \'BEGIN\')', 'EXPLAIN SELECT 1'] as $sql) {
+        assert_eq(null, $read($sql), $sql);
+    }
+    // A BEGIN the server refuses opens nothing; a statement that fails
+    // inside a transaction does not end it.
+    $srv = txn_server(['BEGIN ATOMIC' => [F::error('BEGIN ATOMIC needs a cluster')], 'SELECT nope' => [F::error('no such column: nope')]]);
+    $db = txn_connect($srv);
+    assert_throws(SkaidbException::class, fn () => $db->exec('BEGIN ATOMIC'), '/needs a cluster/');
+    $srv->closeAll();
+    assert_eq(1, $db->exec('UPDATE t SET n = 1'), 'no transaction was open: the connection re-dials');
+    $db->exec('BEGIN');
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT nope'), '/no such column/');
+    $srv->closeAll();
+    assert_throws(ConnectionException::class, fn () => $db->exec('UPDATE t SET n = 2'), TXN_NOT_SENT);
+    assert_eq(0, $db->exec('ROLLBACK'));
+    assert_eq(2, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('hand-written: transaction() notes its own transaction once, and leaves none behind', function () {
+    $srv = txn_server(['UPDATE t SET n = 2' => [FakeServer::DROP, F::mutation(1)]] + txn_stream_script());
+    $db = txn_connect($srv);
+    // Every way the helper ends, the connection is an ordinary one again:
+    // lost afterwards, it is replaced and the statement runs.
+    $ends = [
+        'committed' => fn () => $db->transaction(fn (Connection $c) => $c->exec('UPDATE t SET n = 1')),
+        'rolled back' => fn () => assert_throws(\RuntimeException::class, fn () => $db->transaction(function (Connection $c) {
+            throw new \RuntimeException('no');
+        })),
+        'lost in the body' => fn () => assert_throws(ConnectionException::class, fn () => $db->transaction(fn (Connection $c) => $c->exec('UPDATE t SET n = 2'))),
+        'a stream left open' => fn () => assert_throws(SkaidbException::class, fn () => $db->transaction(function (Connection $c) {
+            $rows = $c->stream('SELECT n FROM t');
+            $rows->current();
+            return $rows;
+        }), '/^connection is busy streaming/'),
+    ];
+    foreach ($ends as $name => $run) {
+        $run();
+        $srv->closeAll();
+        assert_eq(1, $db->exec('UPDATE t SET n = 9'), $name);
+    }
+    // Inside the helper the body's own COMMIT and ROLLBACK are the
+    // transaction's too: after a loss neither is sent.
+    $srv2 = txn_server();
+    $db2 = txn_connect($srv2);
+    assert_throws(ConnectionException::class, fn () => $db2->transaction(function (Connection $c) use ($srv2) {
+        $c->exec('UPDATE t SET n = 1');
+        $srv2->closeAll(FakeServer::HALF);
+        assert_throws(ConnectionException::class, fn () => $c->exec('UPDATE t SET n = 2'), TXN_NOT_SENT);
+        assert_eq(0, $c->exec('ROLLBACK'));
+        // Still inside transaction(): what follows would autocommit.
+        assert_throws(ConnectionException::class, fn () => $c->exec('UPDATE t SET n = 3'), TXN_NOT_SENT);
+    }), TXN_NOT_COMMITTED);
+    assert_eq(['BEGIN', 'UPDATE t SET n = 1'], txn_statements($srv2));
+    assert_eq(1, $srv2->connections());
+    assert_eq(1, $db2->exec('UPDATE t SET n = 9'));
+    $db2->close();
+    $srv2->stop();
     $db->close();
     $srv->stop();
 });

@@ -535,14 +535,28 @@ The rules, with the helper or without:
   `withConnection()`; never spread a transaction over several checkouts.
 - **Stop if the opening statement fails.** No transaction is open then, and
   every statement after it would autocommit on its own.
-- **A connection error ends the transaction.** The reconnect described
-  above gives the next statement a new session with no transaction open,
-  where it would autocommit. Inside `transaction()` nothing more is sent
-  once the connection is lost: a further statement of the body, or the
-  `COMMIT`, throws `connection lost inside a transaction` instead of
-  re-dialling, and the connection reconnects on the first statement after
-  the call. By hand, stop and start again from the opening statement. A
-  connection error on the `COMMIT` itself leaves its outcome unknown.
+- **A lost connection ends the transaction, and nothing of it is sent on
+  a new one.** A new session has no transaction open: sent there, the
+  statements that follow — and the `COMMIT` — would each commit on their
+  own. So while a transaction is open the driver does not reconnect. That
+  holds inside `transaction()` and for a transaction you open yourself:
+  the driver notes a statement the server accepted whose first word is
+  `BEGIN`, until a `COMMIT` or a `ROLLBACK` (alone, or followed by
+  `TRANSACTION`) has been answered. Until then, once the connection is
+  lost, every statement throws a `ConnectionException` — `connection lost
+  inside a transaction: the statement was not sent …` — and you end the
+  transaction yourself:
+  - `ROLLBACK` succeeds without being sent: the server rolled the
+    transaction back when the connection went.
+  - `COMMIT` throws `connection lost inside a transaction: the COMMIT was
+    not sent, and nothing was committed …`.
+
+  Either one ends it, and the next statement reconnects as usual
+  (`transaction()` does this for you and throws the loss). Only when the
+  connection is lost **under the `COMMIT` itself** is the outcome unknown —
+  the server may have applied it before its reply went missing — and the
+  error says so: `connection closed by server: the connection was lost
+  under the COMMIT, so whether the transaction was committed is not known`.
 
 A failed `COMMIT` has ended the transaction, whatever the reason. A
 statement that fails inside one has not: the transaction stays open, to

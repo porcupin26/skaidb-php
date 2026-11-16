@@ -1205,7 +1205,7 @@ test('idle: inside transaction() a connection found dead is a lost transaction, 
         assert_throws(ConnectionException::class, fn () => $c->exec('INSERT INTO notes (id) VALUES (2)'), $lost);
         assert_throws(ConnectionException::class, fn () => $c->prepare('INSERT INTO notes (id) VALUES (?)')->execute([3]), $lost);
         return 'all is well';
-    }), $lost);
+    }), '/^connection lost inside a transaction: the COMMIT was not sent, and nothing was committed/');
     usleep(50_000);
     assert_eq(['connect', 'BEGIN', 'INSERT INTO notes (id) VALUES (1)'], session_seen($srv));
     assert_eq(0, $srv->strayBytes());

@@ -272,6 +272,20 @@ class Connection
      */
     private bool $inTransaction = false;
 
+    /**
+     * A transaction the application opened itself is open on this
+     * connection, as far as the driver can know: the server accepted a
+     * statement whose first word is BEGIN, and has not yet answered a
+     * COMMIT or a ROLLBACK since (see sessionStatement). The rule is
+     * transaction()'s (PROTOCOL.md §6 rule 7): while it is open a lost
+     * connection is not re-dialled, because on a new one the rest of the
+     * transaction — and its COMMIT — would run as separate statements,
+     * each committed on its own. Statements throw instead, until the
+     * application ends the transaction with a ROLLBACK or a COMMIT (see
+     * endLostTransaction).
+     */
+    private bool $transactionNoted = false;
+
     /** Everything a redial needs, captured at construction. */
     private array $dialArgs = [];
 
@@ -701,7 +715,12 @@ class Connection
      * so a transport failure is never retried here, and from $begin to the
      * COMMIT a lost connection is not re-dialled: on a fresh connection the
      * statements that follow would autocommit. They throw instead, and the
-     * connection re-dials on the first statement after this call.
+     * connection re-dials on the first statement after this call. A COMMIT
+     * that could not be sent throws "connection lost inside a transaction:
+     * the COMMIT was not sent, and nothing was committed"; one the
+     * connection was lost under says the outcome is not known. (A
+     * transaction the application opens with its own BEGIN is held to the
+     * same rule: see $transactionNoted.)
      *
      * $begin is sent verbatim: 'BEGIN' on a standalone server, 'BEGIN
      * ATOMIC' or 'BEGIN ATOMIC PARTITION (col = literal)' on a cluster.
@@ -782,6 +801,9 @@ class Connection
             return false;
         }
         $this->markBroken();
+        // Gone with the socket, and neither a COMMIT nor a ROLLBACK will
+        // come to say so.
+        $this->transactionNoted = false;
         return true;
     }
 
@@ -883,6 +905,9 @@ class Connection
     {
         $this->assertNotStreaming();
         $read = self::sessionStatement($sql);
+        if ($this->endLostTransaction($read)) {
+            return ['kind' => 'ddl', 'columns' => [], 'rows' => [], 'affected' => 0];
+        }
         $this->ensureLive($read[0] ?? null);
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
@@ -895,7 +920,7 @@ class Connection
             $res = $this->roundtrip($req);
         } catch (SkaidbException $e) {
             $this->landed(false);
-            throw $e;
+            throw $this->transactionEnded($read, $e);
         }
         $this->noteSession($read);
         $this->landed(true);
@@ -972,6 +997,9 @@ class Connection
             $req .= self::encodeParams($params);
         }
         $read = self::sessionStatement($sql);
+        if ($this->endLostTransaction($read)) {
+            return ['kind' => 'ddl', 'columns' => [], 'affected' => 0];
+        }
         $this->ensureLive($read[0] ?? null);
         $started = hrtime(true);
         try {
@@ -979,7 +1007,7 @@ class Connection
         } catch (SkaidbException $e) {
             $this->landed(false);
             $this->observeFailure();
-            throw $e;
+            throw $this->transactionEnded($read, $e);
         }
         // Busy from the request, not from the first row: the header read below
         // is already part of the stream's exchange.
@@ -992,7 +1020,7 @@ class Connection
             } catch (SkaidbException $e) {
                 $this->landed(false);
                 $this->observeFailure();
-                throw $e;
+                throw $this->transactionEnded($read, $e);
             }
             $this->pool?->roundTrip($this, (hrtime(true) - $started) / 1e9);
             $r = new Reader($frame);
@@ -1004,7 +1032,7 @@ class Connection
             } catch (\Throwable $e) {
                 $this->markBroken();
                 $this->landed(false);
-                throw new ConnectionException($e->getMessage(), 0, $e);
+                throw $this->transactionEnded($read, new ConnectionException($e->getMessage(), 0, $e));
             }
             if ($tag === 3) {
                 // One ordinary Error frame before any header: the statement
@@ -1015,7 +1043,7 @@ class Connection
                     $what = $params === [] ? 'streaming' : 'parameterised streaming (skaidb >= 0.330)';
                     throw new SkaidbException("server does not support {$what}: {$msg}");
                 }
-                throw self::serverError($msg);
+                throw $this->transactionEnded($read, self::serverError($msg));
             }
             $this->noteSession($read);
             $this->landed(true);
@@ -1570,13 +1598,86 @@ class Connection
             return;
         }
         [$what, $value] = $read;
-        if ($what === 'use') {
-            $this->database = $value;
-        } elseif ($what === 'consistency') {
-            $this->consistencyNote = $value;
-        } else {
-            $this->scanBudgetNote = $value;
+        switch ($what) {
+            case 'use':
+                $this->database = $value;
+                break;
+            case 'consistency':
+                $this->consistencyNote = $value;
+                break;
+            case 'scan':
+                $this->scanBudgetNote = $value;
+                break;
+            case 'begin':
+                $this->transactionNoted = true;
+                break;
+            default: // commit, rollback
+                $this->transactionNoted = false;
         }
+    }
+
+    /**
+     * A COMMIT or a ROLLBACK ($read) for a transaction whose connection is
+     * lost: the application ending it. The server dropped the transaction
+     * when the connection went, so there is nothing to send — and nothing
+     * may be sent: on a new connection a ROLLBACK would end nothing, and a
+     * COMMIT would answer for a transaction that is not this one.
+     *
+     * True: it was a ROLLBACK, answered here with success (what was to be
+     * undone is undone). A COMMIT throws: the connection was lost, and
+     * nothing was committed. Either ends the driver's note, so the next
+     * statement re-dials as after any loss. False: no transaction is open,
+     * or its connection is alive, or $read is another statement — it
+     * travels like any other.
+     */
+    private function endLostTransaction(?array $read): bool
+    {
+        $ends = $read[0] ?? null;
+        if (($ends !== 'commit' && $ends !== 'rollback') || $this->closed
+            || !($this->inTransaction || $this->transactionNoted)) {
+            return false;
+        }
+        if (!$this->broken) {
+            if (!$this->peerGone()) {
+                return false;
+            }
+            $this->markBroken();
+        }
+        $this->transactionNoted = false;
+        if ($ends === 'rollback') {
+            return true;
+        }
+        throw new ConnectionException(
+            'connection lost inside a transaction: the COMMIT was not sent, and nothing was committed '
+            . '(the server dropped the transaction with the connection)'
+        );
+    }
+
+    /**
+     * A statement read as $read failed with $e after it was sent. A COMMIT
+     * or a ROLLBACK ends the transaction whatever it is answered with — a
+     * refused COMMIT has ended it too (PROTOCOL.md §6 rule 6) — and when
+     * the connection goes under it, the transaction goes with the
+     * connection. Only the COMMIT's fate is then unknown: the server may
+     * have applied it before its reply went missing, and the error says so.
+     */
+    private function transactionEnded(?array $read, SkaidbException $e): SkaidbException
+    {
+        $ends = $read[0] ?? null;
+        if ($ends !== 'commit' && $ends !== 'rollback') {
+            return $e;
+        }
+        $open = $this->inTransaction || $this->transactionNoted;
+        $this->transactionNoted = false;
+        if ($open && $ends === 'commit' && $e instanceof ConnectionException) {
+            return new ConnectionException(
+                $e->getMessage() . ': the connection was lost under the COMMIT, so whether the '
+                . 'transaction was committed is not known',
+                0,
+                $e
+            );
+        }
+        return $e;
     }
 
     /**
@@ -1605,7 +1706,11 @@ class Connection
      * - ['use', <name>]: USE [DATABASE] <name> (see usedDatabase);
      * - ['consistency', <text>]: a statement whose first two words are SET
      *   CONSISTENCY;
-     * - ['scan', <text>]: one whose first three are SET SCAN BUDGET.
+     * - ['scan', <text>]: one whose first three are SET SCAN BUDGET;
+     * - ['begin', null]: a statement whose first word is BEGIN — BEGIN,
+     *   BEGIN TRANSACTION, BEGIN ATOMIC …: it opens a transaction;
+     * - ['commit', null], ['rollback', null]: exactly COMMIT [TRANSACTION]
+     *   or ROLLBACK [TRANSACTION]: it ends one.
      *
      * <text> is the statement as written, without its `--` comments and its
      * trailing ';' — what a new connection is sent to get the setting back
@@ -1622,16 +1727,25 @@ class Connection
         // Every text statement comes through here, some of them megabytes
         // long: its first word, past whitespace and comments, settles it
         // before anything is copied.
-        if (preg_match('/^(?:\s++|--[^\n]*+)*+(USE|SET)(?![A-Za-z0-9_])/i', $sql, $first) !== 1) {
+        if (preg_match('/^(?:\s++|--[^\n]*+)*+(USE|SET|BEGIN|COMMIT|ROLLBACK)(?![A-Za-z0-9_])/i', $sql, $first) !== 1) {
             return null;
         }
-        if (strcasecmp($first[1], 'USE') === 0) {
+        $word = strtoupper($first[1]);
+        if ($word === 'USE') {
             $database = self::usedDatabase($sql);
             return $database === null ? null : ['use', $database];
+        }
+        if ($word === 'BEGIN') {
+            return ['begin', null];
         }
         $text = trim(self::withoutLineComments($sql));
         if (str_ends_with($text, ';')) {
             $text = rtrim(substr($text, 0, -1));
+        }
+        if ($word !== 'SET') {
+            return preg_match('/^(?:COMMIT|ROLLBACK)(?:\s+TRANSACTION)?$/i', $text) === 1
+                ? [strtolower($word), null]
+                : null;
         }
         if (str_contains($text, ';')
             || preg_match('/^SET\s+(CONSISTENCY|SCAN\s+BUDGET)(?:\s+(DEFAULT(?![A-Za-z0-9_]))?|$)/i', $text, $m) !== 1) {
@@ -1754,9 +1868,12 @@ class Connection
         if (!$this->broken) {
             return;
         }
-        if ($this->inTransaction) {
-            // Inside transaction(): nothing is sent and the connection stays
-            // broken, so it re-dials once the helper has returned.
+        if ($this->inTransaction || $this->transactionNoted) {
+            // Inside a transaction — transaction()'s, or one the application
+            // opened with its own BEGIN: nothing is sent and the connection
+            // stays broken. It re-dials once the transaction is over: the
+            // helper has returned, or the application has sent its ROLLBACK
+            // or COMMIT (see endLostTransaction).
             throw new ConnectionException(
                 'connection lost inside a transaction: the statement was not sent '
                 . '(on a new connection it would run outside the transaction)'

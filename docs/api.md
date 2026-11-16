@@ -188,10 +188,33 @@ re-authenticates, re-sends the Hello, enters the session database again
 and clears the prepared-statement cache, then runs. The failed statement is
 never retried by the driver. A re-dial that fails — no endpoint reachable,
 or a server that turns the new connection away — throws its own error and
-leaves the connection broken, so the statement after it dials again. The
-new session has no transaction open: a statement sent after a transport
-error inside a hand-written `BEGIN` … `COMMIT` autocommits, so stop and
-start the transaction again (`transaction()` refuses to send it).
+leaves the connection broken, so the statement after it dials again.
+
+None of this happens while a transaction is open, because the new session
+would have none: the statements re-sent there would each commit on their
+own. `transaction()` knows its transaction; one the application opens
+itself is noted — a statement the server accepted whose first word is
+`BEGIN` (`BEGIN`, `BEGIN TRANSACTION`, `BEGIN ATOMIC …`) opens it, and a
+statement that is exactly `COMMIT [TRANSACTION]` or `ROLLBACK
+[TRANSACTION]` ends it once the server has answered, with success or with
+an error. In between, a lost connection — under a statement, or found
+closed by the look before one — is not replaced:
+
+- the statement under which it is lost throws its `ConnectionException`,
+  and every later one throws `connection lost inside a transaction: the
+  statement was not sent (on a new connection it would run outside the
+  transaction)`, unsent;
+- `ROLLBACK` is answered with success without being sent (`exec()` returns
+  0): the server dropped the transaction with the connection;
+- `COMMIT` throws `connection lost inside a transaction: the COMMIT was not
+  sent, and nothing was committed (the server dropped the transaction with
+  the connection)`;
+- a `COMMIT` that was sent when the connection went throws the transport
+  error with `: the connection was lost under the COMMIT, so whether the
+  transaction was committed is not known` appended.
+
+The `ROLLBACK` or the `COMMIT` ends the driver's note, and the next
+statement re-dials as described above.
 
 A connection lost while it sat idle is replaced the same way, and costs no
 statement. Every statement first looks at the socket (one poll with a zero
