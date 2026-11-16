@@ -179,6 +179,20 @@ try {
     $ttl = $db->prepare("ALTER TABLE {$t} SET (ttl = ?)");
     check($ttl->execute([86400]) && $ttl->kind() === 'ddl' && $ttl->execute([172800]), 'ALTER TABLE … SET (ttl = ?) runs through the text fallback, twice');
     check($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000000]) && $db->exec('SET SCAN BUDGET DEFAULT') === 0, 'SET SCAN BUDGET ROWS ? takes a bound number');
+    // A name or a keyword there: refused, with the server's reason for the
+    // text it was sent.
+    $refused = [
+        ['USE ?', ['default'], 'parse error: unexpected token "Str(\"default\")", expected identifier'],
+        ['SET CONSISTENCY ?', ['ALL'], 'parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")'],
+    ];
+    foreach ($refused as [$sql, $params, $message]) {
+        try {
+            $db->prepare($sql)->execute($params);
+            check(false, "{$sql} is refused");
+        } catch (SkaidbException $e) {
+            check($e->getMessage() === $message, "{$sql} is refused: " . $e->getMessage());
+        }
+    }
     // A statement that is simply wrong: the prepare's own error, once.
     try {
         $db->prepare("SELEC id FROM {$t} WHERE id = ?")->execute([1]);

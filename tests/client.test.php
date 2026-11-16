@@ -410,6 +410,36 @@ test('prepared: a statement the server will not prepare is sent as text, and the
     $srv->stop();
 });
 
+test('prepared: a parameter binds a value, never a name — USE ? and SET CONSISTENCY ? are refused in the server\'s words', function () {
+    $srv = declining_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    // The server declines to prepare these (the placeholder stands where
+    // the grammar wants a name or a keyword), and the text the fallback
+    // sends carries a quoted string there, which is no name either. What
+    // the application gets is the server's answer to that text.
+    $use = $db->prepare('USE ?');
+    $e = assert_throws(SkaidbException::class, fn () => $use->execute(['default']));
+    assert_eq('parse error: unexpected token "Str(\"default\")", expected identifier', $e->getMessage());
+    assert_eq(SkaidbException::class, get_class($e));
+    $e = assert_throws(SkaidbException::class, fn () => $db->prepare('SET CONSISTENCY ?')->execute(['ALL']));
+    assert_eq('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")', $e->getMessage());
+    // Nothing moved: the session is where it was, on the same connection.
+    assert_eq(null, $db->sessionDatabase());
+    assert_true($db->isUsable());
+    assert_throws(SkaidbException::class, fn () => $use->execute(['app']), '/^parse error: unexpected token "Str\(\\\\"app\\\\"\)", expected identifier$/');
+    assert_eq([
+        'prepare USE ?', "USE 'default'",
+        'prepare SET CONSISTENCY ?', "SET CONSISTENCY 'ALL'",
+        "USE 'app'",
+    ], declining_seen($srv));
+    // Where the statement takes a literal the same fallback works.
+    assert_true($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000]));
+    assert_eq(['prepare SET SCAN BUDGET ROWS ?', 'SET SCAN BUDGET ROWS 1000'], array_slice(declining_seen($srv), 5));
+    assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
 test('prepared: a server from before prepared statements gets every parameterised statement as text', function () {
     $srv = (new FakeServer(['handle' => function (array $req) {
         if ($req['op'] === 1) {
