@@ -240,12 +240,6 @@ class Connection
     private array $declined = [];
 
     /**
-     * The server answered OP_PREPARE with "unknown opcode": it predates
-     * prepared statements, and every parameterised statement goes as text.
-     */
-    private ?string $noPrepare = null;
-
-    /**
      * The server answered OP_EXECUTE_BATCH with "unknown opcode": it
      * predates the opcode (0.87), and a batch goes as one OP_EXECUTE per
      * row.
@@ -1219,9 +1213,6 @@ class Connection
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
-        if ($this->noPrepare !== null) {
-            throw new Unpreparable($this->noPrepare);
-        }
         if (isset($this->declined[$sql])) {
             throw new Unpreparable($this->declined[$sql]);
         }
@@ -1244,10 +1235,6 @@ class Connection
         }
         if ($tag === 3) {
             $msg = $r->text();
-            if (str_contains($msg, 'unknown opcode')) {
-                $this->noPrepare = $msg;
-                throw new Unpreparable($msg);
-            }
             if (self::declinedToPrepare($msg)) {
                 if (count($this->declined) >= self::PREPARED_CACHE_MAX) {
                     unset($this->declined[array_key_first($this->declined)]);
@@ -1283,11 +1270,15 @@ class Connection
      * A server before 0.349 answers the second case with the parser's
      * error alone. That error names the token it stopped at, Question —
      * which is how the newer server tells the case itself — so it is taken
-     * the same way; any other parse error is the statement's.
+     * the same way; any other parse error is the statement's. And a server
+     * from before prepared statements (0.17) answers the opcode itself with
+     * "unknown opcode": everything goes as text there.
      */
     private static function declinedToPrepare(string $msg): bool
     {
-        return str_starts_with($msg, self::KIND_NOT_PREPARED) || str_contains($msg, 'Question');
+        return str_starts_with($msg, self::KIND_NOT_PREPARED)
+            || str_contains($msg, 'Question')
+            || str_contains($msg, 'unknown opcode');
     }
 
     /**
@@ -1953,7 +1944,6 @@ class Connection
         }
         $this->preparedCache = [];
         $this->declined = [];
-        $this->noPrepare = null;
         $this->noBatch = false;
         if (is_resource($this->sock)) {
             @fclose($this->sock);

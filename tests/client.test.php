@@ -541,20 +541,51 @@ test('prepared: a server from before prepared statements gets every parameterise
     $st = $db->prepare('INSERT INTO t (id, name) VALUES (?, ?)');
     assert_true($st->execute([1, "O'Brien"]));
     assert_true($st->execute([2, null]));
-    // Asked once per connection, not once per statement.
     assert_true($db->prepare('DELETE FROM t WHERE id = ?')->execute([1]));
     assert_eq(2, $st->executeBatch([[3, 'a'], [4, 'b']]));
+    // Each statement is asked about once, like any the server declines.
     assert_eq([
         'prepare INSERT INTO t (id, name) VALUES (?, ?)',
         "INSERT INTO t (id, name) VALUES (1, 'O''Brien')",
         'INSERT INTO t (id, name) VALUES (2, NULL)',
+        'prepare DELETE FROM t WHERE id = ?',
         'DELETE FROM t WHERE id = 1',
         "INSERT INTO t (id, name) VALUES (3, 'a')",
         "INSERT INTO t (id, name) VALUES (4, 'b')",
     ], declining_seen($srv));
     $srv->closeAll();
     assert_true($st->execute([5, 'c']));
-    assert_eq(['prepare INSERT INTO t (id, name) VALUES (?, ?)', "INSERT INTO t (id, name) VALUES (5, 'c')"], array_slice(declining_seen($srv), 6));
+    assert_eq(['prepare INSERT INTO t (id, name) VALUES (?, ?)', "INSERT INTO t (id, name) VALUES (5, 'c')"], array_slice(declining_seen($srv), 7));
+    $db->close();
+    $srv->stop();
+});
+
+test('prepared: one statement\'s error never switches the connection to text, whatever the error says', function () {
+    // A syntax error that happens to quote the words an old server answers
+    // the prepare opcode with. It is that statement's error — sent as text
+    // too, it fails there — and every other statement still travels typed.
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        $odd = str_contains($req['sql'] ?? '', '"unknown opcode"');
+        switch ($req['op']) {
+            case 1:
+                return $odd ? F::error('parse error: unexpected token "QuotedIdent(\"unknown opcode\")", expected end of input') : F::mutation(1);
+            case 2:
+                return $odd
+                    ? F::error('unexpected token "QuotedIdent(\"unknown opcode\")", expected end of input')
+                    : F::prepared(1, substr_count($req['sql'], '?'));
+            case 3:
+                return F::rows(['params'], [[$req['params']]]);
+        }
+        return null;
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    assert_throws(SkaidbException::class, fn () => $db->prepare('SELECT 1 "unknown opcode" WHERE id = ?')->execute([1]), '/unknown opcode/');
+    $ts = new \DateTimeImmutable('2024-02-29T23:59:59.123Z');
+    $st = $db->prepare('INSERT INTO t (id, tags, ts) VALUES (?, ?, ?)');
+    $st->execute([1, ['a', 'b'], $ts]);
+    $sent = $st->fetchColumn();
+    assert_eq([1, ['a', 'b']], array_slice($sent, 0, 2), 'the list travelled typed');
+    assert_true($sent[2] instanceof \DateTimeImmutable, 'the timestamp arrived as ' . gettype($sent[2]));
     $db->close();
     $srv->stop();
 });
