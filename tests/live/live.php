@@ -181,16 +181,19 @@ try {
     check($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000000]) && $db->exec('SET SCAN BUDGET DEFAULT') === 0, 'SET SCAN BUDGET ROWS ? takes a bound number');
     // A name or a keyword there: refused, with the server's reason for the
     // text it was sent.
+    // text it was sent. A server from 0.349 on names the string as "a
+    // string literal"; an older one shows its content, and before 0.349
+    // SET CONSISTENCY knew no DEFAULT.
     $refused = [
-        ['USE ?', ['default'], 'parse error: unexpected token "Str(\"default\")", expected identifier'],
-        ['SET CONSISTENCY ?', ['ALL'], 'parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")'],
+        ['USE ?', ['default'], '/^parse error: unexpected token "(a string literal|Str\(\\\\"default\\\\"\))", expected identifier$/'],
+        ['SET CONSISTENCY ?', ['ALL'], '/^parse error: SET CONSISTENCY takes ONE, QUORUM,( ALL, or DEFAULT| or ALL) — found (a string literal|Str\("ALL"\))$/'],
     ];
     foreach ($refused as [$sql, $params, $message]) {
         try {
             $db->prepare($sql)->execute($params);
             check(false, "{$sql} is refused");
         } catch (SkaidbException $e) {
-            check($e->getMessage() === $message, "{$sql} is refused: " . $e->getMessage());
+            check(preg_match($message, $e->getMessage()) === 1, "{$sql} is refused: " . $e->getMessage());
         }
     }
     // A statement that is simply wrong: the prepare's own error, once.

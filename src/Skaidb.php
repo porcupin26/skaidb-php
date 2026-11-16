@@ -50,10 +50,11 @@ class SkaidbException extends Exception
  * The connection was lost, or could not be made: the transport failed (the
  * server closed the socket, a read timed out, a write failed), no endpoint
  * could be reached, a member turned the connection away, or a reply could
- * not be placed and the connection was given up. Whatever statement it
- * interrupted may or may not have run, and the connection re-dials on the
- * next statement — unless a transaction was open on it (see
- * Connection::transaction()).
+ * not be placed and the connection was given up. A statement it
+ * interrupted may or may not have run (one that was never sent says so),
+ * and the connection re-dials on the next statement — unless a transaction
+ * is open on it, which the application has to end first (see
+ * Connection::transaction() and Connection::$transactionNoted).
  *
  * Never thrown for what the server answers a statement with (that is a
  * plain SkaidbException: the connection stays usable), nor for a refused
@@ -212,8 +213,9 @@ class Connection
     private const PREPARED_CACHE_MAX = 240;
 
     /**
-     * What a server answers OP_PREPARE with for a statement that parses but
-     * takes no bound parameters (DDL, session statements).
+     * What a server's answer to OP_PREPARE starts with when the statement
+     * may still run as text: its kind takes no bound parameters, or a `?`
+     * stands where the grammar takes a literal (PROTOCOL.md §6 rule 10).
      */
     private const KIND_NOT_PREPARED = 'statement kind cannot be prepared';
 
@@ -292,7 +294,7 @@ class Connection
     /**
      * The database this session is in, as far as the driver can know: the
      * constructor's $database, then the one named by the last USE the server
-     * accepted (see noteStatement). Null: neither named one. It is session
+     * accepted (see noteSession). Null: neither named one. It is session
      * state, so every dial enters it again (see dial) — a re-dialled
      * connection is in the database the lost one was in, never back in the
      * server's default with a table of the same name.
@@ -1270,23 +1272,22 @@ class Connection
 
     /**
      * Whether an Error answer to OP_PREPARE says "not as a prepared
-     * statement" rather than "this statement is wrong". A server says it
-     * two ways (its prepare(): parse, then count the parameters):
+     * statement" rather than "this statement is wrong" (PROTOCOL.md §6 rule
+     * 10): its message starts with "statement kind cannot be prepared".
+     * Alone, the statement parses and its kind takes no bound parameters
+     * (CREATE INDEX … WHERE v > ?). Followed by the parser's error, a `?`
+     * stands where the grammar wants a literal or a name (ALTER TABLE t SET
+     * (ttl = ?), USE ?). Either way the statement may be right once its
+     * values are written into it.
      *
-     * - "statement kind cannot be prepared": the statement parses, and its
-     *   kind takes no bound parameters (CREATE INDEX … WHERE v > ?);
-     * - the parser's own error naming the token it stopped at as Question,
-     *   the placeholder (`unexpected token "Question", …`, `… found
-     *   Question`): the grammar wants a literal or a name where the `?`
-     *   stands (ALTER TABLE t SET (ttl = ?), USE ?).
-     *
-     * Either way the statement may be right once its values are written
-     * into it. Any other parse error is the statement's.
+     * A server before 0.349 answers the second case with the parser's
+     * error alone. That error names the token it stopped at, Question —
+     * which is how the newer server tells the case itself — so it is taken
+     * the same way; any other parse error is the statement's.
      */
     private static function declinedToPrepare(string $msg): bool
     {
-        return $msg === self::KIND_NOT_PREPARED
-            || preg_match('/unexpected token "Question"|\bfound Question\b/', $msg) === 1;
+        return str_starts_with($msg, self::KIND_NOT_PREPARED) || str_contains($msg, 'Question');
     }
 
     /**

@@ -56,6 +56,6 @@ prepare the statement.
 Every value becomes a literal, so the fallback serves a statement that
 takes a literal where the `?` stands (`ALTER TABLE t SET (ttl = ?)`). It
 cannot supply a name or a keyword: `USE ?` is sent as `USE 'app'`, which
-the server refuses (`parse error: unexpected token "Str(\"app\")",
+the server refuses (`parse error: unexpected token "a string literal",
 expected identifier`), and `SET CONSISTENCY ?` likewise. Write those into
 the statement text.

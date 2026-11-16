@@ -202,18 +202,20 @@ asked about again. Each value is written as a literal, so this works
 wherever the statement takes a literal: `ALTER TABLE t SET (ttl = ?)`,
 `CREATE INDEX … WHERE v > ?`, `SET SCAN BUDGET ROWS ?`. **A parameter is a
 value, never a name or a keyword**: `USE ?` and `SET CONSISTENCY ?` are
-refused, with the server's error for the text it was sent —
+refused, with the server's error for the text it was sent:
 
 ```
-parse error: unexpected token "Str(\"app\")", expected identifier
-parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")
+parse error: unexpected token "a string literal", expected identifier
+parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found a string literal
 ```
 
-— so write the name into the statement (`$db->exec('USE app')`). Arrays and
-documents have no literal form and throw (the message names the reason the
-server would not prepare the statement). Any other error the server answers
-a prepare with, a syntax error for one, is the statement's own: it is
-thrown as it comes and nothing is sent a second time.
+(A server before 0.349 shows the string instead: `unexpected token
+"Str(\"app\")"`, `found Str("ALL")`.) Write the name into the statement:
+`$db->exec('USE app')`. Arrays and documents have no literal form and throw
+(the message names the reason the server would not prepare the statement).
+Any other error the server answers a prepare with, a syntax error for one,
+is the statement's own: it is thrown as it comes and nothing is sent a
+second time.
 
 Prepared ids are scoped to a connection and the cache is dropped on
 reconnect. A server keeps at most 256 prepared statements per connection;

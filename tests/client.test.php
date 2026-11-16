@@ -292,17 +292,21 @@ test('prepared: DDL the server declines to prepare falls back to client-side quo
 });
 
 /**
- * A server that answers OP_PREPARE the way skaidb does, in its words:
- * "statement kind cannot be prepared" for a statement that parses but takes
- * no bound parameters; the parser's error naming the token Question where
- * the grammar wants a literal or a name and found the placeholder; the
- * parser's error for a statement that is simply wrong (an OP_QUERY carries
- * the same text behind "parse error: "). Sent as text, a statement is
- * answered Ddl unless it is one of the wrong ones.
+ * A server that answers OP_PREPARE the way skaidb does, in its words
+ * (PROTOCOL.md §6 rule 10). A statement that parses but takes no bound
+ * parameters: "statement kind cannot be prepared". A `?` where the grammar
+ * wants a literal or a name: the same words, a colon and the parser's error
+ * — or, from a server before 0.349 ($before349), the parser's error alone,
+ * naming the token Question. A statement that is simply wrong: the parser's
+ * error (an OP_QUERY carries the same text behind "parse error: ").
+ *
+ * Sent as text, a statement is answered Ddl unless it is one of the wrong
+ * ones, or puts a string where a name or a keyword belongs: then the
+ * parser's error again, which names the string's content only before 0.349.
  */
-function declining_server(): FakeServer
+function declining_server(bool $before349 = false): FakeServer
 {
-    return (new FakeServer(['handle' => function (array $req) {
+    return (new FakeServer(['handle' => function (array $req) use ($before349) {
         $sql = $req['sql'] ?? '';
         $wrong = [
             'SELEC ' => 'unexpected token "Ident(\"SELEC\")", expected a statement',
@@ -314,28 +318,35 @@ function declining_server(): FakeServer
             }
         }
         if ($req['op'] === 1) {
+            $string = fn (string $content) => $before349 ? 'Str(\"' . $content . '\")' : 'a string literal';
             if (preg_match('/^USE \'(.*)\'$/', $sql, $m) === 1) {
-                return F::error('parse error: unexpected token "Str(\"' . $m[1] . '\")", expected identifier');
+                return F::error('parse error: unexpected token "' . $string($m[1]) . '", expected identifier');
             }
-            if (preg_match('/^SET CONSISTENCY (\'.*\')$/', $sql, $m) === 1) {
-                return F::error('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("' . trim($m[1], "'") . '")');
+            if (preg_match('/^SET CONSISTENCY \'(.*)\'$/', $sql, $m) === 1) {
+                return F::error('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found ' . stripslashes($string($m[1])));
             }
             return F::ddl();
         }
         if ($req['op'] !== 2) {
             return $req['op'] === 3 ? F::mutation(1) : null;
         }
+        // The parser stopping at the placeholder.
+        $atPlaceholder = fn (string $parser) => F::error(($before349 ? '' : 'statement kind cannot be prepared: ') . $parser);
         if (str_starts_with($sql, 'ALTER TABLE')) {
-            return F::error('expected a literal value for option ttl, found Question');
+            return $atPlaceholder('expected a literal value for option ttl, found Question');
         }
         if (str_starts_with($sql, 'USE ?')) {
-            return F::error('unexpected token "Question", expected identifier');
+            return $atPlaceholder('unexpected token "Question", expected identifier');
         }
         if (str_starts_with($sql, 'SET CONSISTENCY ?')) {
-            return F::error('SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Question');
+            return $atPlaceholder('SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Question');
         }
         if (str_starts_with($sql, 'SET SCAN BUDGET')) {
-            return F::error('unexpected token "Question", expected SCAN BUDGET ROWS: a positive integer (0 would lift the limit; use DEFAULT to clear)');
+            return $atPlaceholder('unexpected token "Question", expected SCAN BUDGET ROWS: a positive integer (0 would lift the limit; use DEFAULT to clear)');
+        }
+        if (str_starts_with($sql, 'CREATE SEQUENCE')) {
+            // The prefix is the contract, not the words after it.
+            return F::error('statement kind cannot be prepared: a placeholder cannot stand for the START value');
         }
         if (str_starts_with($sql, 'CREATE')) {
             return F::error('statement kind cannot be prepared');
@@ -381,6 +392,40 @@ test('prepared: a statement that is simply wrong gets its error once — it is n
     assert_throws(SkaidbException::class, fn () => $db->prepare('SELECT FROM t WHERE id = ?')->execute([1]), '/^unexpected token "Keyword\(From\)", expected an expression$/');
     assert_eq(["prepare {$wrong}", "prepare {$wrong}", 'prepare SELECT FROM t WHERE id = ?'], declining_seen($srv));
     assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('prepared: the server\'s "statement kind cannot be prepared" is what sends a statement as text, whatever follows it', function () {
+    // PROTOCOL.md §6 rule 10: the prefix is the signal. What comes after
+    // it is the server's explanation and may be anything.
+    $srv = declining_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    assert_true($db->prepare('CREATE SEQUENCE s START ?')->execute([5]));
+    assert_true($db->prepare('CREATE INDEX i ON t (v) WHERE v > ?')->execute([1]));
+    assert_true($db->prepare('ALTER TABLE t SET (ttl = ?)')->execute([60]));
+    assert_eq([
+        'prepare CREATE SEQUENCE s START ?', 'CREATE SEQUENCE s START 5',
+        'prepare CREATE INDEX i ON t (v) WHERE v > ?', 'CREATE INDEX i ON t (v) WHERE v > 1',
+        'prepare ALTER TABLE t SET (ttl = ?)', 'ALTER TABLE t SET (ttl = 60)',
+    ], declining_seen($srv));
+    $db->close();
+    $srv->stop();
+    // A server before 0.349 has the prefix only for a statement that
+    // parses. Where its parser stops at the placeholder it answers with
+    // the parser's error alone, which names the token: Question. That
+    // still falls back — it did before the prefix existed — and a parse
+    // error that does not name the placeholder still does not.
+    $srv = declining_server(true);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    assert_true($db->prepare('ALTER TABLE t SET (ttl = ?)')->execute([60]));
+    assert_true($db->prepare('SET SCAN BUDGET ROWS ?')->execute([9]));
+    assert_throws(SkaidbException::class, fn () => $db->prepare('SELEC id FROM t WHERE id = ?')->execute([1]), '/^unexpected token "Ident/');
+    assert_eq([
+        'prepare ALTER TABLE t SET (ttl = ?)', 'ALTER TABLE t SET (ttl = 60)',
+        'prepare SET SCAN BUDGET ROWS ?', 'SET SCAN BUDGET ROWS 9',
+        'prepare SELEC id FROM t WHERE id = ?',
+    ], declining_seen($srv));
     $db->close();
     $srv->stop();
 });
@@ -431,33 +476,49 @@ test('prepared: a statement the server will not prepare is sent as text, and the
 });
 
 test('prepared: a parameter binds a value, never a name — USE ? and SET CONSISTENCY ? are refused in the server\'s words', function () {
-    $srv = declining_server();
-    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
     // The server declines to prepare these (the placeholder stands where
     // the grammar wants a name or a keyword), and the text the fallback
     // sends carries a quoted string there, which is no name either. What
-    // the application gets is the server's answer to that text.
-    $use = $db->prepare('USE ?');
-    $e = assert_throws(SkaidbException::class, fn () => $use->execute(['default']));
-    assert_eq('parse error: unexpected token "Str(\"default\")", expected identifier', $e->getMessage());
-    assert_eq(SkaidbException::class, get_class($e));
-    $e = assert_throws(SkaidbException::class, fn () => $db->prepare('SET CONSISTENCY ?')->execute(['ALL']));
-    assert_eq('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")', $e->getMessage());
-    // Nothing moved: the session is where it was, on the same connection.
-    assert_eq(null, $db->sessionDatabase());
-    assert_true($db->isUsable());
-    assert_throws(SkaidbException::class, fn () => $use->execute(['app']), '/^parse error: unexpected token "Str\(\\\\"app\\\\"\)", expected identifier$/');
-    assert_eq([
-        'prepare USE ?', "USE 'default'",
-        'prepare SET CONSISTENCY ?', "SET CONSISTENCY 'ALL'",
-        "USE 'app'",
-    ], declining_seen($srv));
-    // Where the statement takes a literal the same fallback works.
-    assert_true($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000]));
-    assert_eq(['prepare SET SCAN BUDGET ROWS ?', 'SET SCAN BUDGET ROWS 1000'], array_slice(declining_seen($srv), 5));
-    assert_eq(1, $srv->connections());
-    $db->close();
-    $srv->stop();
+    // the application gets is the server's answer to that text: since
+    // 0.349 without the string's content, before it with.
+    $texts = [
+        '0.349' => [
+            'parse error: unexpected token "a string literal", expected identifier',
+            'parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found a string literal',
+            'parse error: unexpected token "a string literal", expected identifier',
+        ],
+        'before 0.349' => [
+            'parse error: unexpected token "Str(\"default\")", expected identifier',
+            'parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")',
+            'parse error: unexpected token "Str(\"app\")", expected identifier',
+        ],
+    ];
+    foreach ($texts as $server => [$useDefault, $consistency, $useApp]) {
+        $srv = declining_server($server !== '0.349');
+        $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+        $use = $db->prepare('USE ?');
+        $e = assert_throws(SkaidbException::class, fn () => $use->execute(['default']));
+        assert_eq($useDefault, $e->getMessage(), $server);
+        assert_eq(SkaidbException::class, get_class($e));
+        $e = assert_throws(SkaidbException::class, fn () => $db->prepare('SET CONSISTENCY ?')->execute(['ALL']));
+        assert_eq($consistency, $e->getMessage(), $server);
+        // Nothing moved: the session is where it was, on the same connection.
+        assert_eq(null, $db->sessionDatabase());
+        assert_true($db->isUsable());
+        $e = assert_throws(SkaidbException::class, fn () => $use->execute(['app']));
+        assert_eq($useApp, $e->getMessage(), $server);
+        assert_eq([
+            'prepare USE ?', "USE 'default'",
+            'prepare SET CONSISTENCY ?', "SET CONSISTENCY 'ALL'",
+            "USE 'app'",
+        ], declining_seen($srv), $server);
+        // Where the statement takes a literal the same fallback works.
+        assert_true($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000]));
+        assert_eq(['prepare SET SCAN BUDGET ROWS ?', 'SET SCAN BUDGET ROWS 1000'], array_slice(declining_seen($srv), 5), $server);
+        assert_eq(1, $srv->connections());
+        $db->close();
+        $srv->stop();
+    }
 });
 
 test('prepared: a server from before prepared statements gets every parameterised statement as text', function () {
