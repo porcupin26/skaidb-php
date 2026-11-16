@@ -183,14 +183,15 @@ interpolation, no injection surface. That is also the only way to send an
 parameter count must match what you pass (a mismatch throws before anything
 runs).
 
-Statements the server declines to prepare (DDL, `USE` and other session
-statements) fall back to client-side quoting of the same `?` parameters, so
-every statement kind accepts parameters; arrays and documents cannot travel
-that way and throw (the message names the reason the server would not
-prepare the statement). Prepared ids are scoped to a connection and the cache
-is dropped on reconnect. A server keeps at most 256 prepared statements per
-connection; the driver stays below that, and a prepare the server refuses
-with `too many prepared statements` is thrown rather than sent as text.
+Statements the server declines to prepare (DDL and session statements) fall
+back to client-side quoting of the same `?` parameters, which works wherever
+the statement takes a literal — not where it takes a name, so `USE ?` is
+refused; arrays and documents cannot travel that way and throw (the message
+names the reason the server would not prepare the statement). Prepared ids
+are scoped to a connection and the cache is dropped on reconnect. A server
+keeps at most 256 prepared statements per connection; the driver stays
+below that, and a prepare the server refuses with `too many prepared
+statements` is thrown rather than sent as text.
 
 ### Batches — many rows, one round-trip
 
