@@ -101,6 +101,28 @@ function txn_statements(FakeServer $srv): array
     return $out;
 }
 
+/**
+ * Poll $cond until it holds, for at most $seconds: what the fake server's
+ * child has seen (a socket closing) reaches its log a moment later.
+ */
+function txn_wait(callable $cond, float $seconds = 2.0): bool
+{
+    $until = microtime(true) + $seconds;
+    do {
+        if ($cond()) {
+            return true;
+        }
+        usleep(5_000);
+    } while (microtime(true) < $until);
+    return false;
+}
+
+/** Whether $db holds an open socket: Connection's private $sock, for what no server can observe. */
+function txn_holds_socket(Connection $db): bool
+{
+    return is_resource((new \ReflectionProperty(Connection::class, 'sock'))->getValue($db));
+}
+
 // ---- the typed error --------------------------------------------------------
 
 test('conflict: a server Error starting with "transaction conflict:" is a TransactionConflictException', function () {
@@ -516,6 +538,138 @@ test('transaction: a connection lost on the COMMIT is thrown — not retried, th
     assert_eq(1, $runs);
     assert_eq(['BEGIN', 'UPDATE t SET n = 1', 'COMMIT'], txn_statements($srv));
     assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+// ---- a broken connection lets go of its socket ------------------------------
+
+test('transaction: a read timeout in the body closes the socket at once — the server\'s session ends with it', function () {
+    $srv = txn_server(['UPDATE t SET n = 2' => [[]]]);   // received, never answered
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.3);
+    assert_throws(SkaidbException::class, fn () => $db->transaction(function (Connection $c) {
+        $c->exec('UPDATE t SET n = 1');
+        $c->exec('UPDATE t SET n = 2');
+    }), '/connection timed out/');
+    assert_eq(['BEGIN', 'UPDATE t SET n = 1', 'UPDATE t SET n = 2'], txn_statements($srv));
+    // No further statement and no close(): the server's session — and the
+    // transaction open in it, with the rows it claimed — must not outlive
+    // the failure until this process happens to use the connection again.
+    assert_true(txn_wait(fn () => $srv->hangups() === 1), 'the timed-out connection still holds its socket open');
+    assert_true(!$db->isUsable());
+    // The connection object recovers as after any connection loss.
+    assert_eq(1, $db->exec('UPDATE t SET n = 3'));
+    assert_eq([2, 1], [$srv->connections(), $srv->hangups()]);
+    $db->close();
+    $srv->stop();
+});
+
+test('transport: every way a live connection is marked broken closes its socket at once', function () {
+    $srv = txn_server([
+        'SELECT slow' => [[]],                                              // never answered
+        'SELECT odd' => [chr(42)],                                          // no reply to a stream request
+        'SELECT blank' => [''],                                             // an empty frame
+        'SELECT endless' => [[F::header(['n']), F::chunk([[1]])]],          // no RowsEnd ever comes
+        'SELECT garbled' => [[F::header(['n']), F::chunk([[1]]), chr(42)]], // the framing is lost in the rest
+        'SELECT hollow' => [[F::header(['n']), F::chunk([[1]]), '']],       // an empty frame in the rest
+    ]);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.3);
+    $breaks = [
+        'a read timeout' => [fn () => $db->query('SELECT slow'), '/connection timed out/'],
+        'a read timeout on a stream request' => [fn () => iterator_to_array($db->stream('SELECT slow')), '/connection timed out/'],
+        'an unexpected reply to a stream request' => [fn () => iterator_to_array($db->stream('SELECT odd')), '/unexpected response tag 42/'],
+        'an empty reply to a stream request' => [fn () => iterator_to_array($db->stream('SELECT blank')), '/truncated server message/'],
+        'a read timeout mid-stream' => [fn () => iterator_to_array($db->stream('SELECT endless')), '/connection timed out/'],
+    ];
+    $n = 0;
+    foreach ($breaks as $name => [$run, $message]) {
+        assert_throws(SkaidbException::class, $run, $message);
+        $n++;
+        assert_true(!$db->isUsable(), "{$name}: the connection is broken");
+        assert_true(txn_wait(fn () => $srv->hangups() === $n), "{$name}: the broken connection still holds its socket open");
+        // The next statement re-dials, as it always did.
+        assert_eq(1, $db->exec('UPDATE t SET n = 1'), $name);
+        assert_eq([$n + 1, $n], [$srv->connections(), $srv->hangups()], $name);
+    }
+    // An abandoned stream whose drain cannot finish — the rest never comes,
+    // or is not a stream's frames: broken, and closed too.
+    foreach (['SELECT endless', 'SELECT garbled', 'SELECT hollow'] as $sql) {
+        $gen = $db->stream($sql);
+        assert_eq(['n' => 1], $gen->current());
+        unset($gen);
+        $n++;
+        assert_true(!$db->isUsable(), "{$sql}: the connection is broken");
+        assert_true(txn_wait(fn () => $srv->hangups() === $n), "{$sql}: a failed drain still holds its socket open");
+        assert_eq(1, $db->exec('UPDATE t SET n = 1'));
+    }
+    $db->close();
+    $srv->stop();
+});
+
+test('transport: a connection the server closed lets go of its socket at once, on a read and on a write', function () {
+    // The server's end is gone already, so nothing lingers there; what is
+    // left to close is this process's own descriptor.
+    $srv = txn_server(['SELECT gone' => [FakeServer::DROP]]);
+    $db = txn_connect($srv);
+    assert_true(txn_holds_socket($db));
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT gone'), '/^connection closed by server$/');
+    assert_true(!txn_holds_socket($db), 'end-of-file on a read: the socket is still open');
+    assert_eq(1, $db->exec('UPDATE t SET n = 1'));
+    assert_true(txn_holds_socket($db));
+    // A request far larger than the socket buffers, to a peer that has
+    // closed: the write itself fails partway.
+    $srv->closeAll();
+    assert_throws(
+        SkaidbException::class,
+        fn () => $db->query('SELECT ' . str_repeat('x', 16 * 1024 * 1024)),
+        '/^connection closed by server \(write\)$/'
+    );
+    assert_true(!txn_holds_socket($db), 'a failed write: the socket is still open');
+    assert_eq(1, $db->exec('UPDATE t SET n = 1'));
+    assert_eq(3, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('transport: a re-dial that fails after its handshake does not leave the new socket open', function () {
+    // The session database is entered on every dial; here the second USE is
+    // refused, so the re-dial fails with a live, authenticated socket.
+    $srv = txn_server([
+        'USE "app"' => [F::ddl(), F::error('no such database: app'), F::ddl()],
+        'SELECT gone' => [FakeServer::DROP],
+    ]);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 5.0, 'app');
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT gone'), '/connection closed by server/');
+    assert_throws(SkaidbException::class, fn () => $db->exec('UPDATE t SET n = 1'), '/^no such database: app$/');
+    assert_true(!$db->isUsable());
+    assert_true(txn_wait(fn () => $srv->hangups() === 1), 'the failed re-dial still holds its socket open');
+    assert_eq(['USE "app"', 'SELECT gone', 'USE "app"'], txn_statements($srv));
+    // Still down, as before: the next statement dials again.
+    assert_eq(1, $db->exec('UPDATE t SET n = 1'));
+    assert_eq(3, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('transport: a re-dial that loses its Hello fails the statement with a transport error; the next one re-dials', function () {
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        static $hellos = 0;
+        if ($req['op'] === 8) {
+            return ++$hellos === 2 ? FakeServer::DROP : F::ddl();
+        }
+        if ($req['op'] === 1) {
+            return $req['sql'] === 'SELECT gone' ? FakeServer::DROP : F::mutation(1);
+        }
+        return null;
+    }]))->start();
+    $db = txn_connect($srv);
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT gone'), '/connection closed by server/');
+    // The second connection authenticates and is dropped on its Hello, an
+    // error the dial ignores: the statement finds no socket to travel on.
+    assert_throws(SkaidbException::class, fn () => $db->exec('UPDATE t SET n = 1'), '/^connection closed by server \(write\)$/');
+    assert_true(!$db->isUsable());
+    assert_eq(1, $db->exec('UPDATE t SET n = 1'));
+    assert_eq(3, $srv->connections());
     $db->close();
     $srv->stop();
 });

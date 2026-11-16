@@ -372,11 +372,13 @@ subclass, modeled on `PDOException`).
   conflicting write throws the subclass
   `Skaidb\TransactionConflictException` (see Transactions).
 - **Transport errors** throw `connection closed by server` / `connection
-  timed out` and mark the connection *broken*, not closed. The next statement
-  **re-dials** (through the seed walk), re-authenticates, re-sends `USE
-  <database>` and clears the prepared-statement cache. Because the failed
-  statement *may* have executed, the driver never retries it for you: retry a
-  write only if it is idempotent. `isUsable()` reports the state.
+  timed out` and mark the connection *broken*, not closed. Its socket is
+  closed at once, so the server's session — and a transaction open in it —
+  ends there, also after a read timeout. The next statement **re-dials**
+  (through the seed walk), re-authenticates, re-sends `USE <database>` and
+  clears the prepared-statement cache. Because the failed statement *may*
+  have executed, the driver never retries it for you: retry a write only if
+  it is idempotent. `isUsable()` reports the state.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   rather than hand the next caller a misaligned reply; the next statement
   reconnects.

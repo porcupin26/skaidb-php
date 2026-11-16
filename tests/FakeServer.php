@@ -158,7 +158,8 @@ final class FakeServer
      *   password — the one password every user has (default 'secret').
      *   handle   — fn(array $req): string|string[]|null, called for every
      *              post-handshake request; Hello is answered with Ddl unless
-     *              the handler returns something.
+     *              the handler returns something. An empty list answers
+     *              nothing and keeps the connection open (a stalled server).
      *   refuse   — fn(): bool, called at every accept; true closes the new
      *              connection before the handshake (a node at capacity).
      */
@@ -238,6 +239,22 @@ final class FakeServer
      */
     public function requests(): array
     {
+        return array_values(array_filter($this->events(), fn ($r) => $r['op'] !== 'hangup'));
+    }
+
+    /**
+     * How many connections the CLIENT closed (the child read end-of-file on
+     * them). One the server dropped itself — DROP, closeAll() — is not
+     * counted. The child notices within its select loop, so poll for it.
+     */
+    public function hangups(): int
+    {
+        return count(array_filter($this->events(), fn ($r) => $r['op'] === 'hangup'));
+    }
+
+    /** @return array<int,array<string,mixed>> everything the child logged, in order */
+    private function events(): array
+    {
         clearstatcache(true, $this->log);
         $lines = file($this->log, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
         return array_map(fn (string $l) => unserialize(base64_decode($l)), $lines);
@@ -315,6 +332,7 @@ final class FakeServer
                 if ($data === false || ($data === '' && feof($sock))) {
                     fclose($sock);
                     unset($conns[$id]);
+                    $this->record(['op' => 'hangup']);
                     continue;
                 }
                 $conns[$id]['buf'] .= $data;

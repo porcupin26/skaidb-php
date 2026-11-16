@@ -157,15 +157,18 @@ anything else.
 ### Reconnect
 
 A transport error (`connection closed by server`, `connection timed out`,
-`connection closed by server (write)`) throws from the statement in flight
-and marks the connection broken. The next statement re-dials through the
-seed list (a pooled connection: through the pool's members, usable ones
-first and the one it lost last), re-authenticates, re-sends `USE`, re-sends
-the Hello and clears the prepared-statement cache, then runs. The failed
-statement is never retried by the driver. The new session has no
-transaction open: a statement sent after a transport error inside a
-hand-written `BEGIN` … `COMMIT` autocommits, so stop and start the
-transaction again (`transaction()` refuses to send it).
+`connection closed by server (write)`) throws from the statement in flight,
+marks the connection broken and closes its socket there and then: the
+server's session ends with the socket, and with it a transaction left open
+in it — also after a read timeout, when the server is still there. The
+next statement re-dials through the seed list (a pooled connection: through
+the pool's members, usable ones first and the one it lost last),
+re-authenticates, re-sends `USE`, re-sends the Hello and clears the
+prepared-statement cache, then runs. The failed statement is never retried
+by the driver. The new session has no transaction open: a statement sent
+after a transport error inside a hand-written `BEGIN` … `COMMIT`
+autocommits, so stop and start the transaction again (`transaction()`
+refuses to send it).
 
 ## `Statement`
 

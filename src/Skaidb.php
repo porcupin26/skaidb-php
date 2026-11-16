@@ -195,7 +195,10 @@ class Connection
     /** @var array<string,array{0:int,1:int}> */
     private array $preparedCache = [];
 
-    /** Transport died; the next statement re-dials (see ensureLive). */
+    /**
+     * Transport died, and its socket is closed (see markBroken); the next
+     * statement re-dials (see ensureLive).
+     */
     private bool $broken = false;
 
     /**
@@ -393,7 +396,9 @@ class Connection
                 // Pooled: a member that dropped or refused the handshake (a
                 // capacity refusal included) is a failed dial — try the next
                 // on a clean slate.
-                @fclose($this->sock);
+                if (is_resource($this->sock)) {
+                    @fclose($this->sock);
+                }
                 $this->sock = null;
                 $this->broken = false;
                 $why = $e->getMessage();
@@ -805,7 +810,7 @@ class Connection
             try {
                 $tag = $r->u8();
             } catch (\Throwable $e) {
-                $this->broken = true;
+                $this->markBroken();
                 throw $e;
             }
             if ($tag === 3) {
@@ -844,7 +849,7 @@ class Connection
             }
             if ($tag !== 5) {
                 // We cannot know what else this reply left queued behind it.
-                $this->broken = true;
+                $this->markBroken();
                 throw new SkaidbException("unexpected response tag {$tag} to stream request");
             }
             // The server has committed to chunks + RowsEnd, so from here
@@ -917,7 +922,7 @@ class Connection
                 return; // socket already gone; nothing can reuse it
             }
             if ($this->broken || !is_resource($this->sock)) {
-                $this->broken = true;
+                $this->markBroken();
                 return;
             }
             while (true) {
@@ -926,12 +931,12 @@ class Connection
                     return;
                 }
                 if ($t !== 6) { // not a RowsChunk — we have lost the framing
-                    $this->broken = true;
+                    $this->markBroken();
                     return;
                 }
             }
         } catch (\Throwable $e) {
-            $this->broken = true;
+            $this->markBroken();
         } finally {
             $this->streaming = false;
         }
@@ -1315,13 +1320,44 @@ class Connection
         try {
             $this->dial();
         } catch (SkaidbException $e) {
-            $this->broken = true;   // still down; the next statement retries
+            $this->markBroken();   // still down; the next statement retries
             throw $e;
         }
     }
 
+    /**
+     * The transport failed or can no longer be trusted: mark the connection
+     * broken and close its socket NOW, not when the next statement re-dials.
+     *
+     * A server ends a session when its socket closes, and with the session
+     * the transaction open in it and the rows that transaction claimed. A
+     * client-side read timeout, or a reply that lost the framing, breaks the
+     * connection to a server that is still there: left open until the next
+     * statement — which inside transaction() never re-dials, and on a
+     * connection nobody uses again never comes — the dead socket would keep
+     * all of that alive.
+     */
+    private function markBroken(): void
+    {
+        $this->broken = true;
+        if (is_resource($this->sock)) {
+            @fclose($this->sock);
+        }
+        $this->sock = null;
+    }
+
     private function writeFrame(string $payload): void
     {
+        if (!is_resource($this->sock)) {
+            // No socket to write to, and `fwrite(null, …)` is a TypeError
+            // rather than a SkaidbException. Every statement path re-dials
+            // (ensureLive) before it writes, so a broken connection gets
+            // here one way: a dial whose Hello exchange lost the transport
+            // again. That is this request's transport error.
+            throw new SkaidbException(
+                $this->broken ? 'connection closed by server (write)' : 'connection is closed'
+            );
+        }
         // u32 BE length prefix, then payload.
         $frame = pack('N', strlen($payload)) . $payload;
         $total = strlen($frame);
@@ -1329,7 +1365,7 @@ class Connection
         while ($written < $total) {
             $n = @fwrite($this->sock, substr($frame, $written));
             if ($n === false || $n === 0) {
-                $this->broken = true;
+                $this->markBroken();
                 throw new SkaidbException('connection closed by server (write)');
             }
             $written += $n;
@@ -1366,10 +1402,10 @@ class Connection
             if ($chunk === false || $chunk === '') {
                 $meta = is_resource($this->sock) ? stream_get_meta_data($this->sock) : ['timed_out' => false];
                 if (!empty($meta['timed_out'])) {
-                    $this->broken = true;
+                    $this->markBroken();
                     throw new SkaidbException('connection timed out');
                 }
-                $this->broken = true;
+                $this->markBroken();
                 throw new SkaidbException('connection closed by server');
             }
             $buf .= $chunk;
