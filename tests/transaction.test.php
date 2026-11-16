@@ -526,6 +526,106 @@ test('transaction: after a lost connection nothing more of the transaction is se
     $srv->stop();
 });
 
+test('transaction: the body swallows a lost connection and writes on — the write is not sent, nothing is committed', function () {
+    // PROTOCOL.md §6 rule 7, the whole scenario: statement 1 succeeds, the
+    // connection is lost, the body catches statement 2's error, runs a
+    // write as statement 3 and returns as if all were well.
+    $srv = txn_server();
+    $db = txn_connect($srv);
+    $lost = '/^connection lost inside a transaction: the statement was not sent/';
+    $caught = [];
+    $body = function (Connection $c) use ($srv, &$caught, $lost) {
+        assert_eq(1, $c->exec('UPDATE t SET n = 1'));
+        $srv->closeAll();
+        try {
+            $c->exec('UPDATE t SET n = 2');
+        } catch (SkaidbException $e) {
+            $caught[] = $e->getMessage();
+        }
+        // Whatever the body tries next would autocommit on a new session.
+        try {
+            $c->exec('INSERT INTO log (id) VALUES (3)');
+        } catch (SkaidbException $e) {
+            $caught[] = $e->getMessage();
+        }
+        assert_throws(SkaidbException::class, fn () => $c->prepare('INSERT INTO log (id) VALUES (?)')->execute([4]), $lost);
+        assert_throws(SkaidbException::class, fn () => $c->prepare('INSERT INTO log (id) VALUES (?)')->executeBatch([[5], [6]]), $lost);
+        assert_throws(SkaidbException::class, fn () => iterator_to_array($c->stream('INSERT INTO log (id) VALUES (?)', [7])), $lost);
+        return 'all is well';
+    };
+    // Not the body's value: the loss, and no claim about a COMMIT that was
+    // never sent having committed or not.
+    assert_throws(SkaidbException::class, fn () => $db->transaction($body), $lost);
+    assert_eq(2, count($caught));
+    assert_match('/^connection closed by server/', $caught[0], 'statement 2: the transport error');
+    assert_match($lost, $caught[1], 'statement 3: refused, not sent');
+    // The server saw one connection and, on it, the transaction's start
+    // and statement 1: no statement 3, no COMMIT, no ROLLBACK anywhere.
+    assert_eq(1, $srv->connections());
+    assert_eq(['BEGIN', 'UPDATE t SET n = 1'], txn_statements($srv));
+    // Afterwards the connection is what it is after any connection loss:
+    // the next statement re-dials and runs, on its own.
+    assert_true(!$db->isUsable());
+    assert_eq(1, $db->exec('UPDATE t SET n = 9'));
+    assert_true($db->isUsable());
+    assert_eq(2, $srv->connections());
+    assert_eq(['UPDATE t SET n = 9'], array_slice(txn_statements($srv), 2));
+    $db->close();
+    $srv->stop();
+});
+
+test('transaction: the opening statement meets a lost connection exactly as an ordinary statement does', function () {
+    $srv = txn_server();
+    $plain = txn_connect($srv);
+    $txn = txn_connect($srv);
+    $runs = 0;
+    $body = function (Connection $c) use (&$runs) {
+        $runs++;
+        return $c->exec('UPDATE t SET n = 1');
+    };
+    // Idle connections, and the server goes away under them (a restart).
+    // Neither knows yet: its next statement finds out and throws, once.
+    $srv->closeAll();
+    $ordinary = assert_throws(SkaidbException::class, fn () => $plain->exec('UPDATE t SET n = 0'), '/^connection closed by server/');
+    $begin = assert_throws(SkaidbException::class, fn () => $txn->transaction($body), '/^connection closed by server/');
+    assert_eq(get_class($ordinary), get_class($begin));
+    assert_eq(0, $runs, 'the body never ran');
+    assert_eq([], txn_statements($srv), 'and nothing else was sent');
+    // Both now know, and both re-dial on the next call: the ordinary
+    // statement runs, and so does the whole transaction, $begin first.
+    assert_eq(1, $plain->exec('UPDATE t SET n = 0'));
+    assert_eq(1, $txn->transaction($body));
+    assert_eq(1, $runs);
+    assert_eq(['UPDATE t SET n = 0', 'BEGIN', 'UPDATE t SET n = 1', 'COMMIT'], txn_statements($srv));
+    assert_eq(4, $srv->connections());
+    assert_true($plain->isUsable() && $txn->isUsable());
+    $plain->close();
+    $txn->close();
+    // A pool: its idle connection looks fine too, and is handed out. An
+    // ordinary statement on it throws once and the pool drops it; so does
+    // the transaction, and the next one runs on a new connection.
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 4);
+    $statement = fn (Connection $c) => $c->exec('UPDATE t SET n = 0');
+    assert_eq(1, $pool->withConnection($statement));
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $pool->withConnection($statement), '/^connection closed by server/');
+    assert_eq(1, $pool->withConnection($statement));
+    $srv->closeAll();
+    $runs = 0;
+    assert_throws(SkaidbException::class, fn () => $pool->transaction($body), '/^connection closed by server/');
+    assert_eq(0, $runs);
+    assert_eq(1, $pool->transaction($body));
+    assert_eq(1, $runs);
+    assert_eq(
+        ['UPDATE t SET n = 0', 'UPDATE t SET n = 0', 'BEGIN', 'UPDATE t SET n = 1', 'COMMIT'],
+        array_slice(txn_statements($srv), 4)
+    );
+    $m = $pool->members()[0];
+    assert_eq([0, 1], [$m['in_use'], $m['idle']]);
+    $pool->close();
+    $srv->stop();
+});
+
 test('transaction: a connection lost on the COMMIT is thrown — not retried, the outcome is unknown', function () {
     $srv = txn_server(['COMMIT' => [FakeServer::DROP]]);
     $db = txn_connect($srv);
