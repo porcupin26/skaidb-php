@@ -1384,8 +1384,9 @@ class Connection
      * The database $sql enters when it is exactly one USE statement — USE
      * [DATABASE] <name> with an optional trailing ';', the name bare or in
      * double quotes ("" for a quote inside) — and null for anything else: a
-     * second statement, a comment, a placeholder. What is not read here is
-     * not tracked, so keep a USE plain.
+     * second statement, a placeholder. `--` comments are skipped first, as
+     * the server skips them, so `USE app -- the app database` is read too.
+     * What is not read here is not tracked.
      *
      * The name is taken as written: the server does not fold its case. A
      * bare DATABASE is the keyword only when a name follows it, as the
@@ -1395,9 +1396,15 @@ class Connection
      */
     public static function usedDatabase(string $sql): ?string
     {
+        // Every successful statement comes through here, some of them
+        // megabytes long: its first word, past whitespace and comments,
+        // settles it before anything is copied.
+        if (preg_match('/^(?:\s++|--[^\n]*+)*+USE(?![A-Za-z0-9_])/i', $sql) !== 1) {
+            return null;
+        }
         $matched = preg_match(
             '/^\s*USE\s+(?:DATABASE\s+)?(?:"((?:[^"]|"")*)"|([A-Za-z_][A-Za-z0-9_]*))\s*;?\s*$/i',
-            $sql,
+            self::withoutLineComments($sql),
             $m
         );
         if ($matched !== 1) {
@@ -1405,6 +1412,17 @@ class Connection
         }
         $name = ($m[2] ?? '') !== '' ? $m[2] : str_replace('""', '"', $m[1]);
         return $name === '' ? null : $name;
+    }
+
+    /**
+     * $sql without its `--` comments. Each runs to the end of its line; a
+     * `--` inside a double-quoted name or a single-quoted string is not one
+     * (`USE "a--b"` names the database a--b). The server knows no other
+     * comment: a slash-star one is a parse error there.
+     */
+    private static function withoutLineComments(string $sql): string
+    {
+        return preg_replace('/("[^"]*+(?:"|\z)|\'[^\']*+(?:\'|\z))|--[^\n]*+/', '$1', $sql) ?? $sql;
     }
 
     /**

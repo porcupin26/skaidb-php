@@ -803,7 +803,7 @@ test('reconnect: only a statement that is exactly one USE moves the session data
     assert_eq('database', $used('USE DATABASE database'));
     // Anything else is left alone.
     foreach ([
-        'SELECT 1', 'USE', 'USE ;', 'USE ?', "USE 'app'", 'USE app other', 'USE app; USE other', 'USE app -- why',
+        'SELECT 1', 'USE', 'USE ;', 'USE ?', "USE 'app'", 'USE app other', 'USE app; USE other',
         'USE app.notes', 'USE "app', 'USE app"', 'USE ""', 'USEapp', 'EXPLAIN USE app', 'USE app-2', 'CREATE TABLE use (PRIMARY KEY (id))',
     ] as $sql) {
         assert_eq(null, $used($sql), $sql);
@@ -813,11 +813,46 @@ test('reconnect: only a statement that is exactly one USE moves the session data
     $srv = session_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
     $db->exec('USE app');
-    $db->exec('USE other -- with a comment the driver does not read');
+    $db->exec('USE other; USE third');
     $srv->closeAll();
     assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
     $db->query('SELECT 1');
     assert_eq(['connect', 'USE "app"', 'SELECT 1'], array_slice(session_seen($srv), 3));
+    $db->close();
+    $srv->stop();
+});
+
+test('reconnect: a USE with a -- comment is read as the server reads it', function () {
+    $used = fn (string $sql) => Connection::usedDatabase($sql);
+    // The server skips a -- comment to the end of its line, wherever it
+    // stands outside a quoted name or string.
+    assert_eq('app', $used('USE app -- the app database'));
+    assert_eq('app', $used('USE app--no space before it'));
+    assert_eq('app', $used("-- which one\nUSE app --\n;"));
+    assert_eq('app', $used("USE -- on the next line\n app"));
+    assert_eq('app', $used('use database "app" -- quoted; and a ; in the comment'));
+    assert_eq('a--b', $used('USE "a--b"'), 'no comment starts inside a quoted name');
+    assert_eq('a--b', $used('USE "a--b" -- one after it'));
+    // No statement, no name, or not a comment at all.
+    foreach ([
+        '-- USE app', "-- USE app\n", 'USE -- x', "USE -- x\n", "USE 'a--b'", 'USE "app -- never closed',
+        'USE app - - x', 'USE app -- x' . "\n" . 'other', '/* c */ USE app', 'USE app /* c */',
+    ] as $sql) {
+        assert_eq(null, $used($sql), $sql);
+    }
+    // End to end: such a USE moves the session like any other.
+    $srv = session_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $db->exec('USE app');
+    $db->exec('USE other -- the reporting database');
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT count(*) FROM notes'), '/^connection closed by server/');
+    assert_eq(3, $db->query('SELECT count(*) FROM notes')->fetchColumn());
+    assert_eq(1, $db->exec('INSERT INTO notes (id) VALUES (1)'));
+    assert_eq(
+        ['connect', 'USE "other"', 'SELECT count(*) FROM notes', 'INSERT INTO notes (id) VALUES (1)'],
+        array_slice(session_seen($srv), 3)
+    );
     $db->close();
     $srv->stop();
 });

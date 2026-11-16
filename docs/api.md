@@ -190,12 +190,14 @@ The session database is the constructor's `$database`, or the one named by
 the last `USE` the server accepted. The driver reads a statement that is
 exactly one `USE [DATABASE] <name>` — the name bare or in double quotes
 (`""` for a quote inside), an optional trailing `;` — sent through
-`exec()`, `query()`, `execute()` or `stream()`; a `USE` written any other
-way (with a comment, as one of two statements) is not noticed. Every dial
-sends `USE "<that database>"` before anything else, so a re-dialled
-connection is in the database the lost one was in. If that `USE` fails,
-the statement that caused the re-dial throws its error and is not sent; it
-never runs in another database, and the next statement tries again.
+`exec()`, `query()`, `execute()` or `stream()`. `--` comments are skipped
+first, each to the end of its line, as the server skips them:
+`USE app -- the app database` is read, and `USE "a--b"` names `a--b`.
+Anything else (two statements in one, say) is not noticed. Every dial sends
+`USE "<that database>"` before anything else, so a re-dialled connection is
+in the database the lost one was in. If that `USE` fails, the statement
+that caused the re-dial throws its error and is not sent; it never runs in
+another database, and the next statement tries again.
 
 ## `Statement`
 

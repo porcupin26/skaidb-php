@@ -392,11 +392,11 @@ subclass, modeled on `PDOException`).
 - **The session database survives the re-dial.** It is the constructor's
   `$database`, or the one the last `USE` the server accepted moved to: a
   statement that is exactly `USE [DATABASE] <name>` (the name bare or in
-  double quotes, an optional `;`) sent through `exec()`, `query()`,
-  `execute()` or `stream()`. A `USE` written any other way (with a
-  comment, say) is not noticed, so keep it plain. If the database cannot be
-  entered on the new connection, the statement throws that error instead of
-  running in another database.
+  double quotes, an optional `;`, `--` comments skipped as the server skips
+  them) sent through `exec()`, `query()`, `execute()` or `stream()`.
+  Anything the driver cannot read as one such statement is not noticed. If
+  the database cannot be entered on the new connection, the statement
+  throws that error instead of running in another database.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   rather than hand the next caller a misaligned reply; the next statement
   reconnects.
