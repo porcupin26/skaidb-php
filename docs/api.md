@@ -405,7 +405,9 @@ or `$ejectErrors < 1` throws `SkaidbException`.
   CONSISTENCY DEFAULT` — only the ones needed, none for a borrower that
   changed nothing. Closes it instead if it is broken, mid-stream, its
   member is ejected, not `ready` or gone, the pool already holds `$maxsize`
-  idle connections, or one of those statements fails.
+  idle connections, or one of those statements fails. Releasing a
+  connection that is not checked out (a second `release()`, or one inside
+  `withConnection()`, which releases by itself) does nothing.
 - `withConnection(callable $fn, string|int|null $affinity = null): mixed` —
   `acquire($affinity)`, call `$fn($conn)`, `release()` however `$fn` ends;
   returns what `$fn` returns.

@@ -1925,6 +1925,34 @@ test('pool: idle connections are reused, broken ones discarded, surplus closed',
     $srv->stop();
 });
 
+test('pool: a connection released twice is pooled once — two borrowers never share it', function () {
+    $srv = scripted_server();
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 4);
+    $c = $pool->acquire();
+    $pool->release($c);
+    $pool->release($c);
+    assert_eq([0, 1], [$pool->members()[0]['in_use'], $pool->members()[0]['idle']]);
+    // The same slip through withConnection(), which releases on its own.
+    $pool->withConnection(fn (Connection $held) => $pool->release($held));
+    assert_eq([0, 1], [$pool->members()[0]['in_use'], $pool->members()[0]['idle']]);
+    $a = $pool->acquire();
+    $b = $pool->acquire();
+    assert_true($a !== $b, 'one connection was handed to two borrowers');
+    assert_eq(2, $pool->members()[0]['in_use']);
+    $pool->release($a);
+    $pool->release($b);
+    $pool->release($a);
+    assert_eq([0, 2], [$pool->members()[0]['in_use'], $pool->members()[0]['idle']]);
+    // A connection its borrower closed is not pooled by a late release.
+    $d = $pool->acquire();
+    $d->close();
+    $pool->release($d);
+    assert_eq([0, 1], [$pool->members()[0]['in_use'], $pool->members()[0]['idle']]);
+    assert_eq(2, $srv->connections());
+    $pool->close();
+    $srv->stop();
+});
+
 test('pool: a re-dialled pooled connection is in the pool\'s database, and in its borrower\'s while it is held', function () {
     $srv = session_server();
     $count = 'SELECT count(*) FROM notes';

@@ -1593,11 +1593,13 @@ class Connection
     /**
      * The server accepted a statement sent as text, read as $read (see
      * sessionStatement): if it changed the session's state in a way the
-     * driver can read, note it — a re-dial has to put that state back (see
-     * dial). A USE moved the session to another
+     * driver can read, note it. A USE moved the session to another
      * database; a SET CONSISTENCY or a SET SCAN BUDGET set the override or
-     * the limit, or cleared it with DEFAULT. Only text statements come
-     * through here: the server prepares none of these.
+     * the limit, or cleared it with DEFAULT — state a re-dial has to put
+     * back (see dial). A BEGIN opened a transaction, a COMMIT or a ROLLBACK
+     * ended one — which decides whether there may be a re-dial at all (see
+     * ensureLive). Only text statements come through here: the server
+     * prepares none of these.
      */
     private function noteSession(?array $read): void
     {
@@ -3320,12 +3322,20 @@ class Pool
      * the connection is closed too: kept, it would run the next borrower's
      * statements in another database, under another borrower's limits, or
      * inside its transaction.
+     *
+     * Releasing a connection that is not checked out — a second release —
+     * does nothing.
      */
     public function release(Connection $conn): void
     {
         $slot = $this->slots[$conn] ?? null;
+        if ($slot !== null && !$slot->out) {
+            // Not checked out: released already, and idle or closed since.
+            // Pooled a second time it would be handed to two borrowers.
+            return;
+        }
         $m = $slot === null ? null : ($this->members[$slot->ep ?? ''] ?? null);
-        if ($slot !== null && $slot->out) {
+        if ($slot !== null) {
             $slot->out = false;
             if ($m !== null && $m->inUse > 0) {
                 $m->inUse--;
