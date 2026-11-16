@@ -8,6 +8,7 @@ declare(strict_types=1);
 
 use Skaidb\Bytes;
 use Skaidb\Connection;
+use Skaidb\ConnectionException;
 use Skaidb\Decimal;
 use Skaidb\Pool;
 use Skaidb\SkaidbException;
@@ -780,6 +781,30 @@ test('batch: a statement the server declines to prepare runs once per row, quote
     assert_eq([], array_slice($sent(), 9), 'no row was sent');
     assert_eq(0, $st->executeBatch([]));
     assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('batch: a connection lost under a row is a ConnectionException that names the row', function () {
+    // A batch the server will not prepare runs row by row; the second
+    // row's statement is where the connection goes.
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        if ($req['op'] === 2) {
+            return F::error('statement kind cannot be prepared');
+        }
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        return str_contains($req['sql'], '= 2') ? FakeServer::DROP : F::ddl();
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $e = assert_throws(
+        ConnectionException::class,
+        fn () => $db->prepare('CREATE INDEX i ON t (v) WHERE v = ?')->executeBatch([[1], [2], [3]]),
+        '/^batch row 1: connection closed by server \(1 rows applied before it\)$/'
+    );
+    assert_true($e->getPrevious() instanceof ConnectionException);
+    assert_true(!$db->isUsable());
     $db->close();
     $srv->stop();
 });

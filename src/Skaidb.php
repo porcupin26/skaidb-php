@@ -2308,16 +2308,26 @@ class Statement
             try {
                 $res = $this->conn->runQuery($sql, $this->consistency);
             } catch (SkaidbException $e) {
-                throw new SkaidbException(
-                    "batch row {$i}: " . $e->getMessage() . " ({$i} rows applied before it)",
-                    0,
-                    $e
-                );
+                throw self::rowFailed($i, $e);
             }
             $total += $res['affected'];
         }
         $this->conn->noteStatement($this->sql);
         return $total;
+    }
+
+    /**
+     * The error for a batch the driver runs row by row, when row $i is the
+     * first to fail: it names the row and how many ran before it (they stay
+     * applied), as a server's own batch error does. A lost connection stays
+     * a ConnectionException — whether row $i ran is then unknown.
+     */
+    private static function rowFailed(int $i, SkaidbException $e): SkaidbException
+    {
+        $message = "batch row {$i}: " . $e->getMessage() . " ({$i} rows applied before it)";
+        return $e instanceof ConnectionException
+            ? new ConnectionException($message, 0, $e)
+            : new SkaidbException($message, 0, $e);
     }
 
     /**
