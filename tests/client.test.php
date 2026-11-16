@@ -311,7 +311,7 @@ test('prepared: DDL the server declines to prepare falls back to client-side quo
  *
  * Sent as text, a statement is answered Ddl unless it is one of the wrong
  * ones, or puts a string where a name or a keyword belongs: then the
- * parser's error again, which names the string's content only before 0.349.
+ * parser's error again, which calls the string "a string literal".
  */
 function declining_server(bool $before349 = false): FakeServer
 {
@@ -327,12 +327,11 @@ function declining_server(bool $before349 = false): FakeServer
             }
         }
         if ($req['op'] === 1) {
-            $string = fn (string $content) => $before349 ? 'Str(\"' . $content . '\")' : 'a string literal';
-            if (preg_match('/^USE \'(.*)\'$/', $sql, $m) === 1) {
-                return F::error('parse error: unexpected token "' . $string($m[1]) . '", expected identifier');
+            if (preg_match('/^USE \'.*\'$/', $sql) === 1) {
+                return F::error('parse error: unexpected token "a string literal", expected identifier');
             }
-            if (preg_match('/^SET CONSISTENCY \'(.*)\'$/', $sql, $m) === 1) {
-                return F::error('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found ' . stripslashes($string($m[1])));
+            if (preg_match('/^SET CONSISTENCY \'.*\'$/', $sql) === 1) {
+                return F::error('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found a string literal');
             }
             return F::ddl();
         }
@@ -420,20 +419,18 @@ test('prepared: the server\'s "statement kind cannot be prepared" is what sends 
     ], declining_seen($srv));
     $db->close();
     $srv->stop();
-    // A server before 0.349 has the prefix only for a statement that
-    // parses. Where its parser stops at the placeholder it answers with
-    // the parser's error alone, which names the token: Question. That
-    // still falls back — it did before the prefix existed — and a parse
-    // error that does not name the placeholder still does not.
+    // Exactly that prefix: a server before 0.349 answers the placeholder
+    // case with its parser's error alone, and that is reported as it is,
+    // like every other Prepare error — nothing is sent as text.
     $srv = declining_server(true);
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
-    assert_true($db->prepare('ALTER TABLE t SET (ttl = ?)')->execute([60]));
-    assert_true($db->prepare('SET SCAN BUDGET ROWS ?')->execute([9]));
-    assert_throws(SkaidbException::class, fn () => $db->prepare('SELEC id FROM t WHERE id = ?')->execute([1]), '/^unexpected token "Ident/');
+    $e = assert_throws(SkaidbException::class, fn () => $db->prepare('ALTER TABLE t SET (ttl = ?)')->execute([60]));
+    assert_eq('expected a literal value for option ttl, found Question', $e->getMessage());
+    assert_eq(SkaidbException::class, get_class($e));
+    assert_true($db->prepare('CREATE INDEX i ON t (v) WHERE v > ?')->execute([1]), 'the bare prefix is as old as prepared statements');
     assert_eq([
-        'prepare ALTER TABLE t SET (ttl = ?)', 'ALTER TABLE t SET (ttl = 60)',
-        'prepare SET SCAN BUDGET ROWS ?', 'SET SCAN BUDGET ROWS 9',
-        'prepare SELEC id FROM t WHERE id = ?',
+        'prepare ALTER TABLE t SET (ttl = ?)',
+        'prepare CREATE INDEX i ON t (v) WHERE v > ?', 'CREATE INDEX i ON t (v) WHERE v > 1',
     ], declining_seen($srv));
     $db->close();
     $srv->stop();
@@ -488,46 +485,31 @@ test('prepared: a parameter binds a value, never a name — USE ? and SET CONSIS
     // The server declines to prepare these (the placeholder stands where
     // the grammar wants a name or a keyword), and the text the fallback
     // sends carries a quoted string there, which is no name either. What
-    // the application gets is the server's answer to that text: since
-    // 0.349 without the string's content, before it with.
-    $texts = [
-        '0.349' => [
-            'parse error: unexpected token "a string literal", expected identifier',
-            'parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found a string literal',
-            'parse error: unexpected token "a string literal", expected identifier',
-        ],
-        'before 0.349' => [
-            'parse error: unexpected token "Str(\"default\")", expected identifier',
-            'parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")',
-            'parse error: unexpected token "Str(\"app\")", expected identifier',
-        ],
-    ];
-    foreach ($texts as $server => [$useDefault, $consistency, $useApp]) {
-        $srv = declining_server($server !== '0.349');
-        $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
-        $use = $db->prepare('USE ?');
-        $e = assert_throws(SkaidbException::class, fn () => $use->execute(['default']));
-        assert_eq($useDefault, $e->getMessage(), $server);
-        assert_eq(SkaidbException::class, get_class($e));
-        $e = assert_throws(SkaidbException::class, fn () => $db->prepare('SET CONSISTENCY ?')->execute(['ALL']));
-        assert_eq($consistency, $e->getMessage(), $server);
-        // Nothing moved: the session is where it was, on the same connection.
-        assert_eq(null, $db->sessionDatabase());
-        assert_true($db->isUsable());
-        $e = assert_throws(SkaidbException::class, fn () => $use->execute(['app']));
-        assert_eq($useApp, $e->getMessage(), $server);
-        assert_eq([
-            'prepare USE ?', "USE 'default'",
-            'prepare SET CONSISTENCY ?', "SET CONSISTENCY 'ALL'",
-            "USE 'app'",
-        ], declining_seen($srv), $server);
-        // Where the statement takes a literal the same fallback works.
-        assert_true($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000]));
-        assert_eq(['prepare SET SCAN BUDGET ROWS ?', 'SET SCAN BUDGET ROWS 1000'], array_slice(declining_seen($srv), 5), $server);
-        assert_eq(1, $srv->connections());
-        $db->close();
-        $srv->stop();
-    }
+    // the application gets is the server's answer to that text, which
+    // names the string without showing it.
+    $srv = declining_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $use = $db->prepare('USE ?');
+    $e = assert_throws(SkaidbException::class, fn () => $use->execute(['default']));
+    assert_eq('parse error: unexpected token "a string literal", expected identifier', $e->getMessage());
+    assert_eq(SkaidbException::class, get_class($e));
+    $e = assert_throws(SkaidbException::class, fn () => $db->prepare('SET CONSISTENCY ?')->execute(['ALL']));
+    assert_eq('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found a string literal', $e->getMessage());
+    // Nothing moved: the session is where it was, on the same connection.
+    assert_eq(null, $db->sessionDatabase());
+    assert_true($db->isUsable());
+    assert_throws(SkaidbException::class, fn () => $use->execute(['app']), '/^parse error: unexpected token "a string literal", expected identifier$/');
+    assert_eq([
+        'prepare USE ?', "USE 'default'",
+        'prepare SET CONSISTENCY ?', "SET CONSISTENCY 'ALL'",
+        "USE 'app'",
+    ], declining_seen($srv));
+    // Where the statement takes a literal the same fallback works.
+    assert_true($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000]));
+    assert_eq(['prepare SET SCAN BUDGET ROWS ?', 'SET SCAN BUDGET ROWS 1000'], array_slice(declining_seen($srv), 5));
+    assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
 });
 
 test('prepared: a server from before prepared statements gets every parameterised statement as text', function () {
@@ -1121,7 +1103,7 @@ function session_server(?array $tls = null): FakeServer
         switch ($req['op']) {
             case 2:
                 return preg_match('/^\s*set\b/i', $req['sql']) === 1
-                    ? F::error('unexpected token "Question", expected a positive integer')
+                    ? F::error('statement kind cannot be prepared: unexpected token "Question", expected a positive integer')
                     : F::prepared(1, substr_count($req['sql'], '?'));
             case 3:
                 return F::mutation(1);

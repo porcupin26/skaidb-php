@@ -1267,18 +1267,20 @@ class Connection
      * (ttl = ?), USE ?). Either way the statement may be right once its
      * values are written into it.
      *
-     * A server before 0.349 answers the second case with the parser's
-     * error alone. That error names the token it stopped at, Question —
-     * which is how the newer server tells the case itself — so it is taken
-     * the same way; any other parse error is the statement's. And a server
-     * from before prepared statements (0.17) answers the opcode itself with
-     * "unknown opcode": everything goes as text there.
+     * Exactly that prefix: every other error a statement's prepare is
+     * answered with is the statement's, and is reported as it is. That
+     * includes the parser's bare error a server before 0.349 gives for a
+     * `?` in a literal's place — there such a statement has to be written
+     * with its value in the text.
+     *
+     * One answer is not about the statement at all: "unknown opcode", from
+     * a server that predates prepared statements (0.17). PROTOCOL.md §3.4
+     * has a driver detect that by preparing and fall back to client-side
+     * binding, so it is taken as a refusal too.
      */
     private static function declinedToPrepare(string $msg): bool
     {
-        return str_starts_with($msg, self::KIND_NOT_PREPARED)
-            || str_contains($msg, 'Question')
-            || str_contains($msg, 'unknown opcode');
+        return str_starts_with($msg, self::KIND_NOT_PREPARED) || str_contains($msg, 'unknown opcode');
     }
 
     /**

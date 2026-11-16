@@ -209,9 +209,10 @@ parse error: unexpected token "a string literal", expected identifier
 parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found a string literal
 ```
 
-(A server before 0.349 shows the string instead: `unexpected token
-"Str(\"app\")"`, `found Str("ALL")`.) Write the name into the statement:
-`$db->exec('USE app')`. Arrays and documents have no literal form and throw
+Write the name into the statement: `$db->exec('USE app')`. A server before
+0.349 does not say `statement kind cannot be prepared` for a `?` in a
+literal's place, so there `ALTER TABLE t SET (ttl = ?)` throws the parser's
+error and the value has to be written into the text too. Arrays and documents have no literal form and throw
 (the message names the reason the server would not prepare the statement).
 Any other error the server answers a prepare with, a syntax error for one,
 is the statement's own: it is thrown as it comes and nothing is sent a

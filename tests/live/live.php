@@ -183,12 +183,10 @@ try {
     check($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000000]) && $db->exec('SET SCAN BUDGET DEFAULT') === 0, 'SET SCAN BUDGET ROWS ? takes a bound number');
     // A name or a keyword there: refused, with the server's reason for the
     // text it was sent.
-    // text it was sent. A server from 0.349 on names the string as "a
-    // string literal"; an older one shows its content, and before 0.349
-    // SET CONSISTENCY knew no DEFAULT.
+    // text it was sent, which names the string without showing it.
     $refused = [
-        ['USE ?', ['default'], '/^parse error: unexpected token "(a string literal|Str\(\\\\"default\\\\"\))", expected identifier$/'],
-        ['SET CONSISTENCY ?', ['ALL'], '/^parse error: SET CONSISTENCY takes ONE, QUORUM,( ALL, or DEFAULT| or ALL) — found (a string literal|Str\("ALL"\))$/'],
+        ['USE ?', ['default'], '/^parse error: unexpected token "a string literal", expected identifier$/'],
+        ['SET CONSISTENCY ?', ['ALL'], '/^parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found a string literal$/'],
     ];
     foreach ($refused as [$sql, $params, $message]) {
         try {

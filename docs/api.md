@@ -292,9 +292,10 @@ it — its answer starts with `statement kind cannot be prepared`: the kind
 takes no bound parameters, or a `?` stands where the grammar wants a
 literal or a name (DDL, session statements) — the values are quoted into
 the text client-side instead, and the connection remembers the refusal (its
-last 240) so the next `execute()` goes straight to text. (A server before
-0.349 answers the second case with its parser's error alone, naming the
-token `Question`; that is taken the same way.) The fallback works where the
+last 240) so the next `execute()` goes straight to text. The fallback is
+taken on exactly that prefix (PROTOCOL.md §6 rule 10): a server before
+0.349 answers the second case with its parser's error alone, which is
+thrown like any other. The fallback works where the
 statement takes a literal; a name or a keyword cannot be bound, so `USE ?`
 and `SET CONSISTENCY ?` throw the server's error for the text (`parse
 error: unexpected token "a string literal", expected identifier`). Any
