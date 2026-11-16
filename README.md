@@ -187,15 +187,30 @@ interpolation, no injection surface. That is also the only way to send an
 parameter count must match what you pass (a mismatch throws before anything
 runs).
 
-Statements the server declines to prepare (DDL and session statements) fall
-back to client-side quoting of the same `?` parameters, which works wherever
-the statement takes a literal — not where it takes a name, so `USE ?` is
-refused; arrays and documents cannot travel that way and throw (the message
-names the reason the server would not prepare the statement). Prepared ids
-are scoped to a connection and the cache is dropped on reconnect. A server
-keeps at most 256 prepared statements per connection; the driver stays
-below that, and a prepare the server refuses with `too many prepared
-statements` is thrown rather than sent as text.
+A statement the server will not prepare — DDL and session statements — is
+sent as text instead, with the same `?` parameters quoted into it
+client-side; the connection remembers the refusal, so that statement is not
+asked about again. Each value is written as a literal, so this works
+wherever the statement takes a literal: `ALTER TABLE t SET (ttl = ?)`,
+`CREATE INDEX … WHERE v > ?`, `SET SCAN BUDGET ROWS ?`. **A parameter is a
+value, never a name or a keyword**: `USE ?` and `SET CONSISTENCY ?` are
+refused, with the server's error for the text it was sent —
+
+```
+parse error: unexpected token "Str(\"app\")", expected identifier
+parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("ALL")
+```
+
+— so write the name into the statement (`$db->exec('USE app')`). Arrays and
+documents have no literal form and throw (the message names the reason the
+server would not prepare the statement). Any other error the server answers
+a prepare with, a syntax error for one, is the statement's own: it is
+thrown as it comes and nothing is sent a second time.
+
+Prepared ids are scoped to a connection and the cache is dropped on
+reconnect. A server keeps at most 256 prepared statements per connection;
+the driver stays below that, and a prepare the server refuses with `too
+many prepared statements` is thrown rather than sent as text.
 
 ### Batches — many rows, one round-trip
 

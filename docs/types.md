@@ -43,12 +43,19 @@ Notes:
 
 ## Client-side fallback
 
-Statements the server will not prepare (DDL, `USE`, other session
-statements) get their `?` parameters quoted into the SQL text instead:
-strings single-quoted with `'` doubled, ints and floats as literals (an
-integral float keeps its `.0`), bools as `TRUE`/`FALSE`, `null` as `NULL`,
-a `DateTimeInterface` as its epoch milliseconds, a `Decimal` as its numeric
+Statements the server will not prepare (DDL and session statements) get
+their `?` parameters quoted into the SQL text instead: strings
+single-quoted with `'` doubled, ints and floats as literals (an integral
+float keeps its `.0`), bools as `TRUE`/`FALSE`, `null` as `NULL`, a
+`DateTimeInterface` as its epoch milliseconds, a `Decimal` as its numeric
 text, a `Bytes` as a hex string, a `Uuid` as a quoted string, any other
 object with `__toString()` as a quoted string. Arrays and documents cannot
 be rendered as SQL and throw; the message includes why the server would not
 prepare the statement.
+
+Every value becomes a literal, so the fallback serves a statement that
+takes a literal where the `?` stands (`ALTER TABLE t SET (ttl = ?)`). It
+cannot supply a name or a keyword: `USE ?` is sent as `USE 'app'`, which
+the server refuses (`parse error: unexpected token "Str(\"app\")",
+expected identifier`), and `SET CONSISTENCY ?` likewise. Write those into
+the statement text.

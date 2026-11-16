@@ -214,12 +214,19 @@ Binds `$params` (positional, in `?` order; associative arrays are
 re-indexed) and runs the statement. With a non-empty `$params` the
 statement is prepared on the server and the values travel typed; the
 parameter count must equal the statement's placeholder count
-(`statement expects N parameters, got M`). If the server declines to
-prepare it (DDL, `USE`), the values are quoted client-side instead. A
-prepare refused because the connection's statement table is full (`too
-many prepared statements …`) is not such a case: it is thrown, since as
-text the values would be typed by their literals. Returns `true`; throws on
-error.
+(`statement expects N parameters, got M`). If the server will not prepare
+it — it answers `statement kind cannot be prepared`, or its parser stops at
+the placeholder where it wants a literal or a name (DDL, session
+statements) — the values are quoted into the text client-side instead, and
+the connection remembers the refusal (its last 240) so the next `execute()`
+goes straight to text. That works where the statement takes a literal; a
+name or a keyword cannot be bound, so `USE ?` and `SET CONSISTENCY ?` throw
+the server's error for the text (`parse error: unexpected token
+"Str(\"app\")", expected identifier`). Any other error answer to the
+prepare is the statement's own and is thrown as it comes, with nothing sent
+again: a syntax error, or a connection whose statement table is full (`too
+many prepared statements …` — as text the values would be typed by their
+literals). Returns `true`; throws on error.
 
 ### `executeBatch(array $rows): int`
 
