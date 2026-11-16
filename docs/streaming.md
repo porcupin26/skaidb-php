@@ -113,5 +113,11 @@ events per page, sleeping `$poll` seconds when a page comes back empty.
 number, so `$after` takes a saved id or `null` (from the beginning).
 `break` out of the loop to stop.
 
+Each poll is an ordinary statement, so the connection is idle between two
+of them like any other: if the server closes it there (a restart, an idle
+timeout) the next poll runs on a new connection and continues after the
+last `id` it yielded. A connection lost under a poll throws its
+`ConnectionException` out of the loop; resume with the last `id` you saved.
+
 For push delivery subscribe to `$stream/<db>/<name>` with any MQTT client
 instead; the events are identical.

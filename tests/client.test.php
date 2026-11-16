@@ -2130,3 +2130,43 @@ test('subscribe: pages the stream log with a keyset cursor', function () {
     $db->close();
     $srv->stop();
 });
+
+test('subscribe: a connection closed between two polls is replaced, and the cursor carries on', function () {
+    // subscribe() polls with ordinary statements, so between two of them
+    // the connection is idle like any other: closed there, it costs the
+    // subscription nothing.
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        $page = fn (array $ids) => F::rows(['id', 'op', 'k', 'ts', 'doc'], array_map(fn ($id) => [$id, 'put', 'k', 1, null], $ids));
+        if ($req['op'] === 2) {
+            return F::prepared(1, 1);
+        }
+        if ($req['op'] === 1) {
+            return $page(['0001', '0002']);
+        }
+        if ($req['op'] === 3) {
+            return $page(match ($req['params'][0]) {
+                '0002' => ['0003'],
+                '0003' => ['0004', '0005'],
+                default => [],
+            });
+        }
+        return null;
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 5.0, 'app');
+    $got = [];
+    foreach ($db->subscribe('orders', null, 0.01) as $ev) {
+        $got[] = $ev['id'];
+        if (in_array($ev['id'], ['0002', '0003'], true)) {
+            $srv->closeAll($ev['id'] === '0002' ? FakeServer::CLOSE : FakeServer::HALF);
+        }
+        if (count($got) === 5) {
+            break;
+        }
+    }
+    assert_eq(['0001', '0002', '0003', '0004', '0005'], $got);
+    assert_eq(3, $srv->connections());
+    usleep(50_000);
+    assert_eq(0, $srv->strayBytes());
+    $db->close();
+    $srv->stop();
+});

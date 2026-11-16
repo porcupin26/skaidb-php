@@ -116,12 +116,18 @@ open`; the connection re-dials on the first statement after the generator
 is released.
 
 From `$begin` to the `COMMIT` the connection does not re-dial: once the
-transport is lost, a further statement of the body, or the `COMMIT`, throws
-`connection lost inside a transaction: …` without being sent, because on a
-new connection it would run outside the transaction (the clean-up
-`ROLLBACK` is not sent either). The transport error itself is thrown as
-usual and is not retried; the connection re-dials on the first statement
-after the call. See [Transactions](../README.md#transactions).
+transport is lost, a further statement of the body throws `connection lost
+inside a transaction: the statement was not sent …`, because on a new
+connection it would run outside the transaction, and the `COMMIT` throws
+`connection lost inside a transaction: the COMMIT was not sent, and nothing
+was committed …` (the clean-up `ROLLBACK` is not sent either). A `COMMIT`
+the connection is lost under throws the transport error with `: the
+connection was lost under the COMMIT, so whether the transaction was
+committed is not known`. The transport error itself is thrown as usual and
+is not retried; the connection re-dials on the first statement after the
+call. All of these are `ConnectionException`s. See
+[Transactions](../README.md#transactions) and Reconnect below, which
+describes the same rule for a transaction opened with a plain `BEGIN`.
 
 ### `stream(string $sql, array $params = [], int|string|null $consistency = null): Generator`
 

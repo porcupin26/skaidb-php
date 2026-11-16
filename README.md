@@ -435,8 +435,9 @@ try {
   and mark the connection *broken*, not closed. Its socket is
   closed at once, so the server's session — and a transaction open in it —
   ends there, also after a read timeout. The next statement **re-dials**
-  (through the seed walk), re-authenticates, enters the session database
-  again and clears the prepared-statement cache. Because the failed
+  (through the seed walk), re-authenticates, puts the session's state back
+  (below) and clears the prepared-statement cache — unless a transaction
+  was open on the connection (see Transactions). Because the failed
   statement *may* have executed, the driver never retries it for you: retry
   a write only if it is idempotent. `isUsable()` reports the state.
 - **A connection the server closed while it sat idle costs no statement.**
