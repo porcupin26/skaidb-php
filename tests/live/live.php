@@ -17,7 +17,9 @@ require __DIR__ . '/../../src/Skaidb.php';
 
 use Skaidb\Bytes;
 use Skaidb\Connection;
+use Skaidb\ConnectionException;
 use Skaidb\Decimal;
+use Skaidb\Pool;
 use Skaidb\Skaidb;
 use Skaidb\SkaidbException;
 use Skaidb\Uuid;
@@ -205,6 +207,94 @@ try {
             'a syntax error in a parameterised statement is the prepare\'s error: ' . $e->getMessage());
     }
     check($db->isUsable() && $db->query('SELECT 1 AS one')->fetchColumn() === 1, 'connection usable after the refusals');
+
+    // ---- the session across a lost connection ---------------------------------------
+    // The connection is lost while it sits idle: its socket is shut down
+    // under the driver, as a restart or an idle timeout would end it.
+    $lose = function (Connection $c): void {
+        stream_socket_shutdown((new \ReflectionProperty(Connection::class, 'sock'))->getValue($c), STREAM_SHUT_RDWR);
+    };
+    $scan = "SELECT id FROM {$big}";
+    $refusedBy = function (Connection $c) use ($scan): string {
+        try {
+            $c->query($scan);
+            return '';
+        } catch (SkaidbException $e) {
+            return $e->getMessage();
+        }
+    };
+    $lose($db);
+    check(!$db->isUsable(), 'isUsable() sees a connection closed while it sat idle, without a round trip');
+    check($db->query('SELECT 1 AS one')->fetchColumn() === 1 && $db->isUsable(), 'the statement after it costs no error: it runs on a new connection');
+    // A scan budget set with a statement is session state: kept across the loss.
+    $db->exec('SET SCAN BUDGET ROWS 1');
+    check(str_contains($refusedBy($db), 'scan budget exceeded'), 'SET SCAN BUDGET ROWS 1 refuses a scan of 2500 rows');
+    $lose($db);
+    check(str_contains($refusedBy($db), 'scan budget exceeded'), 'and still does after the connection was lost and replaced');
+    $db->exec('SET SCAN BUDGET DEFAULT');
+    $lose($db);
+    check($refusedBy($db) === '', 'SET SCAN BUDGET DEFAULT clears it: nothing is sent again after the next loss');
+    try {
+        $db->exec('SET CONSISTENCY ALL');
+        $lose($db);
+        check($db->query("SELECT count(*) AS n FROM {$big}")->fetchColumn() === 2500, 'a noted SET CONSISTENCY ALL is taken again by the new connection');
+        try {
+            $db->exec('SET CONSISTENCY DEFAULT');
+            check(true, 'SET CONSISTENCY DEFAULT clears the override (server >= 0.349)');
+        } catch (SkaidbException $e) {
+            $db->exec('SET CONSISTENCY QUORUM');
+            check(str_contains($e->getMessage(), 'SET CONSISTENCY takes'), 'a server before 0.349 has no SET CONSISTENCY DEFAULT: ' . $e->getMessage());
+        }
+    } catch (SkaidbException $e) {
+        check(false, 'SET CONSISTENCY across a lost connection: ' . $e->getMessage());
+    }
+
+    // ---- a pool hands every borrower its own session state ----------------------------
+    $pool = new Pool([$host, $port, $user, $password, 'QUORUM', 15.0, $database], 1);
+    $first = $pool->acquire();
+    $first->exec('SET SCAN BUDGET ROWS 1');
+    check(str_contains($refusedBy($first), 'scan budget exceeded'), 'pool: borrower 1 sets a scan budget for itself');
+    $pool->release($first);
+    $pool->withConnection(function (Connection $c) use ($first, $refusedBy) {
+        check($c === $first && $refusedBy($c) === '', 'pool: borrower 2 gets the same connection, without borrower 1\'s scan budget');
+    });
+    $pool->close();
+
+    // ---- a transaction written by hand ------------------------------------------------
+    $begun = true;
+    try {
+        $db->exec('BEGIN');
+    } catch (SkaidbException $e) {
+        // A cluster member refuses a plain BEGIN: nothing to check here.
+        $begun = false;
+        echo "skip the hand-written transaction checks: BEGIN is refused ({$e->getMessage()})\n";
+    }
+    if ($begun) {
+        $db->prepare("INSERT INTO {$t} (id, s) VALUES (?, ?)")->execute([9001, 'in a transaction']);
+        $lose($db);
+        $lost = [];
+        foreach (['a statement' => fn () => $db->exec("INSERT INTO {$t} (id, s) VALUES (9002, 'after the loss')"), 'COMMIT' => fn () => $db->exec('COMMIT')] as $what => $run) {
+            try {
+                $run();
+                $lost[$what] = 'ran';
+            } catch (ConnectionException $e) {
+                $lost[$what] = $e->getMessage();
+            }
+        }
+        check(str_starts_with($lost['a statement'], 'connection lost inside a transaction: the statement was not sent'),
+            'a statement after a connection lost inside BEGIN … COMMIT is not sent: ' . $lost['a statement']);
+        check(str_starts_with($lost['COMMIT'], 'connection lost inside a transaction: the COMMIT was not sent, and nothing was committed'),
+            'its COMMIT is not sent either, and says nothing was committed');
+        check($db->query("SELECT count(*) AS n FROM {$t} WHERE id >= 9001")->fetchColumn() === 0, 'none of the transaction\'s rows exist; the connection is in use again');
+        $db->exec('BEGIN');
+        $db->exec("INSERT INTO {$t} (id, s) VALUES (9003, 'rolled back by the loss')");
+        $lose($db);
+        check($db->exec('ROLLBACK') === 0, 'ROLLBACK after a lost connection succeeds without being sent');
+        $db->exec('BEGIN');
+        $db->exec("INSERT INTO {$t} (id, s) VALUES (9004, 'committed')");
+        $db->exec('COMMIT');
+        check($db->query("SELECT id FROM {$t} WHERE id >= 9001")->fetchAll() === [['id' => 9004]], 'with nothing lost, BEGIN … COMMIT commits');
+    }
 
     // ---- client identification ----------------------------------------------------
     sleep(1);
