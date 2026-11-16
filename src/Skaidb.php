@@ -99,7 +99,7 @@ class TransactionConflictException extends SkaidbException
  */
 final class Skaidb
 {
-    public const VERSION = '1.5.1';
+    public const VERSION = '1.5.2';
 
     /** The client_name the driver reports in the server's `drivers` table. */
     public const CLIENT_NAME = 'php';

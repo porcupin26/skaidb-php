@@ -4,6 +4,145 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-11-16
+
+### Added
+- **`Skaidb\ConnectionException`**, a subclass of `SkaidbException`, for a
+  connection that was lost or could not be made: `connection closed by
+  server`, `connection timed out`, a failed write, `no reachable endpoint
+  in …`, a handshake closed or answered with something else, a capacity
+  refusal (`authentication denied: too many connections: …`), a reply the
+  driver cannot place, and a statement refused because its transaction's
+  connection is gone. Everything the driver threw was a bare
+  `SkaidbException` before, so code that tolerated a statement error
+  swallowed a lost connection with it. What the server answers a statement
+  with stays a plain `SkaidbException`, as do a refused login, `connection
+  is closed` after `close()` and `connection is busy streaming`; existing
+  `catch (SkaidbException $e)` blocks catch all of them as before.
+
+### Fixed
+- **A connection the server closed while it sat idle costs no statement.**
+  After a restart, a failover or an idle timeout the first statement on
+  each idle connection threw `connection closed by server`: a write to a
+  closed connection succeeds, only the read fails, and a statement that may
+  have run is not sent again. Every statement now looks at the socket
+  before its request is written (one poll with a zero timeout, no round
+  trip; the socket itself under TLS). A connection found closed, reset, or
+  holding bytes no request is waiting for is replaced, and the statement
+  runs on the new one — nothing is written to the dead one. `isUsable()`
+  makes the same look, so a pool no longer hands out an idle connection
+  the server closed, and such a close is not counted against the member.
+  Bytes left behind a complete reply used to answer the next statement;
+  that connection is replaced too.
+- **`SET CONSISTENCY` and `SET SCAN BUDGET` survive a re-dial.** A
+  consistency override and a scan budget set with plain statements are
+  session state on the server and were lost with the connection: after a
+  restart a scan the application had bounded ran unbounded, and a read
+  asked for at `ALL` ran at the request's own level. The driver now keeps
+  the text of the last `SET CONSISTENCY …` and the last `SET SCAN BUDGET …`
+  the server accepted (one statement, `--` comments and a trailing `;`
+  aside, through `exec()`, `query()`, `execute()` or `stream()`; `…
+  DEFAULT` clears it) and sends them again on a new connection, after the
+  `USE` and before the statement. A setting refused there fails the
+  statement with that error, unsent.
+- **A hand-written transaction is held to its connection.** Only
+  `transaction()` kept a lost connection from being replaced. After a
+  `BEGIN` sent by the application the driver re-dialled, and the rest of
+  the transaction ran on a new session, each statement committed on its
+  own; the `COMMIT` then answered `no transaction in progress`, and a
+  `ROLLBACK` undid nothing. The driver now notes a statement the server
+  accepted whose first word is `BEGIN`, until a `COMMIT` or `ROLLBACK`
+  (optionally followed by `TRANSACTION`) has been answered. In between, a
+  lost connection is not replaced: every further statement throws
+  `connection lost inside a transaction: the statement was not sent …`.
+  The application ends it: `ROLLBACK` succeeds without being sent, `COMMIT`
+  throws `connection lost inside a transaction: the COMMIT was not sent,
+  and nothing was committed …`; the next statement reconnects. A `COMMIT`
+  the connection is lost under — the one case with an unknown outcome — now
+  says so: `…: the connection was lost under the COMMIT, so whether the
+  transaction was committed is not known`.
+- **A pool hands every borrower its own session state.** A scan budget or
+  a consistency override set by one borrower applied to the next, and a
+  transaction a borrower left open stayed open: the next borrower's
+  statements ran inside it and were lost with it. `release()` now puts the
+  session back before the connection is kept — `ROLLBACK`, `USE` of the
+  pool's database (`USE default` when the pool was given none), `SET SCAN
+  BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`, only the ones the borrower
+  made necessary, so a borrower that changed nothing costs no round trip.
+  If one of them fails (a server before 0.349 has no `SET CONSISTENCY
+  DEFAULT`) the connection is closed instead. A connection a borrower's
+  `USE` moved is reset the same way instead of being closed, which cost a
+  dial per checkout.
+- **A `USE` is never held hostage by the database it leaves.** With the
+  session database dropped and the connection lost, every statement failed
+  at the re-dial's `USE` — and so did a new `USE other`, because the old
+  database was entered first for it too. A re-dial caused by a `USE` no
+  longer enters the old database first; the same holds for a `SET
+  CONSISTENCY` or `SET SCAN BUDGET` and the setting it replaces. If that
+  statement is refused in turn, the connection is dropped rather than used
+  half restored.
+- **A plain connection walks past a seed that refuses its handshake.** A
+  node at capacity accepts a connection and closes it unanswered; with
+  seeds `[such a node, a healthy node]` half of all constructors threw
+  `connection closed by server`. Such a seed is now a failed dial like one
+  that refuses the connection, and the next seed is tried; a refused login
+  still ends the walk.
+- **Only a statement the server will not prepare falls back to text.**
+  Every error answer to a prepare was taken for "declined", so a statement
+  with a syntax error was sent a second time as text, and a parameterised
+  DDL statement cost a refused prepare on every `execute()`. The fallback
+  is now taken on the server's `statement kind cannot be prepared`
+  (PROTOCOL.md §6 rule 10) and remembered per connection; any other
+  error is thrown as it comes, once. `docs/` no longer names `USE` as a
+  statement that takes a parameter: a parameter is a value, never a name,
+  and `USE ?` and `SET CONSISTENCY ?` are refused with the server's error
+  for the text.
+- **A `?` in a quoted identifier or a comment is not a placeholder.**
+  `query('SELECT id AS "ok?" FROM t')`, a statement ending in `-- really?`
+  and such a `$begin` for `transaction()` were refused with `query has
+  placeholders but no parameters given`, and the text fallback counted one
+  placeholder too many. The driver now reads a statement as the server's
+  lexer does: strings, quoted identifiers and `--` comments are skipped.
+- **`executeBatch()` works against a server without the batch opcode**
+  (before 0.87): the rows go one prepared execute each, typed, with the
+  same result and the same error for the first failing row. It threw
+  `protocol error: … unknown opcode`.
+- **A dial that loses its new connection fails once.** A server that
+  authenticated a connection and dropped it before the session database
+  was entered made the dial start over from inside itself, without end:
+  `new Connection(..., database: 'app')` hung, dialling in a loop. The
+  statement now throws `connection closed by server (write)` and the next
+  one dials again.
+- A batch the driver runs row by row keeps the `ConnectionException` of a
+  row that loses the connection.
+
+### Upgrade notes
+- A statement on a connection the server closed while idle used to throw
+  once; it now runs. Code that retried after that error no longer sees it.
+- After a lost connection inside a `BEGIN` the application sent, statements
+  throw until the application sends `ROLLBACK` or `COMMIT`. An error
+  handler that rolls back, as one should after any failed transaction,
+  needs no change.
+- `transaction()` reports a `COMMIT` that could not be sent as `connection
+  lost inside a transaction: the COMMIT was not sent, and nothing was
+  committed …` (it was `… the statement was not sent …`).
+- A syntax error in a statement executed with parameters is the server's
+  answer to the prepare, which carries no `parse error: ` in front; the
+  statement is no longer sent a second time to get the other wording.
+- Against a server before 0.349, a parameter in a literal's place in a
+  statement the server cannot prepare (`ALTER TABLE t SET (ttl = ?)`, `SET
+  SCAN BUDGET ROWS ?`) throws the server's parse error: such a server does
+  not mark that refusal, and the driver no longer sends every refused
+  statement as text. Write the value into the text there. `CREATE INDEX …
+  WHERE v > ?` and the like, refused with `statement kind cannot be
+  prepared` by every server, fall back as before.
+- On a pool, a borrower's `USE`, `SET CONSISTENCY`, `SET SCAN BUDGET` and
+  open transaction end with its checkout. A `USE` on a pool without a
+  `database` argument does not carry over to later borrowers (as since
+  1.5.1); the connection is now reset with `USE default` instead of closed.
+- `isUsable()` is false, and the connection broken, as soon as the server
+  has closed it — not only after a statement failed on it.
+
 ## [1.5.1] - 2026-11-16
 
 ### Fixed
