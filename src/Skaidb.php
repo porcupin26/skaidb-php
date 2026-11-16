@@ -390,7 +390,13 @@ class Connection
                 }
             } catch (SkaidbException $e) {
                 if ($this->order === null || !Pool::memberFault($e)) {
-                    $this->close();
+                    // Only the socket, not close(): that is terminal, and
+                    // this may be a re-dial (ensureLive), which the next
+                    // statement tries again.
+                    if (is_resource($this->sock)) {
+                        @fclose($this->sock);
+                    }
+                    $this->sock = null;
                     throw $e;
                 }
                 // Pooled: a member that dropped or refused the handshake (a

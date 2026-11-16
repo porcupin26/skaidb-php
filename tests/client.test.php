@@ -436,6 +436,33 @@ test('reconnect: a connection the server dropped re-dials on the next statement 
     $srv->stop();
 });
 
+test('reconnect: a re-dial the server turns away in its handshake leaves the connection broken, not closed', function () {
+    // A node at capacity closes a new connection unanswered (PROTOCOL.md
+    // §6), and a node on its way up or down may do the same: a connection
+    // failure like any other, tried again by the next statement.
+    $full = tempnam(sys_get_temp_dir(), 'skaidb-full-');
+    unlink($full);
+    $srv = (new FakeServer([
+        'handle' => fn (array $req) => $req['op'] === 1 ? F::rows(['n'], [[1]]) : null,
+        'refuse' => fn () => file_exists($full),
+    ]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
+    touch($full);
+    // Each of these dials, reaches the server and is turned away.
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
+    assert_true(!$db->isUsable());
+    unlink($full);
+    assert_eq(1, $db->query('SELECT 1')->rowCount());
+    assert_true($db->isUsable());
+    assert_eq(2, $srv->connections(), 'the first connection and the one that got in; nothing leaked in between');
+    $db->close();
+    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection is closed$/');
+    $srv->stop();
+});
+
 test('reconnect: close() is terminal for a broken connection too — its next statement does not dial', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');

@@ -176,10 +176,12 @@ next statement re-dials through the seed list (a pooled connection: through
 the pool's members, usable ones first and the one it lost last),
 re-authenticates, re-sends `USE`, re-sends the Hello and clears the
 prepared-statement cache, then runs. The failed statement is never retried
-by the driver. The new session has no transaction open: a statement sent
-after a transport error inside a hand-written `BEGIN` … `COMMIT`
-autocommits, so stop and start the transaction again (`transaction()`
-refuses to send it).
+by the driver. A re-dial that fails — no endpoint reachable, or a server
+that turns the new connection away — throws its own error and leaves the
+connection broken, so the statement after it dials again. The new session
+has no transaction open: a statement sent after a transport error inside a
+hand-written `BEGIN` … `COMMIT` autocommits, so stop and start the
+transaction again (`transaction()` refuses to send it).
 
 ## `Statement`
 
