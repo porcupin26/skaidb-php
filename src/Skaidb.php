@@ -1935,6 +1935,10 @@ class Statement
      * individually: a failure names the row and earlier rows stay applied,
      * so the statement must be idempotent. Returns total affected rows.
      *
+     * A statement the server declines to prepare (DDL, session statements)
+     * cannot travel in one request: it runs once per row with the values
+     * quoted client-side, as execute() runs it, under the same rules.
+     *
      * @param array<int,array<int,mixed>> $rows
      */
     public function executeBatch(array $rows): int
@@ -1942,7 +1946,11 @@ class Statement
         if ($rows === []) {
             return 0;
         }
-        [$id, $n] = $this->conn->prepareServer($this->sql);
+        try {
+            [$id, $n] = $this->conn->prepareServer($this->sql);
+        } catch (Unpreparable $e) {
+            return $this->executeBatchAsText($rows, $e);
+        }
         foreach ($rows as $r) {
             if (count($r) !== $n) {
                 throw new SkaidbException(
@@ -1960,6 +1968,69 @@ class Statement
     }
 
     /**
+     * executeBatch() for a statement the server declined to prepare: one
+     * text statement per row, in order, each a round trip. What a batch
+     * promises still holds. Every row is bound before the first is sent, so
+     * a row that cannot be bound stops the batch with nothing applied. Rows
+     * autocommit one by one, and the first failing row ends the batch with
+     * an error naming it and the rows that ran before it, which stay
+     * applied. The total affected count is returned.
+     *
+     * @param array<int|string,array<int|string,mixed>> $rows
+     */
+    private function executeBatchAsText(array $rows, Unpreparable $declined): int
+    {
+        $bound = [];
+        foreach (array_values($rows) as $i => $r) {
+            try {
+                $bound[] = $this->bindText($r, $declined);
+            } catch (SkaidbException $e) {
+                throw new SkaidbException("batch row {$i}: " . $e->getMessage());
+            }
+        }
+        $total = 0;
+        foreach ($bound as $i => $sql) {
+            try {
+                $res = $this->conn->runQuery($sql, $this->consistency);
+            } catch (SkaidbException $e) {
+                throw new SkaidbException(
+                    "batch row {$i}: " . $e->getMessage() . " ({$i} rows applied before it)",
+                    0,
+                    $e
+                );
+            }
+            $total += $res['affected'];
+        }
+        $this->conn->noteStatement($this->sql);
+        return $total;
+    }
+
+    /**
+     * $params quoted into the SQL client-side: the text a statement without
+     * parameters, or one the server declined to prepare ($declined), is sent
+     * as.
+     *
+     * @param array<int|string,mixed> $params
+     */
+    private function bindText(array $params, ?Unpreparable $declined): string
+    {
+        try {
+            return Connection::bindParams($this->sql, $params);
+        } catch (SkaidbException $e) {
+            if ($declined !== null) {
+                // The text path cannot carry this value; the real reason
+                // is whatever made the server decline to prepare it
+                // (often a syntax error), so say so.
+                throw new SkaidbException(
+                    $e->getMessage() . ' via client-side binding; the server declined to '
+                    . 'prepare the statement: ' . $declined->getMessage()
+                );
+            }
+            throw $e;
+        }
+    }
+
+    /**
      * Bind $params into the SQL and run it. Returns true on success (mirrors
      * PDOStatement::execute, which returns bool). Throws on error.
      *
@@ -1972,6 +2043,7 @@ class Statement
     public function execute(array $params = []): bool
     {
         $res = null;
+        $unpreparable = null;
         if ($params !== []) {
             // Server-side prepare so parameters travel as TYPED values;
             // arrays and documents have no SQL literal form.
@@ -1988,21 +2060,7 @@ class Statement
             }
         }
         if ($res === null) {
-            try {
-                $bound = Connection::bindParams($this->sql, $params);
-            } catch (SkaidbException $e) {
-                if (isset($unpreparable)) {
-                    // The text path cannot carry this value; the real reason
-                    // is whatever made the server decline to prepare it
-                    // (often a syntax error), so say so.
-                    throw new SkaidbException(
-                        $e->getMessage() . ' via client-side binding; the server declined to '
-                        . 'prepare the statement: ' . $unpreparable->getMessage()
-                    );
-                }
-                throw $e;
-            }
-            $res = $this->conn->runQuery($bound, $this->consistency);
+            $res = $this->conn->runQuery($this->bindText($params, $unpreparable), $this->consistency);
         }
         $this->conn->noteStatement($this->sql);
         $this->pos = 0;

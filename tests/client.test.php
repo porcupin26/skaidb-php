@@ -256,6 +256,82 @@ test('batch: one OP_EXECUTE_BATCH carries every row typed; total affected return
     $srv->stop();
 });
 
+test('batch: a statement the server declines to prepare runs once per row, quoted client-side', function () {
+    // Nothing prepares here, as on a server answering a DDL or session
+    // statement — or every statement, before prepared statements existed.
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        if ($req['op'] === 2) {
+            return F::error('statement kind cannot be prepared');
+        }
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        if (str_contains($req['sql'], "'refused'")) {
+            return F::error('constraint violation: refused');
+        }
+        return str_starts_with($req['sql'], 'INSERT') ? F::mutation(1) : F::ddl();
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    /** What followed the Hello: a statement's text, or its opcode. */
+    $sent = fn () => array_values(array_map(
+        fn ($r) => $r['op'] === 1 ? $r['sql'] : "op {$r['op']}",
+        array_filter($srv->requests(), fn ($r) => !in_array($r['op'], ['connect', 8], true))
+    ));
+
+    // The total affected count, as a batch returns it; one statement per
+    // row, in order, with the values execute() would have quoted.
+    $st = $db->prepare('INSERT INTO t (id, name) VALUES (?, ?)');
+    assert_eq(3, $st->executeBatch([[1, "O'Brien"], ['id' => 2, 'name' => null], [3, 2.5]]));
+    assert_eq([
+        'op 2',
+        "INSERT INTO t (id, name) VALUES (1, 'O''Brien')",
+        'INSERT INTO t (id, name) VALUES (2, NULL)',
+        'INSERT INTO t (id, name) VALUES (3, 2.5)',
+    ], $sent());
+    // A statement with no affected count adds nothing, as in a server batch.
+    assert_eq(0, $db->prepare('ALTER TABLE t SET (ttl = ?)')->executeBatch([[60], [120]]));
+    assert_eq(['op 2', 'ALTER TABLE t SET (ttl = 60)', 'ALTER TABLE t SET (ttl = 120)'], array_slice($sent(), 4));
+
+    // The first failing row ends the batch: the error names it and the rows
+    // applied before it, and the rows after it are not sent.
+    $e = assert_throws(
+        SkaidbException::class,
+        fn () => $st->executeBatch([[4, 'ok'], [5, 'refused'], [6, 'never']]),
+        '/^batch row 1: constraint violation: refused \(1 rows applied before it\)$/'
+    );
+    assert_eq(SkaidbException::class, get_class($e), 'never the internal Unpreparable');
+    assert_eq(
+        ['op 2', "INSERT INTO t (id, name) VALUES (4, 'ok')", "INSERT INTO t (id, name) VALUES (5, 'refused')"],
+        array_slice($sent(), 7)
+    );
+    assert_true($db->isUsable());
+
+    // Every row is bound before the first is sent: a row with the wrong
+    // parameter count, or a value with no SQL literal form, applies nothing.
+    $declined = 'via client-side binding; the server declined to prepare the statement: statement kind cannot be prepared$/';
+    $e = assert_throws(
+        SkaidbException::class,
+        fn () => $st->executeBatch([[7, 'a'], [8]]),
+        '/^batch row 1: more placeholders than parameters ' . $declined
+    );
+    assert_eq(SkaidbException::class, get_class($e));
+    assert_throws(
+        SkaidbException::class,
+        fn () => $st->executeBatch([[9, 'a'], [10, 'b', 'c']]),
+        '/^batch row 1: more parameters than placeholders ' . $declined
+    );
+    assert_throws(
+        SkaidbException::class,
+        fn () => $st->executeBatch([[11, ['a', 'list']]]),
+        '/^batch row 0: cannot bind value of type array ' . $declined
+    );
+    assert_eq(['op 2', 'op 2', 'op 2'], array_slice($sent(), 10), 'only the three prepares: no row was sent');
+    assert_eq(0, $st->executeBatch([]));
+    assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
 test('multiple result sets: a CALL that EMITs exposes every set, the last one as the rows', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');

@@ -188,8 +188,17 @@ Runs the statement once per row in one round-trip (`OP_EXECUTE_BATCH`) and
 returns the total affected count. Every row must have the statement's
 parameter count. Rows autocommit individually: on the first failing row the
 server answers with an error naming the row and how many applied before it,
-and those stay applied. Only preparable statements can be batched. An empty
-`$rows` returns 0 without a round-trip.
+and those stay applied. An empty `$rows` returns 0 without a round-trip.
+
+If the server declines to prepare the statement (DDL, session statements),
+it runs once per row instead, each row's values quoted client-side as
+`execute()` quotes them: one round-trip per row, the same rules. Every row
+is bound before the first is sent, so a row with the wrong parameter count
+or a value that has no SQL literal form throws with nothing applied
+(`batch row N: … via client-side binding; the server declined to prepare
+the statement: …`); the first failing row ends the batch with `batch row
+N: <its error> (N rows applied before it)`; the total affected count is
+returned.
 
 ### `fetch(): ?array`
 
@@ -307,7 +316,8 @@ call that runs a statement — `exec()`, `query()`, `execute()`,
 counts nothing against a pool member. `transaction()` retries on it.
 `Unpreparable extends SkaidbException` is what `prepareServer()` (an
 `@internal` method) throws when the server declines to prepare a statement;
-`execute()` catches it and falls back, so user code never sees it.
+`execute()` and `executeBatch()` catch it and fall back, so user code never
+sees it.
 
 ## Hello and the `drivers` table
 

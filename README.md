@@ -199,9 +199,15 @@ Runs a prepared statement once per row in a single request and returns the
 **total** affected count. Rows **autocommit individually**: on the first
 failing row the server answers with an error naming the row index and how
 many rows applied before it, and those earlier rows stay applied — use
-idempotent statements. Only preparable statements (`SELECT`/`INSERT`/
-`UPDATE`/`DELETE`) can be batched; the whole request must fit one 64 MiB
-frame. An empty batch returns 0 without a round-trip.
+idempotent statements. The whole request must fit one 64 MiB frame. An
+empty batch returns 0 without a round-trip.
+
+A statement the server declines to prepare (DDL, session statements) cannot
+travel in one request: `executeBatch()` runs it once per row, each row's
+values quoted client-side as `execute()` quotes them. The result and the
+rules are the same — the total affected count, rows applied one by one, an
+error naming the first failing row and how many ran before it — at one
+round-trip per row.
 
 ### Multiple result sets
 
