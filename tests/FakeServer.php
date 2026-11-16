@@ -160,6 +160,9 @@ final class FakeServer
      *              post-handshake request; Hello is answered with Ddl unless
      *              the handler returns something. An empty list answers
      *              nothing and keeps the connection open (a stalled server).
+     *              $req['conn'] numbers the connection it arrived on (1, 2,
+     *              … in accept order), for state that is per connection, as
+     *              a prepared statement's id is; requests() does not carry it.
      *   refuse   — fn(): bool, called at every accept; true closes the new
      *              connection before the handshake (a node at capacity).
      */
@@ -288,6 +291,7 @@ final class FakeServer
             $this->dropAll = true;
         });
         stream_set_blocking($this->listener, false);
+        $accepted = 0;
         while (true) {
             if (posix_getppid() === 1) {
                 exit(0); // the test process is gone
@@ -319,7 +323,7 @@ final class FakeServer
                     if ($client !== false) {
                         stream_set_blocking($client, false);
                         $conns[(int) $client] = ['sock' => $client, 'buf' => '', 'state' => 'start',
-                            'user' => '', 'salted' => '', 'authMessage' => ''];
+                            'user' => '', 'salted' => '', 'authMessage' => '', 'n' => ++$accepted];
                         $this->record(['op' => 'connect']);
                     }
                     continue;
@@ -431,7 +435,7 @@ final class FakeServer
         $req = self::parseRequest($payload);
         $req['user'] = $conn['user'];
         $this->record($req);
-        $out = ($this->handler)($req);
+        $out = ($this->handler)($req + ['conn' => $conn['n']]);
         if ($out === null) {
             $out = $req['op'] === 8 ? F::ddl() : F::error("fake server: unhandled op {$req['op']}");
         }

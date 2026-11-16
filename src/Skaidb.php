@@ -185,6 +185,17 @@ class Connection
 
     private const CONSISTENCY_BY_NAME = ['ONE' => 0, 'QUORUM' => 1, 'ALL' => 2];
 
+    /**
+     * Prepared statements kept per connection. A server holds at most 256
+     * for one connection and refuses every prepare beyond that; the cache
+     * stays below it, so a statement that does not fit can still be prepared
+     * before the one it replaces is closed.
+     */
+    private const PREPARED_CACHE_MAX = 240;
+
+    /** What the server's refusal starts with when a connection's statement table is full. */
+    private const STATEMENT_TABLE_FULL = 'too many prepared statements';
+
     /** @var resource|null the TCP stream */
     private $sock;
 
@@ -192,7 +203,7 @@ class Connection
 
     private bool $closed = false;
 
-    /** @var array<string,array{0:int,1:int}> */
+    /** @var array<string,array{0:int,1:int}> SQL text => [id, paramCount], the least recently used first */
     private array $preparedCache = [];
 
     /**
@@ -1012,6 +1023,13 @@ class Connection
      * connection that created it. Throws Unpreparable for statement kinds
      * the server declines (DDL, session statements).
      *
+     * The cache keeps the PREPARED_CACHE_MAX most recently used statements.
+     * One more pushes the least recently used out and closes it on the
+     * server (OP_CLOSE), which would otherwise keep every statement a
+     * connection ever prepared until its table of 256 was full. A Statement
+     * holds SQL, never an id, so one whose entry went is simply prepared
+     * again by its next execute().
+     *
      * @internal
      * @return array{0:int,1:int}
      */
@@ -1020,7 +1038,11 @@ class Connection
         $this->assertNotStreaming();
         $this->ensureLive();
         if (isset($this->preparedCache[$sql])) {
-            return $this->preparedCache[$sql];
+            // Used now: to the back of the queue.
+            $hit = $this->preparedCache[$sql];
+            unset($this->preparedCache[$sql]);
+            $this->preparedCache[$sql] = $hit;
+            return $hit;
         }
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
@@ -1031,9 +1053,15 @@ class Connection
         if ($tag === 4) { // Prepared
             $id = $r->u32();
             $nparams = $r->u16();
-            if (count($this->preparedCache) < 240) {
-                $this->preparedCache[$sql] = [$id, $nparams];
+            if (count($this->preparedCache) >= self::PREPARED_CACHE_MAX) {
+                // Forgotten before it is closed: the server issues a closed
+                // id again, to another statement.
+                $oldest = array_key_first($this->preparedCache);
+                $evicted = $this->preparedCache[$oldest][0];
+                unset($this->preparedCache[$oldest]);
+                $this->closePrepared($evicted);
             }
+            $this->preparedCache[$sql] = [$id, $nparams];
             return [$id, $nparams];
         }
         if ($tag === 3) {
@@ -1044,11 +1072,30 @@ class Connection
                 // again.
                 throw new TransactionConflictException($msg);
             }
+            if (str_starts_with($msg, self::STATEMENT_TABLE_FULL)) {
+                // Not "declined" either. The statement can be prepared, the
+                // connection has no slot for it; as text its values would
+                // be typed by their literals instead — a timestamp a
+                // number, bytes a hex string — and a list or a document
+                // not at all.
+                throw new SkaidbException($msg);
+            }
             throw new Unpreparable($msg);
         }
         // As for any reply the driver cannot place: see roundtrip().
         $this->markBroken();
         throw new SkaidbException("unexpected prepare response tag {$tag}");
+    }
+
+    /**
+     * Free a prepared statement's slot on the server: OP_CLOSE=4, u32 LE
+     * statement id (PROTOCOL.md §3.3). The answer is read and dropped — Ddl,
+     * or an Error for an id the server does not hold; the slot is free
+     * either way. A transport failure is thrown, as from any round trip.
+     */
+    private function closePrepared(int $id): void
+    {
+        $this->exchange(pack('C', 4) . pack('V', $id));
     }
 
     /**

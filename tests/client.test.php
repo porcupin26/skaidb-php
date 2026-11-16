@@ -280,6 +280,141 @@ test('prepared: a mutation through execute() reports rowCount', function () {
     $srv->stop();
 });
 
+/**
+ * A server with a real statement table (PROTOCOL.md §3.3): per connection,
+ * at most $max prepared statements; an id is the lowest free slot, so every
+ * connection starts at 0 and a closed id is issued again; OP_CLOSE frees
+ * one. OP_EXECUTE answers one row [ran, params]: the SQL that id names on
+ * this connection, and the values as they arrived. OP_EXECUTE_BATCH answers
+ * Mutation(rows) when that SQL is an UPDATE and Mutation(1000 + rows) for
+ * anything else. A text statement answers [ran: 'as text', params: [sql]].
+ */
+function table_server(int $max = 256): FakeServer
+{
+    return (new FakeServer(['handle' => function (array $req) use ($max) {
+        static $tables = [];
+        $tables[$req['conn']] ??= [];
+        $table = &$tables[$req['conn']];
+        $unknown = fn () => F::error("unknown prepared statement id {$req['id']}");
+        switch ($req['op']) {
+            case 1:
+                return F::rows(['ran', 'params'], [['as text', [$req['sql']]]]);
+            case 2:
+                if (count($table) >= $max) {
+                    return F::error("too many prepared statements (max {$max}); close some first");
+                }
+                for ($id = 0; isset($table[$id]); $id++) {
+                }
+                $table[$id] = $req['sql'];
+                return F::prepared($id, substr_count($req['sql'], '?'));
+            case 3:
+                return isset($table[$req['id']])
+                    ? F::rows(['ran', 'params'], [[$table[$req['id']], $req['params']]])
+                    : $unknown();
+            case 4:
+                if (!isset($table[$req['id']])) {
+                    return $unknown();
+                }
+                unset($table[$req['id']]);
+                return F::ddl();
+            case 7:
+                return isset($table[$req['id']])
+                    ? F::mutation((str_starts_with($table[$req['id']], 'UPDATE') ? 0 : 1000) + count($req['rows']))
+                    : $unknown();
+        }
+        return null;
+    }]))->start();
+}
+
+/**
+ * The most prepared statements a server held open at once, replayed from
+ * the requests it logged (every OP_PREPARE taken, every OP_CLOSE honoured).
+ */
+function table_high_water(FakeServer $srv): int
+{
+    $open = 0;
+    $max = 0;
+    foreach ($srv->requests() as $r) {
+        if ($r['op'] === 'connect') {
+            $open = 0;
+        } elseif ($r['op'] === 2) {
+            $max = max($max, ++$open);
+        } elseif ($r['op'] === 4) {
+            $open--;
+        }
+    }
+    return $max;
+}
+
+test('prepared: 300 distinct statements on one connection all travel typed — the server\'s table never fills', function () {
+    $srv = table_server(256);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $ts = new \DateTimeImmutable('2024-02-29T23:59:59.123Z');
+    // A statement the application holds from before the others.
+    $held = $db->prepare('SELECT ? AS held, ? AS list');
+    $held->execute([0, ['first']]);
+    assert_eq('SELECT ? AS held, ? AS list', $held->fetchColumn());
+    for ($i = 0; $i < 300; $i++) {
+        // A list has no literal form at all; a timestamp's is a number.
+        $sql = "INSERT INTO t (id, a{$i}, tags, ts) VALUES (?, 1, ?, ?)";
+        $st = $db->prepare($sql);
+        $st->execute([$i, ['a', $i], $ts]);
+        $row = $st->fetch();
+        assert_eq($sql, $row['ran'], "statement {$i} ran as another, or as text");
+        assert_eq([$i, ['a', $i]], array_slice($row['params'], 0, 2), "statement {$i}");
+        assert_true($row['params'][2] instanceof \DateTimeImmutable, "statement {$i}: the timestamp arrived as " . gettype($row['params'][2]));
+    }
+    // The held statement was pushed out of the cache and closed on the
+    // server meanwhile; its id may name another statement there by now.
+    // It runs as itself again, prepared anew.
+    $held->execute([1, ['again']]);
+    assert_eq(['ran' => 'SELECT ? AS held, ? AS list', 'params' => [1, ['again']]], $held->fetch());
+    // One it used a moment ago is still prepared: no second OP_PREPARE.
+    $held->execute([2, []]);
+    $requests = $srv->requests();
+    $count = fn (int $op) => count(array_filter($requests, fn ($r) => $r['op'] === $op));
+    assert_eq(0, $count(1), 'nothing went as text');
+    assert_eq(303, $count(3));
+    assert_eq(302, $count(2), 'the held statement was prepared twice, every other once');
+    assert_true(table_high_water($srv) < 256, 'the server held ' . table_high_water($srv) . ' statements at once');
+    assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('prepared: a batch on a full cache is prepared, sent typed and leaves the table bounded', function () {
+    $srv = table_server(256);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    for ($i = 0; $i < 300; $i++) {
+        $n = $db->prepare("UPDATE t SET a{$i} = ?, tags = ? WHERE id = ?")->executeBatch([[1, ['x'], 1], [2, [], 2]]);
+        assert_eq(2, $n, "batch {$i}");
+    }
+    $requests = $srv->requests();
+    assert_eq(0, count(array_filter($requests, fn ($r) => $r['op'] === 1)), 'no batch fell back to text rows');
+    assert_eq(300, count(array_filter($requests, fn ($r) => $r['op'] === 7)));
+    assert_true(table_high_water($srv) < 256, 'the server held ' . table_high_water($srv) . ' statements at once');
+    $db->close();
+    $srv->stop();
+});
+
+test('prepared: a prepare refused because the server\'s table is full is the statement\'s error, not a text fallback', function () {
+    // A table already full, whoever filled it: the statement could be
+    // prepared, so sending it as text would only change how its values are
+    // typed (a timestamp as a number, bytes as a hex string).
+    $srv = table_server(0);
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $full = '/^too many prepared statements \(max 0\); close some first$/';
+    $st = $db->prepare('INSERT INTO t (id, ts) VALUES (?, ?)');
+    $e = assert_throws(SkaidbException::class, fn () => $st->execute([1, new \DateTimeImmutable('@0')]), $full);
+    assert_eq(SkaidbException::class, get_class($e));
+    $e = assert_throws(SkaidbException::class, fn () => $st->executeBatch([[1, 'a'], [2, 'b']]), $full);
+    assert_eq(SkaidbException::class, get_class($e));
+    assert_true($db->isUsable(), 'a statement error: the connection stays usable');
+    assert_eq([2, 2], array_values(array_map(fn ($r) => $r['op'], array_filter($srv->requests(), fn ($r) => is_int($r['op']) && $r['op'] !== 8))), 'two refused prepares, and nothing as text');
+    $db->close();
+    $srv->stop();
+});
+
 test('batch: one OP_EXECUTE_BATCH carries every row typed; total affected returned', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');

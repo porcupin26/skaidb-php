@@ -64,7 +64,10 @@ Mirrors `PDO::query`.
 
 Returns a `Statement` to `execute()` with parameters. Nothing is sent until
 `execute()`; the server-side prepare happens on the first execute with
-parameters and is cached per connection (up to 240 distinct statements).
+parameters and is cached per connection. The 240 most recently used
+statements stay prepared; one more closes the least recently used on the
+server (`OP_CLOSE` — a server keeps at most 256 per connection), and a
+`Statement` whose entry went is prepared again by its next `execute()`.
 
 ### `transaction(callable $body, int $attempts = 3, string $begin = 'BEGIN'): mixed`
 
@@ -206,8 +209,11 @@ re-indexed) and runs the statement. With a non-empty `$params` the
 statement is prepared on the server and the values travel typed; the
 parameter count must equal the statement's placeholder count
 (`statement expects N parameters, got M`). If the server declines to
-prepare it (DDL, `USE`), the values are quoted client-side instead. Returns
-`true`; throws on error.
+prepare it (DDL, `USE`), the values are quoted client-side instead. A
+prepare refused because the connection's statement table is full (`too
+many prepared statements …`) is not such a case: it is thrown, since as
+text the values would be typed by their literals. Returns `true`; throws on
+error.
 
 ### `executeBatch(array $rows): int`
 

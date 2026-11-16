@@ -175,18 +175,22 @@ Placeholders are `?`, positional, in order; a `?` inside a string literal is
 left alone. Statements on one connection run one at a time.
 
 With parameters the driver **prepares the statement on the server** (once
-per distinct SQL text per connection, cached up to 240 entries) and sends the
-values as **typed binary** — no string interpolation, no injection surface.
-That is also the only way to send an `Array` or a `Document`, which have no
-SQL literal form. The statement's parameter count must match what you pass
-(a mismatch throws before anything runs).
+per distinct SQL text per connection; the 240 most recently used stay
+prepared, and one pushed out is closed on the server and prepared again
+when it is next used) and sends the values as **typed binary** — no string
+interpolation, no injection surface. That is also the only way to send an
+`Array` or a `Document`, which have no SQL literal form. The statement's
+parameter count must match what you pass (a mismatch throws before anything
+runs).
 
 Statements the server declines to prepare (DDL, `USE` and other session
 statements) fall back to client-side quoting of the same `?` parameters, so
 every statement kind accepts parameters; arrays and documents cannot travel
 that way and throw (the message names the reason the server would not
 prepare the statement). Prepared ids are scoped to a connection and the cache
-is dropped on reconnect.
+is dropped on reconnect. A server keeps at most 256 prepared statements per
+connection; the driver stays below that, and a prepare the server refuses
+with `too many prepared statements` is thrown rather than sent as text.
 
 ### Batches — many rows, one round-trip
 
