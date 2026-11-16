@@ -92,7 +92,8 @@ certificate is verified against. See [TLS](tls.md).
 new Connection(seeds: ['db1:7000', 'db2:7000', 'db3:7000'], user: 'app', password: $pw);
 ```
 
-The seeds are shuffled and tried until one connects. The same walk runs
+The seeds are shuffled and tried until one connects and answers the
+handshake. The same walk runs
 when a connection is lost later: the next statement re-dials,
 re-authenticates, re-selects the database and runs. The statement that was in
 flight when the connection died throws and is never retried by the driver

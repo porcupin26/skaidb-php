@@ -119,8 +119,11 @@ instead (see TLS below).
 
 skaidb is leaderless: every node accepts reads and writes, so a seed list is
 only "somewhere to land". The seeds are shuffled and tried in turn until one
-connects; if none does the constructor throws `no reachable endpoint in
-<list>: <last error>`. The same walk runs again on reconnect, so a connection
+connects and completes the handshake: a seed that refuses the connection, or
+closes it during the handshake (a node at capacity does), is walked past. If
+none is left the constructor throws `no reachable endpoint in <list>: <last
+error>`. A refused login stops the walk at once — it would be refused on
+every member. The same walk runs again on reconnect, so a connection
 survives the node it was talking to going away.
 
 ### TLS

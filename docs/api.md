@@ -32,12 +32,14 @@ new Connection(
 )
 ```
 
-Connects (walking the shuffled seeds until one accepts), runs the
-SCRAM-SHA-256 handshake, verifies the server signature when `$password` is
-non-empty, sends the Hello frame and issues `USE $database` if given.
-Throws on any failure (`no reachable endpoint in <list>: ...`,
-`authentication denied: ...`, `server signature mismatch (mutual auth
-failed)`).
+Walks the shuffled seeds until one connects and completes the SCRAM-SHA-256
+handshake — a seed that refuses the connection, or closes it during the
+handshake (a node at capacity), is walked past — verifies the server
+signature when `$password` is non-empty, sends the Hello frame and issues
+`USE $database` if given. Throws on any failure (`no reachable endpoint in
+<list>: ...` when no seed is left; `authentication denied: ...` and `server
+signature mismatch (mutual auth failed)` at once, without trying the next
+seed).
 
 With `$authMechanism = 'certificate'` (also accepted: `'external'`,
 `'x509'`) the handshake is EXTERNAL: the client certificate is the

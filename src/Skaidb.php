@@ -383,6 +383,7 @@ class Connection
         }
         $tried = [];
         $why = '';
+        $refused = null; // the last endpoint's handshake failure, when that is how it failed
         foreach ($endpoints as $ep) {
             $tried[] = $ep;
             $sock = @stream_socket_client(
@@ -395,6 +396,7 @@ class Connection
             );
             if ($sock === false) {
                 $why = "{$errstr} ({$errno})";
+                $refused = null;
                 $this->pool?->failed($ep);
                 continue;
             }
@@ -411,25 +413,25 @@ class Connection
                     $this->handshake($user, $password);
                 }
             } catch (SkaidbException $e) {
-                if ($this->order === null || !Pool::memberFault($e)) {
-                    // Only the socket, not close(): that is terminal, and
-                    // this may be a re-dial (ensureLive), which the next
-                    // statement tries again.
-                    if (is_resource($this->sock)) {
-                        @fclose($this->sock);
-                    }
-                    $this->sock = null;
-                    throw $e;
-                }
-                // Pooled: a member that dropped or refused the handshake (a
-                // capacity refusal included) is a failed dial — try the next
-                // on a clean slate.
+                // Only the socket, not close(): that is terminal, and this
+                // may be a re-dial (ensureLive), which the next statement
+                // tries again.
                 if (is_resource($this->sock)) {
                     @fclose($this->sock);
                 }
                 $this->sock = null;
+                if (!Pool::memberFault($e)) {
+                    // A refused login is the caller's, and the same on
+                    // every member: the walk ends here.
+                    throw $e;
+                }
+                // A member that dropped or refused the handshake (a
+                // capacity refusal included) is a failed dial, as one that
+                // refused the connection is — try the next on a clean
+                // slate.
                 $this->broken = false;
                 $why = $e->getMessage();
+                $refused = $e;
                 $this->pool?->failed($ep);
                 continue;
             }
@@ -438,6 +440,10 @@ class Connection
             break;
         }
         if ($this->sock === null) {
+            if ($refused !== null && $this->order === null && count($tried) === 1) {
+                // One endpoint and nothing to walk: its own error.
+                throw $refused;
+            }
             $list = implode(', ', $tried);
             throw new SkaidbException("no reachable endpoint in {$list}: {$why}");
         }
