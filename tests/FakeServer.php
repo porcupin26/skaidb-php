@@ -371,8 +371,8 @@ final class FakeServer
         stream_set_blocking($this->listener, false);
         $accepted = 0;
         while (true) {
-            if (posix_getppid() === 1) {
-                exit(0); // the test process is gone
+            if (posix_getppid() !== $this->owner) {
+                exit(0); // the test process is gone (and init, or a subreaper, has adopted this one)
             }
             if ($this->dropAll) {
                 $this->dropAll = false;

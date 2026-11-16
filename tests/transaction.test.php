@@ -1216,6 +1216,47 @@ test('transport: a re-dial that loses its Hello fails the statement with a trans
     $srv->stop();
 });
 
+test('transport: a dial that loses its connection while putting the session back fails once — it does not dial again from inside itself', function () {
+    // While the flag file exists every connection is dropped at its Hello:
+    // it authenticates, and is gone before the session's state is sent.
+    $down = tempnam(sys_get_temp_dir(), 'skaidb-down-');
+    unlink($down);
+    $srv = (new FakeServer(['handle' => function (array $req) use ($down) {
+        if ($req['op'] === 8) {
+            return file_exists($down) ? FakeServer::DROP : F::ddl();
+        }
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        return str_starts_with($req['sql'], 'SELECT') ? F::rows(['n'], [[3]]) : F::ddl();
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 2.0, 'app');
+    $db->exec('SET CONSISTENCY ALL');
+    $db->exec('SET SCAN BUDGET ROWS 5');
+    touch($down);
+    $srv->closeAll();
+    // One statement, one dial, one transport error: the statements a dial
+    // sends travel on the connection being dialled, or not at all.
+    foreach ([2, 3, 4] as $connections) {
+        assert_throws(ConnectionException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server \(write\)$/');
+        assert_eq($connections, $srv->connections(), 'the dial retried itself');
+        assert_true(!$db->isUsable());
+    }
+    // A new connection with a database to enter, the same.
+    assert_throws(
+        ConnectionException::class,
+        fn () => new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 2.0, 'app'),
+        '/^connection closed by server \(write\)$/'
+    );
+    assert_eq(5, $srv->connections());
+    unlink($down);
+    assert_eq(3, $db->query('SELECT 1')->fetchColumn());
+    assert_eq(['USE "app"', 'SET CONSISTENCY ALL', 'SET SCAN BUDGET ROWS 5', 'SELECT 1'], array_slice(txn_statements($srv), 3));
+    assert_eq(6, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
 test('transport: a lost connection is a ConnectionException, and a statement error is not', function () {
     $srv = txn_server([
         'SELECT gone' => [FakeServer::DROP],

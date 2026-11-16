@@ -325,6 +325,16 @@ class Connection
     private bool $adrift = false;
 
     /**
+     * dial() is putting the session's state back: the statements it sends
+     * for that travel on the connection being dialled, or not at all. If
+     * that connection is lost meanwhile they fail with its transport error
+     * and the dial fails with them; they must not re-dial — that would be
+     * dial() starting over from inside itself, for as long as the server
+     * keeps dropping the new connection.
+     */
+    private bool $dialling = false;
+
+    /**
      * The Pool that owns this connection (see Pool), or null outside one:
      * told each round trip's latency, each transport failure and each write,
      * and asked for the dial order when the connection re-dials.
@@ -553,15 +563,20 @@ class Connection
             'scan' => $this->scanBudgetNote,
         ];
         $left = false;
-        foreach ($restore as $what => $statement) {
-            if ($statement === null) {
-                continue;
+        $this->dialling = true;
+        try {
+            foreach ($restore as $what => $statement) {
+                if ($statement === null) {
+                    continue;
+                }
+                if ($what === $replaces) {
+                    $left = true;
+                    continue;
+                }
+                $this->exec($statement);
             }
-            if ($what === $replaces) {
-                $left = true;
-                continue;
-            }
-            $this->exec($statement);
+        } finally {
+            $this->dialling = false;
         }
         $this->adrift = $left;
     }
@@ -1908,6 +1923,11 @@ class Connection
         // it was closed: nothing dials again.
         if ($this->closed || ($this->sock === null && !$this->broken)) {
             throw new SkaidbException('connection is closed');
+        }
+        if ($this->dialling) {
+            // One of dial()'s own statements: it is written to the
+            // connection being dialled, whatever has become of it.
+            return;
         }
         if (!$this->broken && $this->peerGone()) {
             // Closed by the server while it sat idle (a restart, a
