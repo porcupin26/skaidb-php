@@ -542,6 +542,150 @@ test('transaction: a connection lost on the COMMIT is thrown — not retried, th
     $srv->stop();
 });
 
+// ---- a stream the body leaves open --------------------------------------------
+
+/**
+ * A script whose stream sends four rows in two chunks: after the first row
+ * the connection still owes a chunk and RowsEnd.
+ *
+ * @return array<string,array<int,array<int,string>>>
+ */
+function txn_stream_script(): array
+{
+    return ['SELECT n FROM t' => [[F::header(['n']), F::chunk([[1], [2]]), F::chunk([[3], [4]]), F::end()]]];
+}
+
+test('transaction: a body that returns with its stream open is not committed, and the connection is discarded', function () {
+    $srv = txn_server(txn_stream_script());
+    $db = txn_connect($srv);
+    $runs = 0;
+    // "The rows, lazily": the generator outlives the body, so the COMMIT
+    // cannot be sent on the busy connection.
+    $body = function (Connection $c) use (&$runs) {
+        $runs++;
+        $c->exec('UPDATE t SET n = 1');
+        $rows = $c->stream('SELECT n FROM t');
+        assert_eq(['n' => 1], $rows->current());
+        return $rows;
+    };
+    $e = assert_throws(SkaidbException::class, fn () => $db->transaction($body), '/^connection is busy streaming a result set/');
+    assert_eq(1, $runs, 'never run again for this');
+    // The transaction must not stay open on a live socket, where the next
+    // statement would silently join it: the socket is closed, so the server
+    // drops the session and the transaction with it.
+    assert_true(txn_wait(fn () => $srv->hangups() === 1), 'the connection still holds the socket the transaction is open on');
+    assert_eq(['BEGIN', 'UPDATE t SET n = 1', 'stream SELECT n FROM t'], txn_statements($srv), 'no COMMIT, no ROLLBACK');
+    assert_match('/the transaction was not committed and its connection was closed/', $e->getMessage());
+    // Afterwards the connection is as after any connection loss: the next
+    // statement runs on a new session, outside the abandoned transaction.
+    assert_true(!$db->isUsable());
+    assert_eq(1, $db->exec('UPDATE t SET n = 2'));
+    assert_eq(2, $srv->connections());
+    assert_eq(1, $db->transaction(fn (Connection $c) => $c->exec('UPDATE t SET n = 3')));
+    assert_eq(['UPDATE t SET n = 2', 'BEGIN', 'UPDATE t SET n = 3', 'COMMIT'], array_slice(txn_statements($srv), 3));
+    $db->close();
+    $srv->stop();
+});
+
+test('transaction: a body that throws with its stream open gets its own exception, and the connection is discarded', function () {
+    $srv = txn_server(txn_stream_script());
+    $db = txn_connect($srv);
+    $boom = new \RuntimeException('the body changed its mind');
+    $held = null;
+    $body = function (Connection $c) use (&$held, $boom) {
+        $c->exec('UPDATE t SET n = 1');
+        $held = $c->stream('SELECT n FROM t');   // kept beyond the body
+        assert_eq(['n' => 1], $held->current());
+        throw $boom;
+    };
+    $e = assert_throws(\RuntimeException::class, fn () => $db->transaction($body));
+    assert_true($e === $boom, 'the body\'s exception, unchanged');
+    assert_true($held instanceof \Generator);
+    // The ROLLBACK cannot be sent on the busy connection either.
+    assert_true(txn_wait(fn () => $srv->hangups() === 1), 'the connection still holds the socket the transaction is open on');
+    assert_eq(['BEGIN', 'UPDATE t SET n = 1', 'stream SELECT n FROM t'], txn_statements($srv));
+    // The stream is over. The chunk already read is still handed out; the
+    // rest went with the socket. Until the generator is let go the
+    // connection is busy, as with any stream.
+    assert_throws(SkaidbException::class, fn () => $db->exec('UPDATE t SET n = 2'), '/busy streaming/');
+    $seen = [];
+    assert_throws(SkaidbException::class, function () use ($held, &$seen) {
+        foreach ($held as $row) {
+            $seen[] = $row['n'];
+        }
+    }, '/^connection lost: the connection was closed with this stream still open$/');
+    assert_eq([1, 2], $seen);
+    $held = null;
+    assert_eq(1, $srv->connections(), 'nothing re-dialled while the stream was held');
+    assert_eq(1, $db->exec('UPDATE t SET n = 2'));
+    assert_eq(2, $srv->connections());
+    assert_eq(['UPDATE t SET n = 2'], array_slice(txn_statements($srv), 3));
+    $db->close();
+    $srv->stop();
+});
+
+test('transaction: a stream the body finished or abandoned itself does not cost the connection', function () {
+    $srv = txn_server(txn_stream_script());
+    $db = txn_connect($srv);
+    $first = $db->transaction(function (Connection $c) {
+        foreach ($c->stream('SELECT n FROM t') as $row) {
+            return $row['n'];             // abandoned: drained as the body returns
+        }
+    });
+    assert_eq(1, $first);
+    $all = $db->transaction(fn (Connection $c) => iterator_to_array($c->stream('SELECT n FROM t')));
+    assert_eq([1, 2, 3, 4], array_column($all, 'n'));
+    // A stream never started sends nothing, so it does not hold the connection.
+    $lazy = $db->transaction(fn (Connection $c) => $c->stream('SELECT n FROM t'));
+    assert_eq(
+        ['BEGIN', 'stream SELECT n FROM t', 'COMMIT', 'BEGIN', 'stream SELECT n FROM t', 'COMMIT', 'BEGIN', 'COMMIT'],
+        txn_statements($srv)
+    );
+    assert_true($db->isUsable());
+    assert_eq([1, 0], [$srv->connections(), $srv->hangups()]);
+    unset($lazy);
+    $db->close();
+    $srv->stop();
+});
+
+test('transaction: a body that closes the connection with its stream open leaves it closed — nothing re-dials', function () {
+    $srv = txn_server(txn_stream_script());
+    $db = txn_connect($srv);
+    $held = null;
+    $body = function (Connection $c) use (&$held) {
+        $held = $c->stream('SELECT n FROM t');
+        assert_eq(['n' => 1], $held->current());
+        $c->close();
+    };
+    assert_throws(SkaidbException::class, fn () => $db->transaction($body), '/busy streaming/');
+    $held = null;
+    // close() is terminal: giving the connection up must not make it one
+    // that dials again.
+    assert_throws(SkaidbException::class, fn () => $db->exec('UPDATE t SET n = 2'), '/^connection is closed$/');
+    assert_throws(SkaidbException::class, fn () => $db->exec('UPDATE t SET n = 2'), '/^connection is closed$/');
+    assert_eq(1, $srv->connections());
+    $srv->stop();
+});
+
+test('pool transaction: a connection whose body left a stream open is not pooled with the transaction open', function () {
+    $srv = txn_server(txn_stream_script());
+    $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 4);
+    assert_throws(SkaidbException::class, fn () => $pool->transaction(function (Connection $c) {
+        $c->exec('UPDATE t SET n = 1');
+        $rows = $c->stream('SELECT n FROM t');
+        assert_eq(['n' => 1], $rows->current());
+        return $rows;
+    }), '/busy streaming/');
+    $m = $pool->members()[0];
+    assert_eq([0, 0], [$m['in_use'], $m['idle']], 'the connection went back to the pool with its transaction open');
+    assert_true(txn_wait(fn () => $srv->hangups() === 1));
+    // The next borrower gets a new session: its statement autocommits.
+    assert_eq(1, $pool->withConnection(fn (Connection $c) => $c->exec('UPDATE t SET n = 2')));
+    assert_eq(2, $srv->connections());
+    $pool->close();
+    $srv->stop();
+});
+
 // ---- a broken connection lets go of its socket ------------------------------
 
 test('transaction: a read timeout in the body closes the socket at once — the server\'s session ends with it', function () {

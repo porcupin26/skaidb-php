@@ -89,6 +89,11 @@ Holding a generator in a variable keeps the connection busy until that
 variable is unset or goes out of scope. To run something else while a
 stream is open, use a second connection (a `Pool` makes that cheap).
 
+Inside [`transaction()`](api.md) finish every stream before the callback
+returns. A stream still open then keeps the `COMMIT` and the `ROLLBACK`
+from being sent, so the helper closes the connection (the server drops the
+transaction with it) and throws; the stream cannot be read further.
+
 ## Following a stream — `$db->subscribe($name, $after = null, $poll = 0.5)`
 
 For a table with `CREATE STREAM <name> ...`, `subscribe()` yields the

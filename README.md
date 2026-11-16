@@ -463,9 +463,17 @@ A failed `COMMIT` has ended the transaction, whatever the reason. A
 statement that fails inside one has not: the transaction stays open, to
 continue or to roll back. A `ROLLBACK` that finds no transaction open is an
 error on servers before 0.347.0, so never let a clean-up `ROLLBACK` replace
-the error being handled. A stream started in the body must be finished
-before the body returns — the connection is busy until then and cannot take
-the `COMMIT`.
+the error being handled.
+
+A stream started in the body must be finished before the body returns: the
+connection is busy until then and can take neither the `COMMIT` nor the
+`ROLLBACK`. If one is still open when the body ends — its generator was
+returned, or kept somewhere — `transaction()` closes the connection, so the
+server drops the transaction and no later statement can run inside it, and
+throws: the body's exception if it threw, otherwise `connection is busy
+streaming a result set: …`. Nothing was committed. The connection re-dials
+on the first statement after the stream is let go; a pool does not take it
+back.
 
 ## Client identification
 

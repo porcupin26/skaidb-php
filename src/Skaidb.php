@@ -555,8 +555,16 @@ class Connection
      *
      * $body can therefore run more than once: it must be safe to repeat, and
      * should do nothing outside the database that a repeat would do twice.
-     * A stream it starts must be finished before it returns (the connection
-     * is busy until then, so the COMMIT could not be sent).
+     *
+     * A stream $body starts must be finished before it returns: the
+     * connection is busy until then and can take neither the COMMIT nor the
+     * ROLLBACK. If one is still in flight when $body ends — the generator
+     * was returned, or kept somewhere — the connection is closed as a lost
+     * one is, so the server drops the transaction and nothing can run inside
+     * it later, and the call throws: $body's exception when it threw, else
+     * "connection is busy streaming a result set: …". Nothing was
+     * committed, and the connection re-dials on the first statement after
+     * the stream is released.
      *
      * Every statement of the transaction must travel on this one connection,
      * so a transport failure is never retried here, and from $begin to the
@@ -588,15 +596,25 @@ class Connection
                 try {
                     $value = $body($this);
                 } catch (\Throwable $e) {
-                    try {
-                        $this->exec('ROLLBACK');
-                    } catch (\Throwable $ignored) {
-                        // Clean-up only. A server may answer a ROLLBACK that
-                        // finds nothing open with an error, and a lost
-                        // connection cannot take one at all; the error to
-                        // report is the body's.
+                    if (!$this->discardIfStreaming()) {
+                        try {
+                            $this->exec('ROLLBACK');
+                        } catch (\Throwable $ignored) {
+                            // Clean-up only. A server may answer a ROLLBACK
+                            // that finds nothing open with an error, and a
+                            // lost connection cannot take one at all; the
+                            // error to report is the body's.
+                        }
                     }
                     throw $e;
+                }
+                if ($this->discardIfStreaming()) {
+                    throw new SkaidbException(
+                        'connection is busy streaming a result set: the transaction\'s body returned '
+                        . 'with a stream still open, so the COMMIT could not be sent — the transaction '
+                        . 'was not committed and its connection was closed (finish every stream '
+                        . 'before the body returns)'
+                    );
                 }
                 try {
                     $this->exec('COMMIT');
@@ -611,6 +629,29 @@ class Connection
                 $this->inTransaction = $outer;
             }
         }
+    }
+
+    /**
+     * transaction()'s body has ended: if a stream it started is still in
+     * flight, give the connection up and say so.
+     *
+     * The busy connection can take neither the COMMIT nor the ROLLBACK, and
+     * left as it is the transaction would stay open on a live socket: once
+     * the stream was finished or abandoned, the statements that follow —
+     * the next borrower's, on a pooled connection — would run inside it,
+     * and be lost with it. Only the generator can end its stream, so the
+     * connection is closed the way a lost one is (see markBroken): the
+     * server drops the session and the transaction with it. The generator
+     * finds no socket if it is read again, and the first statement after it
+     * is released re-dials.
+     */
+    private function discardIfStreaming(): bool
+    {
+        if (!$this->streaming) {
+            return false;
+        }
+        $this->markBroken();
+        return true;
     }
 
     /**
@@ -1339,6 +1380,9 @@ class Connection
      */
     private function markBroken(): void
     {
+        if ($this->closed) {
+            return; // closed is terminal: there is no socket, and nothing may re-dial
+        }
         $this->broken = true;
         if (is_resource($this->sock)) {
             @fclose($this->sock);
@@ -1386,14 +1430,19 @@ class Connection
     private function readExact(int $n): string
     {
         if (!is_resource($this->sock)) {
-            // Defence in depth, not a live path: finishStream() already
-            // returns on `closed` and on a non-resource socket before it
-            // reads anything, so an abandoned stream never arrives here
-            // with a dead socket. Kept because `fread(null, …)` is a
-            // TypeError rather than a SkaidbException, and one reachable
-            // caller past this guard would turn a closed connection into
-            // an error nobody catches.
-            throw new SkaidbException('connection is closed');
+            // A stream read on after its connection let go of the socket:
+            // close() ran, or transaction() gave the connection up because
+            // its body left this stream open (broken; the connection itself
+            // re-dials). An abandoned stream never arrives here —
+            // finishStream() returns on `closed` and on a non-resource
+            // socket before it reads anything. `fread(null, …)` would be a
+            // TypeError rather than a SkaidbException, an error nobody
+            // catches.
+            throw new SkaidbException(
+                $this->broken
+                    ? 'connection lost: the connection was closed with this stream still open'
+                    : 'connection is closed'
+            );
         }
         $buf = '';
         $remaining = $n;

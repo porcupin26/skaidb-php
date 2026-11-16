@@ -86,10 +86,21 @@ Runs `$body` inside a transaction on this connection: sends `$begin`, calls
   and no `ROLLBACK`.
 
 `$body` can run more than once, so it must be safe to repeat and should do
-nothing outside the database that a repeat would do twice. A stream it
-starts must be finished before it returns. `$begin` is sent verbatim:
-`'BEGIN'` on a standalone server, `'BEGIN ATOMIC'` or `'BEGIN ATOMIC
-PARTITION (col = literal)'` on a cluster.
+nothing outside the database that a repeat would do twice. `$begin` is sent
+verbatim: `'BEGIN'` on a standalone server, `'BEGIN ATOMIC'` or `'BEGIN
+ATOMIC PARTITION (col = literal)'` on a cluster.
+
+A stream `$body` starts must be finished before it returns. If one is still
+in flight when `$body` ends (the generator was returned, or kept
+somewhere), the connection can take neither the `COMMIT` nor the
+`ROLLBACK`: `transaction()` closes it as a lost connection is closed, so
+the server drops the transaction, and throws `$body`'s exception if it
+threw, otherwise `connection is busy streaming a result set: the
+transaction's body returned with a stream still open, …`. Nothing was
+committed and the transaction is not run again. Reading the stream on
+throws `connection lost: the connection was closed with this stream still
+open`; the connection re-dials on the first statement after the generator
+is released.
 
 From `$begin` to the `COMMIT` the connection does not re-dial: once the
 transport is lost, a further statement of the body, or the `COMMIT`, throws
