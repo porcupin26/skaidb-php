@@ -159,6 +159,47 @@ test('query: an unknown response tag throws', function () {
     $srv->stop();
 });
 
+test('desync: a frame the driver cannot place drops the connection — the next statement gets its own reply', function () {
+    // Each of these replies is followed by a frame nobody asked for. Left
+    // on the socket, it would answer the next statement, whose own reply
+    // would answer the one after, and so on.
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        $leftover = F::rows(['answer_to'], [['a leftover frame']]);
+        switch ($req['op']) {
+            case 1:
+                return $req['sql'] === 'SELECT garbage'
+                    ? [chr(42), $leftover]
+                    : F::rows(['answer_to'], [[$req['sql']]]);
+            case 2:
+                return str_starts_with($req['sql'], 'SELECT garbage') ? [chr(42), $leftover] : F::prepared(7, 1);
+            case 3:
+                return F::rows(['answer_to'], [['execute ' . json_encode($req['params'])]]);
+            case 5:
+                return [F::header(['n']), F::chunk([[1]]), chr(42), F::chunk([[2]]), F::end()];
+        }
+        return null;
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $desyncs = [
+        'a reply to a statement' => [fn () => $db->query('SELECT garbage'), '/^unknown response tag 42$/'],
+        'a reply to a prepare' => [fn () => $db->prepare('SELECT garbage WHERE id = ?')->execute([1]), '/^unexpected prepare response tag 42$/'],
+        'a frame in a stream' => [fn () => iterator_to_array($db->stream('SELECT n FROM t')), '/^unexpected frame tag 42 in stream$/'],
+    ];
+    $n = 1;
+    foreach ($desyncs as $name => [$run, $message]) {
+        assert_throws(SkaidbException::class, $run, $message);
+        $usable = $db->isUsable();
+        assert_eq('SELECT after', $db->query('SELECT after')->fetchColumn(), "{$name}: the next statement was answered with a leftover frame");
+        assert_true(!$usable, "{$name}: the connection was not at a request boundary any more");
+        $st = $db->prepare('SELECT ? AS after');
+        $st->execute([$n]);
+        assert_eq("execute [{$n}]", $st->fetchColumn(), $name);
+        assert_eq(++$n, $srv->connections(), "{$name}: one reconnect");
+    }
+    $db->close();
+    $srv->stop();
+});
+
 test('consistency: per connection and per statement, on the wire', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'ONE');

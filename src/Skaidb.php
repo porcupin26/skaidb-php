@@ -933,7 +933,10 @@ class Connection
                     $live = false;
                     throw self::serverError($fr->text());
                 } else {
+                    // Not a stream's frame: the framing is lost, and what
+                    // else is queued behind it cannot be known or drained.
                     $live = false;
+                    $this->markBroken();
                     throw new SkaidbException("unexpected frame tag {$t} in stream");
                 }
             }
@@ -1029,6 +1032,8 @@ class Connection
             }
             throw new Unpreparable($msg);
         }
+        // As for any reply the driver cannot place: see roundtrip().
+        $this->markBroken();
         throw new SkaidbException("unexpected prepare response tag {$tag}");
     }
 
@@ -1174,6 +1179,11 @@ class Connection
         if ($tag === 3) { // Error
             throw self::serverError($r->text());
         }
+        // A reply this driver cannot place. Whether more of it is queued
+        // behind this frame cannot be known, and a leftover frame would
+        // answer the next statement — every reply after it one statement
+        // late. The connection is given up; the next statement re-dials.
+        $this->markBroken();
         throw new SkaidbException("unknown response tag {$tag}");
     }
 
