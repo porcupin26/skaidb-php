@@ -231,6 +231,15 @@ test('consistency: per connection and per statement, on the wire', function () {
     $st->execute();
     assert_eq(1, $st->fetch()['consistency']);
     assert_eq(2, $db->getConsistency());
+    // The level a request carries is the driver's own state, not the
+    // session's: a new connection changes nothing about it, and nothing is
+    // sent to put it back.
+    $srv->closeAll();
+    assert_eq(2, $db->query('SELECT d')->fetch()['consistency']);
+    $st->execute();
+    assert_eq(1, $st->fetch()['consistency']);
+    assert_eq(['SELECT d', 'SELECT c'], array_slice(session_seen($srv), -2));
+    assert_eq(2, $srv->connections());
     $db->close();
     $srv->stop();
 });
