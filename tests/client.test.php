@@ -809,6 +809,81 @@ test('batch: a connection lost under a row is a ConnectionException that names t
     $srv->stop();
 });
 
+test('batch: a server from before OP_EXECUTE_BATCH runs the batch as one typed OP_EXECUTE per row', function () {
+    // Servers 0.17 to 0.86 prepare and execute, and answer the batch opcode
+    // as they answer any they do not know (PROTOCOL.md §3.4).
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        switch ($req['op']) {
+            case 2:
+                return F::prepared(3, substr_count($req['sql'], '?'));
+            case 3:
+                return $req['params'][1] === 'refused'
+                    ? F::error('constraint violation: refused')
+                    : ($req['params'][1] === 'gone' ? FakeServer::DROP : F::mutation(1));
+            case 7:
+                return F::error('protocol error: malformed message: unknown opcode');
+        }
+        return null;
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $ops = fn () => array_values(array_map(
+        fn ($r) => $r['op'] === 3 ? 'execute ' . json_encode($r['params']) : "op {$r['op']}",
+        array_filter($srv->requests(), fn ($r) => !in_array($r['op'], ['connect', 8], true))
+    ));
+    $st = $db->prepare('INSERT INTO t (id, tags) VALUES (?, ?)');
+    // What a batch promises: the total affected count, the rows in order,
+    // each with its values typed — a list has no other way to travel.
+    assert_eq(3, $st->executeBatch([[1, ['a']], [2, []], ['id' => 3, 'tags' => ['b', 'c']]]));
+    assert_eq(['op 2', 'op 7', 'execute [1,["a"]]', 'execute [2,[]]', 'execute [3,["b","c"]]'], $ops());
+    // The connection knows now: the opcode is not tried again.
+    assert_eq(2, $st->executeBatch([[4, 'x'], [5, 'y']]));
+    assert_eq(['execute [4,"x"]', 'execute [5,"y"]'], array_slice($ops(), 5));
+    // The first failing row ends the batch, named with the rows before it.
+    $e = assert_throws(
+        SkaidbException::class,
+        fn () => $st->executeBatch([[6, 'ok'], [7, 'refused'], [8, 'never']]),
+        '/^batch row 1: constraint violation: refused \(1 rows applied before it\)$/'
+    );
+    assert_eq(SkaidbException::class, get_class($e));
+    assert_eq(['execute [6,"ok"]', 'execute [7,"refused"]'], array_slice($ops(), 7));
+    // A wrong parameter count stops the batch before its first row.
+    assert_throws(SkaidbException::class, fn () => $st->executeBatch([[9, 'a'], [10]]), '/^batch row expects 2 parameters, got 1$/');
+    assert_eq([], array_slice($ops(), 9));
+    assert_true($db->isUsable());
+    // A connection lost under a row: the transport error, naming the row.
+    assert_throws(
+        ConnectionException::class,
+        fn () => $st->executeBatch([[11, 'ok'], [12, 'gone']]),
+        '/^batch row 1: connection closed by server \(1 rows applied before it\)$/'
+    );
+    // The new connection is asked again: it may be a newer member.
+    assert_eq(1, $st->executeBatch([[13, 'z']]));
+    assert_eq(['execute [11,"ok"]', 'execute [12,"gone"]', 'op 2', 'op 7', 'execute [13,"z"]'], array_slice($ops(), 9));
+    $db->close();
+    $srv->stop();
+
+    // A server that has the opcode answers a failing row itself, and that
+    // is never taken for a missing opcode, whatever the row's error says:
+    // the rows before it are applied and must not be sent again.
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        return match ($req['op']) {
+            2 => F::prepared(3, 2),
+            7 => F::error('batch row 1: no such function: unknown opcode (1 rows applied before it)'),
+            3 => F::mutation(1),
+            default => null,
+        };
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    assert_throws(
+        SkaidbException::class,
+        fn () => $db->prepare('INSERT INTO t (id, v) VALUES (?, ?)')->executeBatch([[1, 'a'], [2, 'b']]),
+        '/^batch row 1: no such function: unknown opcode \(1 rows applied before it\)$/'
+    );
+    assert_eq([2, 7], array_values(array_filter(array_map(fn ($r) => $r['op'], $srv->requests()), fn ($op) => is_int($op) && $op !== 8)));
+    $db->close();
+    $srv->stop();
+});
+
 test('multiple result sets: a CALL that EMITs exposes every set, the last one as the rows', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');

@@ -244,6 +244,13 @@ class Connection
     private ?string $noPrepare = null;
 
     /**
+     * The server answered OP_EXECUTE_BATCH with "unknown opcode": it
+     * predates the opcode (0.87), and a batch goes as one OP_EXECUTE per
+     * row.
+     */
+    private bool $noBatch = false;
+
+    /**
      * Transport died, and its socket is closed (see markBroken); the next
      * statement re-dials (see ensureLive).
      */
@@ -1195,18 +1202,39 @@ class Connection
      * autocommit individually: a failure names the row and earlier rows
      * stay applied, so the statement must be idempotent.
      *
+     * Null when this connection's server has no OP_EXECUTE_BATCH (before
+     * 0.87): it answers the opcode with "unknown opcode", nothing ran, and
+     * the caller sends the rows one OP_EXECUTE each. Remembered until the
+     * connection re-dials. A failing row on a server that has the opcode
+     * is answered "batch row N: …" and is never taken for that, whatever
+     * the row's own error says — its earlier rows are applied.
+     *
      * @internal
      * @param array<int,array<int,mixed>> $rows
-     * @return array{kind:string, columns:array<int,string>, rows:array<int,array<int,mixed>>, affected:int}
+     * @return array{kind:string, columns:array<int,string>, rows:array<int,array<int,mixed>>, affected:int}|null
      */
-    public function execBatch(int $id, array $rows, int $consistency): array
+    public function execBatch(int $id, array $rows, int $consistency): ?array
     {
+        if ($this->noBatch) {
+            return null;
+        }
         $req = pack('C', 7) . pack('C', $consistency) . pack('V', $id)
             . pack('V', count($rows));
         foreach ($rows as $params) {
             $req .= self::encodeParams($params);
         }
-        return $this->roundtrip($req);
+        try {
+            return $this->roundtrip($req);
+        } catch (ConnectionException $e) {
+            throw $e;
+        } catch (SkaidbException $e) {
+            $msg = $e->getMessage();
+            if (str_starts_with($msg, 'batch row ') || !str_contains($msg, 'unknown opcode')) {
+                throw $e;
+            }
+            $this->noBatch = true;
+            return null;
+        }
     }
 
     /**
@@ -1568,6 +1596,7 @@ class Connection
         $this->preparedCache = [];
         $this->declined = [];
         $this->noPrepare = null;
+        $this->noBatch = false;
         if (is_resource($this->sock)) {
             @fclose($this->sock);
         }
@@ -2252,7 +2281,9 @@ class Statement
      *
      * A statement the server declines to prepare (DDL, session statements)
      * cannot travel in one request: it runs once per row with the values
-     * quoted client-side, as execute() runs it, under the same rules.
+     * quoted client-side, as execute() runs it, under the same rules. A
+     * server from before OP_EXECUTE_BATCH (0.87) is sent one OP_EXECUTE per
+     * row instead, typed, under the same rules too.
      *
      * @param array<int,array<int,mixed>> $rows
      */
@@ -2273,13 +2304,27 @@ class Statement
                 );
             }
         }
-        $res = $this->conn->execBatch(
-            $id,
-            array_map('array_values', $rows),
-            $this->consistency
-        );
+        $typed = array_values(array_map('array_values', $rows));
+        $res = $this->conn->execBatch($id, $typed, $this->consistency);
+        if ($res !== null) {
+            $affected = $res['affected'];
+        } else {
+            // A server from before OP_EXECUTE_BATCH: the loop that request
+            // stands for, one OP_EXECUTE per row, the values typed as in
+            // the batch. The first failing row ends it, named with the
+            // rows that ran before it.
+            $affected = 0;
+            foreach ($typed as $i => $params) {
+                try {
+                    $one = $this->conn->execPrepared($id, $params, $this->consistency);
+                } catch (SkaidbException $e) {
+                    throw self::rowFailed($i, $e);
+                }
+                $affected += $one['affected'];
+            }
+        }
         $this->conn->noteStatement($this->sql);
-        return $res['affected'];
+        return $affected;
     }
 
     /**

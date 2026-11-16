@@ -246,6 +246,11 @@ the statement: …`); the first failing row ends the batch with `batch row
 N: <its error> (N rows applied before it)`; the total affected count is
 returned.
 
+A server from before `OP_EXECUTE_BATCH` (0.87) answers the opcode with
+`unknown opcode`. The rows then go one `OP_EXECUTE` each, typed, in order,
+under the same rules (the first failing row ends the batch with `batch row
+N: …`), and the connection does not try the opcode again.
+
 ### `fetch(): ?array`
 
 The next row as `['column' => value]`, or `null` when exhausted.

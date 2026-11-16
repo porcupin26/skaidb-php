@@ -531,10 +531,11 @@ After authenticating, the driver sends a Hello frame that fills the server's
 `drivers` table: `client_name` `php`, `client_version` = `Skaidb\Skaidb::VERSION`
 (the package version, `1.5.1`). An older server without the opcode ignores
 it. Prepared statements need server ≥ 0.17.0 (older servers get the
-client-side fallback automatically), batches ≥ 0.87.0, streaming a server
-with the streaming opcode, parameterised streaming ≥ 0.330, multiple result
-sets a server with `EMIT`, the transaction conflict error a standalone
-server ≥ 0.346.0.
+client-side fallback automatically), a batch in one request ≥ 0.87.0 (an
+older server is sent the rows one prepared execute each, with the same
+result), streaming a server with the streaming opcode, parameterised
+streaming ≥ 0.330, multiple result sets a server with `EMIT`, the
+transaction conflict error a standalone server ≥ 0.346.0.
 
 ## Development
 
