@@ -1,7 +1,8 @@
 # API reference
 
 Everything lives in `src/Skaidb.php` under the `Skaidb` namespace. Every
-error is a `Skaidb\SkaidbException`.
+error is a `Skaidb\SkaidbException`; a lost connection is its subclass
+`Skaidb\ConnectionException`.
 
 ## `Skaidb\Skaidb`
 
@@ -172,8 +173,9 @@ anything else.
 
 ### Reconnect
 
-A transport error (`connection closed by server`, `connection timed out`,
-`connection closed by server (write)`) throws from the statement in flight,
+A transport error (a `ConnectionException`: `connection closed by server`,
+`connection timed out`, `connection closed by server (write)`) throws from
+the statement in flight,
 marks the connection broken and closes its socket there and then: the
 server's session ends with the socket, and with it a transaction left open
 in it — also after a read timeout, when the server is still there. The
@@ -340,9 +342,22 @@ value objects that make a parameter travel as the typed Bytes, Decimal or
 Uuid value. `->value` holds the normalized input; `Uuid::bytes()` the 16
 raw bytes. See [types](types.md).
 
-## `SkaidbException` · `TransactionConflictException` · `Unpreparable`
+## `SkaidbException` · `ConnectionException` · `TransactionConflictException` · `Unpreparable`
 
 `SkaidbException extends \Exception` is thrown for every driver error.
+`ConnectionException extends SkaidbException` says the connection was lost
+or could not be made: the server closed the socket (`connection closed by
+server`), a read timed out (`connection timed out`), a write failed, no
+endpoint answered (`no reachable endpoint in …`), a member turned the
+connection away (a handshake closed unanswered, `authentication denied: too
+many connections: …`), a reply the driver cannot place made it give the
+connection up, or a statement was refused because its transaction's
+connection is gone (`connection lost inside a transaction: …`). The
+statement it interrupted may or may not have run; the connection re-dials
+on the next statement. What the server answers a statement with is never a
+`ConnectionException`, and neither is a refused login (`authentication
+denied: …`, `server signature mismatch …`), `connection is closed` after
+`close()`, or `connection is busy streaming a result set`.
 `TransactionConflictException extends SkaidbException` is a server error
 whose message starts with `transaction conflict:`
 (`TransactionConflictException::PREFIX`; only the prefix is matched): the

@@ -9,6 +9,7 @@ declare(strict_types=1);
 // server received, in order.
 
 use Skaidb\Connection;
+use Skaidb\ConnectionException;
 use Skaidb\Pool;
 use Skaidb\SkaidbException;
 use Skaidb\TransactionConflictException;
@@ -910,11 +911,105 @@ test('transport: a re-dial that loses its Hello fails the statement with a trans
     assert_throws(SkaidbException::class, fn () => $db->query('SELECT gone'), '/connection closed by server/');
     // The second connection authenticates and is dropped on its Hello, an
     // error the dial ignores: the statement finds no socket to travel on.
-    assert_throws(SkaidbException::class, fn () => $db->exec('UPDATE t SET n = 1'), '/^connection closed by server \(write\)$/');
+    assert_throws(ConnectionException::class, fn () => $db->exec('UPDATE t SET n = 1'), '/^connection closed by server \(write\)$/');
     assert_true(!$db->isUsable());
     assert_eq(1, $db->exec('UPDATE t SET n = 1'));
     assert_eq(3, $srv->connections());
     $db->close();
+    $srv->stop();
+});
+
+test('transport: a lost connection is a ConnectionException, and a statement error is not', function () {
+    $srv = txn_server([
+        'SELECT gone' => [FakeServer::DROP],
+        'SELECT slow' => [[]],
+        'SELECT odd' => [chr(42)],
+        'prepare SELECT odd WHERE id = ?' => [chr(42)],
+        'SELECT blank' => [''],
+        'SELECT garbled' => [[F::header(['n']), F::chunk([[1]]), chr(42)]],
+        'SELECT nope' => [F::error('no such column: nope')],
+        'COMMIT' => [F::error(TXN_CONFLICT)],
+    ] + txn_stream_script());
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.5);
+    // Every way the connection is lost under a statement: one type, still a
+    // SkaidbException, and the connection re-dials for the next statement.
+    $lost = [
+        'end-of-file on a read' => [fn () => $db->query('SELECT gone'), '/^connection closed by server$/'],
+        'a read timeout' => [fn () => $db->query('SELECT slow'), '/^connection timed out$/'],
+        'a reply the driver cannot place' => [fn () => $db->query('SELECT odd'), '/^unknown response tag 42$/'],
+        'a reply to a prepare it cannot place' => [fn () => $db->prepare('SELECT odd WHERE id = ?')->execute([1]), '/^unexpected prepare response tag 42$/'],
+        'a reply to a stream request it cannot place' => [fn () => iterator_to_array($db->stream('SELECT odd')), '/^unexpected response tag 42 to stream request$/'],
+        'an empty reply to a stream request' => [fn () => iterator_to_array($db->stream('SELECT blank')), '/^truncated server message$/'],
+        'a frame it cannot place in a stream' => [fn () => iterator_to_array($db->stream('SELECT garbled')), '/^unexpected frame tag 42 in stream$/'],
+        'a stream cut off' => [fn () => iterator_to_array($db->stream('SELECT gone')), '/^connection closed by server$/'],
+    ];
+    foreach ($lost as $name => [$run, $message]) {
+        $e = assert_throws(ConnectionException::class, $run, $message);
+        assert_true($e instanceof SkaidbException, $name);
+        assert_true(!$db->isUsable(), "{$name}: the connection is broken");
+        assert_eq(1, $db->exec('UPDATE t SET n = 1'), "{$name}: the next statement re-dials");
+    }
+    // A failed write.
+    $srv->closeAll();
+    assert_throws(ConnectionException::class, fn () => $db->query('SELECT ' . str_repeat('x', 16 * 1024 * 1024)), '/^connection closed by server \(write\)$/');
+    // Inside transaction(), the statements that are not sent any more.
+    $e = assert_throws(ConnectionException::class, fn () => $db->transaction(function (Connection $c) {
+        try {
+            $c->query('SELECT gone');
+        } catch (ConnectionException $e) {
+            assert_throws(ConnectionException::class, fn () => $c->exec('UPDATE t SET n = 2'), '/^connection lost inside a transaction/');
+            throw $e;
+        }
+    }), '/^connection closed by server$/');
+    // A stream read on after its connection was given up.
+    $held = null;
+    $body = function (Connection $c) use (&$held) {
+        $held = $c->stream('SELECT garbled');
+        $held->current();
+    };
+    $e = assert_throws(SkaidbException::class, fn () => $db->transaction($body), '/^connection is busy streaming/');
+    assert_eq(SkaidbException::class, get_class($e), 'the body\'s misuse, not a lost connection');
+    assert_throws(ConnectionException::class, fn () => $held->next(), '/^connection lost: the connection was closed with this stream still open$/');
+    $held = null;
+    // What the server answers is the statement's error, never this type —
+    // nor is what the application did to the connection itself.
+    $plain = [
+        'a statement error' => [fn () => $db->query('SELECT nope'), SkaidbException::class],
+        'a refused COMMIT' => [fn () => $db->exec('COMMIT'), TransactionConflictException::class],
+        'a statement while a stream is open' => [function () use ($db) {
+            $gen = $db->stream('SELECT n FROM t');
+            $gen->current();
+            $db->query('SELECT 1');
+        }, SkaidbException::class],
+    ];
+    foreach ($plain as $name => [$run, $class]) {
+        $e = assert_throws($class, $run);
+        assert_true(!$e instanceof ConnectionException, "{$name}: " . get_class($e));
+        assert_eq($class, get_class($e), $name);
+    }
+    $db->close();
+    $e = assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection is closed$/');
+    assert_eq(SkaidbException::class, get_class($e), 'closed by the application');
+    $srv->stop();
+
+    // A connection that cannot be made.
+    $e = assert_throws(ConnectionException::class, fn () => new Connection('127.0.0.1', 1, 'ada', 'secret', 'QUORUM', 0.5), '/^no reachable endpoint in 127\.0\.0\.1:1: /');
+    $full = (new FakeServer(['refuse' => fn () => true]))->start();
+    assert_throws(ConnectionException::class, fn () => new Connection('127.0.0.1', $full->port, 'ada', 'secret'), '/^connection closed by server$/');
+    $full->stop();
+    // A capacity refusal that arrives as a denied login is the member being
+    // full, with the server's reason as the message (PROTOCOL.md §6).
+    $busy = (new FakeServer(['deny' => 'too many connections: 500 of 500']))->start();
+    assert_throws(ConnectionException::class, fn () => new Connection('127.0.0.1', $busy->port, 'ada', 'secret'), '/^authentication denied: too many connections: 500 of 500$/');
+    $busy->stop();
+    // A refused login is not: the same credentials fail everywhere.
+    $srv = (new FakeServer())->start();
+    $e = assert_throws(SkaidbException::class, fn () => new Connection('127.0.0.1', $srv->port, 'ada', 'wrong'), '/^authentication denied: bad password$/');
+    assert_eq(SkaidbException::class, get_class($e));
+    $srv->stop();
+    $srv = (new FakeServer(['corruptServerSignature' => true]))->start();
+    $e = assert_throws(SkaidbException::class, fn () => new Connection('127.0.0.1', $srv->port, 'ada', 'secret'), '/^server signature mismatch/');
+    assert_eq(SkaidbException::class, get_class($e));
     $srv->stop();
 });
 

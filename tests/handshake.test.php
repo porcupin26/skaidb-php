@@ -6,6 +6,7 @@ declare(strict_types=1);
 // computes the real proofs, plus the Hello that follows it.
 
 use Skaidb\Connection;
+use Skaidb\ConnectionException;
 use Skaidb\Skaidb;
 use Skaidb\SkaidbException;
 use SkaidbTests\FakeServer;
@@ -145,4 +146,24 @@ test('seeds: a seed that refuses its handshake is walked past, like one that ref
     $full->stop();
     $other->stop();
     $good->stop();
+});
+
+test('a handshake the server answers with something else is a failed connection', function () {
+    // Whatever is on the other end is not a skaidb node in a state to talk
+    // to: a connection failure, not a refused login.
+    [$port, $join] = cf_fork_server(function ($s) {
+        cf_read_frame($s);                // AuthStart
+        cf_send($s, chr(99));
+    });
+    assert_throws(ConnectionException::class, fn () => new Connection('127.0.0.1', $port, 'ada', 'secret', 'QUORUM', 5.0), '/^bad handshake challenge$/');
+    assert_eq('', $join());
+    [$port, $join] = cf_fork_server(function ($s) {
+        cf_read_frame($s);                // AuthStart
+        $salt = random_bytes(16);
+        cf_send($s, chr(11) . pack('V', strlen($salt)) . $salt . pack('V', 1000) . \SkaidbTests\F::str('nonce'));
+        cf_read_frame($s);                // AuthFinish
+        cf_send($s, chr(99));
+    });
+    assert_throws(ConnectionException::class, fn () => new Connection('127.0.0.1', $port, 'ada', 'secret', 'QUORUM', 5.0), '/^bad handshake outcome$/');
+    assert_eq('', $join());
 });

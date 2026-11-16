@@ -47,6 +47,24 @@ class SkaidbException extends Exception
 }
 
 /**
+ * The connection was lost, or could not be made: the transport failed (the
+ * server closed the socket, a read timed out, a write failed), no endpoint
+ * could be reached, a member turned the connection away, or a reply could
+ * not be placed and the connection was given up. Whatever statement it
+ * interrupted may or may not have run, and the connection re-dials on the
+ * next statement — unless a transaction was open on it (see
+ * Connection::transaction()).
+ *
+ * Never thrown for what the server answers a statement with (that is a
+ * plain SkaidbException: the connection stays usable), nor for a refused
+ * login. Still a SkaidbException, so `catch (SkaidbException $e)` catches it
+ * as before.
+ */
+class ConnectionException extends SkaidbException
+{
+}
+
+/**
  * The server declines to prepare some statement kinds (DDL, session
  * statements). Not an error — the caller falls back to client-side text
  * binding.
@@ -445,7 +463,7 @@ class Connection
                 throw $refused;
             }
             $list = implode(', ', $tried);
-            throw new SkaidbException("no reachable endpoint in {$list}: {$why}");
+            throw new ConnectionException("no reachable endpoint in {$list}: {$why}");
         }
 
         $this->sendHello();
@@ -889,7 +907,7 @@ class Connection
                 $tag = $r->u8();
             } catch (\Throwable $e) {
                 $this->markBroken();
-                throw $e;
+                throw new ConnectionException($e->getMessage(), 0, $e);
             }
             if ($tag === 3) {
                 // One ordinary Error frame before any header: the statement
@@ -928,7 +946,7 @@ class Connection
             if ($tag !== 5) {
                 // We cannot know what else this reply left queued behind it.
                 $this->markBroken();
-                throw new SkaidbException("unexpected response tag {$tag} to stream request");
+                throw new ConnectionException("unexpected response tag {$tag} to stream request");
             }
             // The server has committed to chunks + RowsEnd, so from here
             // the socket carries frames this call owns: say so BEFORE
@@ -968,7 +986,7 @@ class Connection
                     // else is queued behind it cannot be known or drained.
                     $live = false;
                     $this->markBroken();
-                    throw new SkaidbException("unexpected frame tag {$t} in stream");
+                    throw new ConnectionException("unexpected frame tag {$t} in stream");
                 }
             }
             return ['kind' => 'rows', 'columns' => $columns, 'affected' => 0];
@@ -1090,7 +1108,7 @@ class Connection
         }
         // As for any reply the driver cannot place: see roundtrip().
         $this->markBroken();
-        throw new SkaidbException("unexpected prepare response tag {$tag}");
+        throw new ConnectionException("unexpected prepare response tag {$tag}");
     }
 
     /**
@@ -1251,7 +1269,7 @@ class Connection
         // answer the next statement — every reply after it one statement
         // late. The connection is given up; the next statement re-dials.
         $this->markBroken();
-        throw new SkaidbException("unknown response tag {$tag}");
+        throw new ConnectionException("unknown response tag {$tag}");
     }
 
     /**
@@ -1488,7 +1506,7 @@ class Connection
         if ($this->inTransaction) {
             // Inside transaction(): nothing is sent and the connection stays
             // broken, so it re-dials once the helper has returned.
-            throw new SkaidbException(
+            throw new ConnectionException(
                 'connection lost inside a transaction: the statement was not sent '
                 . '(on a new connection it would run outside the transaction)'
             );
@@ -1543,9 +1561,9 @@ class Connection
             // (ensureLive) before it writes, so a broken connection gets
             // here one way: a dial whose Hello exchange lost the transport
             // again. That is this request's transport error.
-            throw new SkaidbException(
-                $this->broken ? 'connection closed by server (write)' : 'connection is closed'
-            );
+            throw $this->broken
+                ? new ConnectionException('connection closed by server (write)')
+                : new SkaidbException('connection is closed');
         }
         // u32 BE length prefix, then payload.
         $frame = pack('N', strlen($payload)) . $payload;
@@ -1555,7 +1573,7 @@ class Connection
             $n = @fwrite($this->sock, substr($frame, $written));
             if ($n === false || $n === 0) {
                 $this->markBroken();
-                throw new SkaidbException('connection closed by server (write)');
+                throw new ConnectionException('connection closed by server (write)');
             }
             $written += $n;
         }
@@ -1583,11 +1601,9 @@ class Connection
             // socket before it reads anything. `fread(null, …)` would be a
             // TypeError rather than a SkaidbException, an error nobody
             // catches.
-            throw new SkaidbException(
-                $this->broken
-                    ? 'connection lost: the connection was closed with this stream still open'
-                    : 'connection is closed'
-            );
+            throw $this->broken
+                ? new ConnectionException('connection lost: the connection was closed with this stream still open')
+                : new SkaidbException('connection is closed');
         }
         $buf = '';
         $remaining = $n;
@@ -1597,10 +1613,10 @@ class Connection
                 $meta = is_resource($this->sock) ? stream_get_meta_data($this->sock) : ['timed_out' => false];
                 if (!empty($meta['timed_out'])) {
                     $this->markBroken();
-                    throw new SkaidbException('connection timed out');
+                    throw new ConnectionException('connection timed out');
                 }
                 $this->markBroken();
-                throw new SkaidbException('connection closed by server');
+                throw new ConnectionException('connection closed by server');
             }
             $buf .= $chunk;
             $remaining -= strlen($chunk);
@@ -1622,7 +1638,7 @@ class Connection
         // AuthChallenge: tag 11, blob salt, u32 LE iterations, str server_nonce.
         $r = new Reader($this->readFrame());
         if ($r->u8() !== 11) {
-            throw new SkaidbException('bad handshake challenge');
+            throw new ConnectionException('bad handshake challenge');
         }
         $salt = $r->blob();
         $iterations = $r->u32();
@@ -1638,7 +1654,7 @@ class Connection
         // AuthOutcome: tag 13, u8 ok_flag, then 32-byte sig or str reason.
         $r = new Reader($this->readFrame());
         if ($r->u8() !== 13) {
-            throw new SkaidbException('bad handshake outcome');
+            throw new ConnectionException('bad handshake outcome');
         }
         if ($r->u8() === 1) {
             $serverSig = $r->take(32);
@@ -1646,8 +1662,21 @@ class Connection
                 throw new SkaidbException('server signature mismatch (mutual auth failed)');
             }
         } else {
-            throw new SkaidbException('authentication denied: ' . $r->text());
+            throw self::denied($r->text());
         }
+    }
+
+    /**
+     * The exception for a denied login. A reason starting with "too many
+     * connections:" is a capacity refusal — the member is full, nothing is
+     * wrong with the credentials (PROTOCOL.md §6) — and so a connection
+     * failure; any other is the caller's.
+     */
+    private static function denied(string $reason): SkaidbException
+    {
+        return str_starts_with($reason, 'too many connections:')
+            ? new ConnectionException('authentication denied: ' . $reason)
+            : new SkaidbException('authentication denied: ' . $reason);
     }
 
     /**
@@ -1661,10 +1690,10 @@ class Connection
         $this->writeFrame(self::authStartExternal($user));
         $r = new Reader($this->readFrame());
         if ($r->u8() !== 13) {
-            throw new SkaidbException('bad handshake outcome');
+            throw new ConnectionException('bad handshake outcome');
         }
         if ($r->u8() !== 1) {
-            throw new SkaidbException('authentication denied: ' . $r->text());
+            throw self::denied($r->text());
         }
     }
 

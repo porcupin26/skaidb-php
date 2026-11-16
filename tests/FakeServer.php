@@ -139,6 +139,9 @@ final class FakeServer
     /** @var (callable():bool)|null asked (in the child) at each accept: true closes the new connection unanswered */
     private $refuse;
 
+    /** When set, every login is denied with this reason, whatever the proof. */
+    private ?string $deny;
+
     private int $iterations = 1000;
 
     /** True inside the forked child, which must not tear the parent's state down. */
@@ -165,12 +168,15 @@ final class FakeServer
      *              a prepared statement's id is; requests() does not carry it.
      *   refuse   — fn(): bool, called at every accept; true closes the new
      *              connection before the handshake (a node at capacity).
+     *   deny     — a reason: every login is answered with AuthOutcome
+     *              Denied carrying it, whatever the proof.
      */
     public function __construct(array $opts = [])
     {
         $this->password = $opts['password'] ?? 'secret';
         $this->handler = $opts['handle'] ?? fn (array $req) => null;
         $this->refuse = $opts['refuse'] ?? null;
+        $this->deny = $opts['deny'] ?? null;
         $this->owner = getmypid();
         $this->corruptServerSignature = $opts['corruptServerSignature'] ?? false;
         $this->log = tempnam(sys_get_temp_dir(), 'skaidb-fake-');
@@ -419,6 +425,10 @@ final class FakeServer
             $storedKey = hash('sha256', $clientKey, true);
             $clientSig = hash_hmac('sha256', $conn['authMessage'], $storedKey, true);
             $recovered = $proof ^ $clientSig;
+            if ($this->deny !== null) {
+                $this->send($sock, chr(13) . chr(0) . F::str($this->deny));
+                return true;
+            }
             if (!hash_equals($storedKey, hash('sha256', $recovered, true))) {
                 $this->send($sock, chr(13) . chr(0) . F::str('bad password'));
                 return true;

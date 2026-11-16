@@ -110,7 +110,8 @@ $db = new Connection(user: 'app', password: $pw, database: 'app',
 ```
 
 The constructor connects and runs the SCRAM-SHA-256 handshake; it throws
-`Skaidb\SkaidbException` on a connect or authentication failure. With a
+`Skaidb\ConnectionException` when no node can be reached and a plain
+`Skaidb\SkaidbException` when the login is refused. With a
 non-empty password the server's signature is verified too (mutual auth).
 With `authMechanism: 'certificate'` the TLS client certificate is the login
 instead (see TLS below).
@@ -378,14 +379,27 @@ Details in [docs/types.md](docs/types.md).
 ## Errors and reconnect
 
 Every error the driver raises is a `Skaidb\SkaidbException` (an `Exception`
-subclass, modeled on `PDOException`).
+subclass, modeled on `PDOException`). Two subclasses tell the cases apart
+that code usually treats differently:
 
-- **Statement errors** (`SELECT nope` → `no such column …`) throw; the
-  connection stays usable. A `COMMIT` the server refuses because of a
-  conflicting write throws the subclass
+```php
+try {
+    $db->prepare('UPDATE stock SET n = ? WHERE id = ?')->execute([$n, $id]);
+} catch (Skaidb\ConnectionException $e) {
+    // the connection was lost: the statement may or may not have run
+} catch (Skaidb\SkaidbException $e) {
+    // the server refused the statement; the connection is fine
+}
+```
+
+- **Statement errors** (`SELECT nope` → `no such column …`) throw a plain
+  `SkaidbException`; the connection stays usable. A `COMMIT` the server
+  refuses because of a conflicting write throws the subclass
   `Skaidb\TransactionConflictException` (see Transactions).
-- **Transport errors** throw `connection closed by server` / `connection
-  timed out` and mark the connection *broken*, not closed. Its socket is
+- **Transport errors** throw `Skaidb\ConnectionException` (`connection
+  closed by server`, `connection timed out`, `no reachable endpoint in …`,
+  a member turning the connection away, a reply the driver cannot place)
+  and mark the connection *broken*, not closed. Its socket is
   closed at once, so the server's session — and a transaction open in it —
   ends there, also after a read timeout. The next statement **re-dials**
   (through the seed walk), re-authenticates, enters the session database

@@ -9,6 +9,7 @@ declare(strict_types=1);
 // Common Name the way skaidb does, and checks the AuthStart bytes.
 
 use Skaidb\Connection;
+use Skaidb\ConnectionException;
 use Skaidb\SkaidbException;
 use SkaidbTests\F;
 
@@ -184,6 +185,17 @@ test('certificate login: a denial surfaces the server\'s reason', function () {
     assert_throws(SkaidbException::class, fn () => cert_connect($port, ['user' => 'bob',
         'tlsClientCert' => $fx['client_crt'], 'tlsClientKey' => $fx['client_key'], 'authMechanism' => 'certificate']),
         '/authentication denied: the username does not match/');
+    cert_join($join);
+});
+
+test('certificate login: an outcome that is none is a failed connection', function () {
+    $fx = cert_fixture();
+    [$port, $join] = cert_server(function ($s) {
+        cf_read_frame($s);                // AuthStart
+        cf_send($s, chr(99));
+    });
+    assert_throws(ConnectionException::class, fn () => cert_connect($port, ['tlsClientCert' => $fx['client_crt'],
+        'tlsClientKey' => $fx['client_key'], 'authMechanism' => 'certificate']), '/^bad handshake outcome$/');
     cert_join($join);
 });
 
