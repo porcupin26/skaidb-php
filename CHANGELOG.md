@@ -4,6 +4,89 @@ All notable changes to the skaidb PHP driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-11-16
+
+### Fixed
+- **`executeBatch()` on a statement the server declines to prepare** (DDL,
+  session statements) threw the internal `Skaidb\Unpreparable`, where
+  `execute()` falls back to client-side quoting. It now falls back too: the
+  statement runs once per row, each row's values quoted as `execute()`
+  quotes them, and the total affected count is returned. Every row is
+  bound before the first is sent, so a row with the wrong parameter count
+  or a value with no SQL literal form throws with nothing applied; the
+  first failing row ends the batch with `batch row N: <its error> (N rows
+  applied before it)`.
+- **A long-lived connection no longer loses typed parameters after its
+  256th distinct statement.** The driver prepared every distinct
+  parameterised SQL text and never closed one, and a server keeps at most
+  256 prepared statements per connection: from then on it refused every
+  prepare (`too many prepared statements (max 256); close some first`),
+  and the driver sent those statements as text with client-side literals
+  instead. An `Array` or a `Document` parameter then failed (`cannot bind
+  value of type array via client-side binding`); a `DateTime` was stored
+  as an integer and `Bytes` as a hex string, with no error. The cache now
+  keeps the 240 most recently used statements and closes the one it pushes
+  out on the server; a `Statement` whose entry went is prepared again by
+  its next `execute()`. A prepare the server refuses with `too many
+  prepared statements` is thrown, never sent as text.
+- **A stream left open by a `transaction()` body no longer leaves the
+  transaction open.** With the body's stream still in flight (its
+  generator returned as the body's value, or kept somewhere) neither the
+  `COMMIT` nor the `ROLLBACK` could be sent; the call threw and the
+  transaction stayed open on a live connection. Once the generator was
+  released, every later statement on that connection ran inside the
+  abandoned transaction — reported as applied, never committed — and
+  `$pool->transaction()` could put the connection back in the pool that
+  way, for the next borrower. `transaction()` now closes such a connection,
+  so the server drops the transaction, and throws the body's exception if
+  it threw, otherwise `connection is busy streaming a result set: the
+  transaction's body returned with a stream still open, …`. Nothing is
+  committed; the connection re-dials on the first statement after the
+  generator is released, and reading the stream on throws `connection
+  lost: the connection was closed with this stream still open`.
+- **The session database survives a re-dial when it was entered with
+  `USE`.** A re-dialled connection re-entered only the constructor's
+  `$database`: after a plain `USE app` and a lost connection, the next
+  statement ran in the constructor's database, or in none — against the
+  default database's table of the same name. The driver now keeps the
+  database named by the last `USE` the server accepted (a statement that is
+  exactly `USE [DATABASE] <name>`, the name bare or in double quotes, an
+  optional `;`, through `exec()`, `query()`, `execute()` or `stream()`)
+  and enters it on every dial before anything else is sent. A `USE` with a
+  `--` comment is read like any other (`USE app -- the app database`), as
+  the server reads it; `USE "a--b"` names `a--b`. If the database cannot
+  be entered on the new connection, the statement throws that error
+  instead of running in another database.
+- **A pool no longer hands one borrower's `USE` to the next.** A
+  connection released in another database than the pool's `database`
+  argument (with no such argument: after any `USE`) is closed instead of
+  kept, so the next checkout is in the pool's database. Name the database
+  in the pool's arguments rather than switching on a checked-out
+  connection.
+- **A broken connection closes its socket at once.** After a transport
+  error the socket stayed open until the next statement re-dialled or
+  `close()` ran. After a read timeout, or a reply that lost the framing,
+  the server was still there and kept the session — with a transaction
+  open in it and the rows it had claimed — until then; inside
+  `transaction()`, where nothing re-dials, until the first statement after
+  the call. The socket is now closed when the connection is marked broken.
+  Re-dialling is unchanged.
+- **A re-dial the server turns away during its handshake** (a node at
+  capacity, or one on its way up or down, closing the new connection
+  unanswered) closed the connection for good: every later statement threw
+  `connection is closed`. It now stays broken, and the next statement
+  dials again, as after a re-dial that finds no endpoint.
+- **`close()` is terminal for a broken connection too.** A connection
+  closed after a transport error dialled a new session on its next
+  statement before throwing `connection is closed`, and left that session
+  open.
+- **A reply the driver cannot place drops the connection**, as the README
+  says: an unknown tag in the reply to a statement or to a prepare, and an
+  unexpected frame in the middle of a stream, threw but left the
+  connection in use, so the frames queued behind it answered the next
+  statements — each with the reply to the one before. The connection is
+  now marked broken and the next statement re-dials.
+
 ## [1.5.0] - 2026-11-15
 
 ### Added
