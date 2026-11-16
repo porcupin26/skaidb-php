@@ -173,6 +173,22 @@ try {
         check(true, 'missing parameters throw: ' . $e->getMessage());
     }
 
+    // ---- statements the server will not prepare ------------------------------------
+    // A literal where the placeholder stands: the values are written into
+    // the text, and the statement runs.
+    $ttl = $db->prepare("ALTER TABLE {$t} SET (ttl = ?)");
+    check($ttl->execute([86400]) && $ttl->kind() === 'ddl' && $ttl->execute([172800]), 'ALTER TABLE … SET (ttl = ?) runs through the text fallback, twice');
+    check($db->prepare('SET SCAN BUDGET ROWS ?')->execute([1000000]) && $db->exec('SET SCAN BUDGET DEFAULT') === 0, 'SET SCAN BUDGET ROWS ? takes a bound number');
+    // A statement that is simply wrong: the prepare's own error, once.
+    try {
+        $db->prepare("SELEC id FROM {$t} WHERE id = ?")->execute([1]);
+        check(false, 'a syntax error throws');
+    } catch (SkaidbException $e) {
+        check($e->getMessage() === 'unexpected token "Ident(\"SELEC\")", expected a statement' && get_class($e) === SkaidbException::class,
+            'a syntax error in a parameterised statement is the prepare\'s error: ' . $e->getMessage());
+    }
+    check($db->isUsable() && $db->query('SELECT 1 AS one')->fetchColumn() === 1, 'connection usable after the refusals');
+
     // ---- client identification ----------------------------------------------------
     sleep(1);
     $drivers = $db->query('SELECT client_name, client_version FROM drivers')->fetchAll();

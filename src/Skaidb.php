@@ -211,8 +211,11 @@ class Connection
      */
     private const PREPARED_CACHE_MAX = 240;
 
-    /** What the server's refusal starts with when a connection's statement table is full. */
-    private const STATEMENT_TABLE_FULL = 'too many prepared statements';
+    /**
+     * What a server answers OP_PREPARE with for a statement that parses but
+     * takes no bound parameters (DDL, session statements).
+     */
+    private const KIND_NOT_PREPARED = 'statement kind cannot be prepared';
 
     /** @var resource|null the TCP stream */
     private $sock;
@@ -223,6 +226,22 @@ class Connection
 
     /** @var array<string,array{0:int,1:int}> SQL text => [id, paramCount], the least recently used first */
     private array $preparedCache = [];
+
+    /**
+     * Statements this connection's server declined to prepare: SQL text =>
+     * its answer, the oldest first. They go as text without being asked
+     * about again. Per connection, like the cache: another member, or the
+     * same one after an upgrade, may answer differently.
+     *
+     * @var array<string,string>
+     */
+    private array $declined = [];
+
+    /**
+     * The server answered OP_PREPARE with "unknown opcode": it predates
+     * prepared statements, and every parameterised statement goes as text.
+     */
+    private ?string $noPrepare = null;
 
     /**
      * Transport died, and its socket is closed (see markBroken); the next
@@ -1044,8 +1063,11 @@ class Connection
     /**
      * Prepare $sql on the SERVER, returning [id, paramCount]. Cached per
      * connection, because a prepared id only means anything on the
-     * connection that created it. Throws Unpreparable for statement kinds
-     * the server declines (DDL, session statements).
+     * connection that created it. Throws Unpreparable for a statement the
+     * server declines to prepare (see declinedToPrepare) — remembered, so
+     * the same statement is not asked about twice on this connection — and
+     * the server's own error for anything else it answers: a statement
+     * that is wrong is wrong as text too, and is not sent a second time.
      *
      * The cache keeps the PREPARED_CACHE_MAX most recently used statements.
      * One more pushes the least recently used out and closes it on the
@@ -1071,6 +1093,12 @@ class Connection
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
+        if ($this->noPrepare !== null) {
+            throw new Unpreparable($this->noPrepare);
+        }
+        if (isset($this->declined[$sql])) {
+            throw new Unpreparable($this->declined[$sql]);
+        }
         $req = pack('C', 2) . pack('V', strlen($sql)) . $sql;
         $r = new Reader($this->exchange($req));
         $tag = $r->u8();
@@ -1090,25 +1118,51 @@ class Connection
         }
         if ($tag === 3) {
             $msg = $r->text();
-            if (str_starts_with($msg, TransactionConflictException::PREFIX)) {
-                // Never "declined to prepare": the fallback to client-side
-                // binding would swallow the conflict and send the statement
-                // again.
-                throw new TransactionConflictException($msg);
+            if (str_contains($msg, 'unknown opcode')) {
+                $this->noPrepare = $msg;
+                throw new Unpreparable($msg);
             }
-            if (str_starts_with($msg, self::STATEMENT_TABLE_FULL)) {
-                // Not "declined" either. The statement can be prepared, the
-                // connection has no slot for it; as text its values would
-                // be typed by their literals instead — a timestamp a
-                // number, bytes a hex string — and a list or a document
-                // not at all.
-                throw new SkaidbException($msg);
+            if (self::declinedToPrepare($msg)) {
+                if (count($this->declined) >= self::PREPARED_CACHE_MAX) {
+                    unset($this->declined[array_key_first($this->declined)]);
+                }
+                $this->declined[$sql] = $msg;
+                throw new Unpreparable($msg);
             }
-            throw new Unpreparable($msg);
+            // The statement's own error, thrown as it is and never
+            // answered by the text fallback: a syntax error would only be
+            // refused a second time; a full statement table ("too many
+            // prepared statements") means the statement CAN be prepared,
+            // and as text its values would be typed by their literals — a
+            // timestamp a number, bytes a hex string, a list or a document
+            // not at all; a conflict would be swallowed and the statement
+            // sent again.
+            throw self::serverError($msg);
         }
         // As for any reply the driver cannot place: see roundtrip().
         $this->markBroken();
         throw new ConnectionException("unexpected prepare response tag {$tag}");
+    }
+
+    /**
+     * Whether an Error answer to OP_PREPARE says "not as a prepared
+     * statement" rather than "this statement is wrong". A server says it
+     * two ways (its prepare(): parse, then count the parameters):
+     *
+     * - "statement kind cannot be prepared": the statement parses, and its
+     *   kind takes no bound parameters (CREATE INDEX … WHERE v > ?);
+     * - the parser's own error naming the token it stopped at as Question,
+     *   the placeholder (`unexpected token "Question", …`, `… found
+     *   Question`): the grammar wants a literal or a name where the `?`
+     *   stands (ALTER TABLE t SET (ttl = ?), USE ?).
+     *
+     * Either way the statement may be right once its values are written
+     * into it. Any other parse error is the statement's.
+     */
+    private static function declinedToPrepare(string $msg): bool
+    {
+        return $msg === self::KIND_NOT_PREPARED
+            || preg_match('/unexpected token "Question"|\bfound Question\b/', $msg) === 1;
     }
 
     /**
@@ -1512,6 +1566,8 @@ class Connection
             );
         }
         $this->preparedCache = [];
+        $this->declined = [];
+        $this->noPrepare = null;
         if (is_resource($this->sock)) {
             @fclose($this->sock);
         }

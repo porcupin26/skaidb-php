@@ -46,7 +46,7 @@ function scripted_server(): FakeServer
                 return F::rows(['sql', 'consistency'], [[$sql, $req['consistency']]]);
             case 2: // prepare
                 if (str_starts_with($req['sql'], 'CREATE') || str_starts_with($req['sql'], 'USE')) {
-                    return F::error('cannot prepare DDL');
+                    return F::error('statement kind cannot be prepared');
                 }
                 $id = $nextId++;
                 $n = substr_count($req['sql'], '?');
@@ -262,10 +262,180 @@ test('prepared: a parameter-count mismatch is refused before anything runs', fun
 test('prepared: DDL the server declines to prepare falls back to client-side quoting', function () {
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
-    $st = $db->prepare('USE ?');
+    $st = $db->prepare('CREATE INDEX by_name ON t (name) WHERE name <> ?');
     $st->execute(["it's"]);
     $q = array_values(array_filter($srv->requests(), fn ($r) => $r['op'] === 1));
-    assert_eq("USE 'it''s'", $q[0]['sql']);
+    assert_eq("CREATE INDEX by_name ON t (name) WHERE name <> 'it''s'", $q[0]['sql']);
+    $db->close();
+    $srv->stop();
+});
+
+/**
+ * A server that answers OP_PREPARE the way skaidb does, in its words:
+ * "statement kind cannot be prepared" for a statement that parses but takes
+ * no bound parameters; the parser's error naming the token Question where
+ * the grammar wants a literal or a name and found the placeholder; the
+ * parser's error for a statement that is simply wrong (an OP_QUERY carries
+ * the same text behind "parse error: "). Sent as text, a statement is
+ * answered Ddl unless it is one of the wrong ones.
+ */
+function declining_server(): FakeServer
+{
+    return (new FakeServer(['handle' => function (array $req) {
+        $sql = $req['sql'] ?? '';
+        $wrong = [
+            'SELEC ' => 'unexpected token "Ident(\"SELEC\")", expected a statement',
+            'SELECT FROM' => 'unexpected token "Keyword(From)", expected an expression',
+        ];
+        foreach ($wrong as $start => $error) {
+            if (str_starts_with($sql, $start)) {
+                return in_array($req['op'], [1, 2], true) ? F::error(($req['op'] === 1 ? 'parse error: ' : '') . $error) : null;
+            }
+        }
+        if ($req['op'] === 1) {
+            if (preg_match('/^USE \'(.*)\'$/', $sql, $m) === 1) {
+                return F::error('parse error: unexpected token "Str(\"' . $m[1] . '\")", expected identifier');
+            }
+            if (preg_match('/^SET CONSISTENCY (\'.*\')$/', $sql, $m) === 1) {
+                return F::error('parse error: SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Str("' . trim($m[1], "'") . '")');
+            }
+            return F::ddl();
+        }
+        if ($req['op'] !== 2) {
+            return $req['op'] === 3 ? F::mutation(1) : null;
+        }
+        if (str_starts_with($sql, 'ALTER TABLE')) {
+            return F::error('expected a literal value for option ttl, found Question');
+        }
+        if (str_starts_with($sql, 'USE ?')) {
+            return F::error('unexpected token "Question", expected identifier');
+        }
+        if (str_starts_with($sql, 'SET CONSISTENCY ?')) {
+            return F::error('SET CONSISTENCY takes ONE, QUORUM, ALL, or DEFAULT — found Question');
+        }
+        if (str_starts_with($sql, 'SET SCAN BUDGET')) {
+            return F::error('unexpected token "Question", expected SCAN BUDGET ROWS: a positive integer (0 would lift the limit; use DEFAULT to clear)');
+        }
+        if (str_starts_with($sql, 'CREATE')) {
+            return F::error('statement kind cannot be prepared');
+        }
+        return F::prepared(1, substr_count($sql, '?'));
+    }]))->start();
+}
+
+/**
+ * What followed each connection's Hello: "prepare <sql>", a text
+ * statement's SQL, or "op <n>".
+ *
+ * @return array<int,string>
+ */
+function declining_seen(FakeServer $srv): array
+{
+    $out = [];
+    foreach ($srv->requests() as $r) {
+        if ($r['op'] === 'connect' || $r['op'] === 8) {
+            continue;
+        }
+        $out[] = match ($r['op']) {
+            1 => $r['sql'],
+            2 => 'prepare ' . $r['sql'],
+            default => "op {$r['op']}",
+        };
+    }
+    return $out;
+}
+
+test('prepared: a statement that is simply wrong gets its error once — it is not sent again as text', function () {
+    $srv = declining_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    // The prepare's own answer, in the server's words, and nothing after
+    // it: the statement cannot be right as text either.
+    $wrong = 'SELEC id FROM t WHERE id = ?';
+    $e = assert_throws(SkaidbException::class, fn () => $db->prepare($wrong)->execute([1]), '/^unexpected token "Ident\(\\\\"SELEC\\\\"\)", expected a statement$/');
+    assert_eq(SkaidbException::class, get_class($e), 'a statement error, not the internal Unpreparable');
+    assert_eq(["prepare {$wrong}"], declining_seen($srv));
+    assert_true($db->isUsable());
+    $e = assert_throws(SkaidbException::class, fn () => $db->prepare($wrong)->executeBatch([[1], [2]]), '/^unexpected token "Ident/');
+    assert_eq(SkaidbException::class, get_class($e));
+    assert_throws(SkaidbException::class, fn () => $db->prepare('SELECT FROM t WHERE id = ?')->execute([1]), '/^unexpected token "Keyword\(From\)", expected an expression$/');
+    assert_eq(["prepare {$wrong}", "prepare {$wrong}", 'prepare SELECT FROM t WHERE id = ?'], declining_seen($srv));
+    assert_eq(1, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('prepared: a statement the server will not prepare is sent as text, and the refusal is remembered', function () {
+    $srv = declining_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    // Both of the server's ways to say so: the statement's kind takes no
+    // bound parameters, or it takes a literal where the placeholder stands.
+    $ttl = $db->prepare('ALTER TABLE t SET (ttl = ?)');
+    $index = $db->prepare('CREATE INDEX i ON t (v) WHERE v > ?');
+    foreach ([60, 120, 180] as $seconds) {
+        assert_true($ttl->execute([$seconds]));
+        assert_eq('ddl', $ttl->kind());
+    }
+    assert_true($index->execute([1]));
+    assert_true($index->execute([2]));
+    assert_eq(0, $ttl->executeBatch([[240], [300]]));
+    // One prepare per statement, not one per execute.
+    assert_eq([
+        'prepare ALTER TABLE t SET (ttl = ?)',
+        'ALTER TABLE t SET (ttl = 60)', 'ALTER TABLE t SET (ttl = 120)', 'ALTER TABLE t SET (ttl = 180)',
+        'prepare CREATE INDEX i ON t (v) WHERE v > ?',
+        'CREATE INDEX i ON t (v) WHERE v > 1', 'CREATE INDEX i ON t (v) WHERE v > 2',
+        'ALTER TABLE t SET (ttl = 240)', 'ALTER TABLE t SET (ttl = 300)',
+    ], declining_seen($srv));
+    // What the memory holds is what THIS connection was told: a new one
+    // (another member, another version) is asked again.
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $ttl->execute([360]), '/^connection closed by server/');
+    assert_true($ttl->execute([360]));
+    assert_true($ttl->execute([420]));
+    assert_eq(
+        ['prepare ALTER TABLE t SET (ttl = ?)', 'ALTER TABLE t SET (ttl = 360)', 'ALTER TABLE t SET (ttl = 420)'],
+        array_slice(declining_seen($srv), 9)
+    );
+    // It is bounded: one statement more than it holds pushes the oldest
+    // out, and that one is asked about again.
+    $before = count(array_filter(declining_seen($srv), fn ($s) => str_starts_with($s, 'prepare ')));
+    for ($i = 0; $i < 240; $i++) {
+        $db->prepare("CREATE INDEX i{$i} ON t (v) WHERE v > ?")->execute([$i]);
+    }
+    $ttl->execute([480]);
+    $db->prepare('CREATE INDEX i239 ON t (v) WHERE v > ?')->execute([0]);
+    $prepares = count(array_filter(declining_seen($srv), fn ($s) => str_starts_with($s, 'prepare ')));
+    assert_eq($before + 241, $prepares, 'the 240 new ones, and the one they pushed out');
+    $db->close();
+    $srv->stop();
+});
+
+test('prepared: a server from before prepared statements gets every parameterised statement as text', function () {
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        if ($req['op'] === 1) {
+            return F::mutation(1);
+        }
+        return $req['op'] === 8 ? null : F::error('protocol error: malformed message: unknown opcode');
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $st = $db->prepare('INSERT INTO t (id, name) VALUES (?, ?)');
+    assert_true($st->execute([1, "O'Brien"]));
+    assert_true($st->execute([2, null]));
+    // Asked once per connection, not once per statement.
+    assert_true($db->prepare('DELETE FROM t WHERE id = ?')->execute([1]));
+    assert_eq(2, $st->executeBatch([[3, 'a'], [4, 'b']]));
+    assert_eq([
+        'prepare INSERT INTO t (id, name) VALUES (?, ?)',
+        "INSERT INTO t (id, name) VALUES (1, 'O''Brien')",
+        'INSERT INTO t (id, name) VALUES (2, NULL)',
+        'DELETE FROM t WHERE id = 1',
+        "INSERT INTO t (id, name) VALUES (3, 'a')",
+        "INSERT INTO t (id, name) VALUES (4, 'b')",
+    ], declining_seen($srv));
+    $srv->closeAll();
+    assert_throws(SkaidbException::class, fn () => $st->execute([5, 'c']), '/^connection closed by server/');
+    assert_true($st->execute([5, 'c']));
+    assert_eq(['prepare INSERT INTO t (id, name) VALUES (?, ?)', "INSERT INTO t (id, name) VALUES (5, 'c')"], array_slice(declining_seen($srv), 6));
     $db->close();
     $srv->stop();
 });
@@ -552,8 +722,9 @@ test('batch: a statement the server declines to prepare runs once per row, quote
     );
     assert_eq(SkaidbException::class, get_class($e), 'never the internal Unpreparable');
     assert_eq(
-        ['op 2', "INSERT INTO t (id, name) VALUES (4, 'ok')", "INSERT INTO t (id, name) VALUES (5, 'refused')"],
-        array_slice($sent(), 7)
+        ["INSERT INTO t (id, name) VALUES (4, 'ok')", "INSERT INTO t (id, name) VALUES (5, 'refused')"],
+        array_slice($sent(), 7),
+        'the statement was declined once already: no second prepare'
     );
     assert_true($db->isUsable());
 
@@ -576,7 +747,7 @@ test('batch: a statement the server declines to prepare runs once per row, quote
         fn () => $st->executeBatch([[11, ['a', 'list']]]),
         '/^batch row 0: cannot bind value of type array ' . $declined
     );
-    assert_eq(['op 2', 'op 2', 'op 2'], array_slice($sent(), 10), 'only the three prepares: no row was sent');
+    assert_eq([], array_slice($sent(), 9), 'no row was sent');
     assert_eq(0, $st->executeBatch([]));
     assert_eq(1, $srv->connections());
     $db->close();
