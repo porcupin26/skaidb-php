@@ -29,11 +29,14 @@ const TXN_CONFLICT = 'transaction conflict: a row of table t was changed by anot
  * "prepare <sql>" is scripted; OP_EXECUTE and OP_EXECUTE_BATCH answer what
  * the prepared SQL is scripted to.
  *
+ * $cutAt: the server closes a connection that many bytes into a request
+ * it has not received whole (see FakeServer), 0 for never.
+ *
  * @param array<string,array<int,string|array<int,string>>> $script
  */
-function txn_server(array $script = []): FakeServer
+function txn_server(array $script = [], int $cutAt = 0): FakeServer
 {
-    return (new FakeServer(['handle' => function (array $req) use ($script) {
+    return (new FakeServer(['cutAt' => $cutAt, 'handle' => function (array $req) use ($script) {
         static $arrivals = [];
         static $prepared = [];
         static $nextId = 1;
@@ -529,15 +532,14 @@ test('transaction: after a lost connection nothing more of the transaction is se
 
 test('transaction: the body swallows a lost connection and writes on — the write is not sent, nothing is committed', function () {
     // PROTOCOL.md §6 rule 7, the whole scenario: statement 1 succeeds, the
-    // connection is lost, the body catches statement 2's error, runs a
-    // write as statement 3 and returns as if all were well.
-    $srv = txn_server();
+    // connection is lost under statement 2, the body catches its error,
+    // runs a write as statement 3 and returns as if all were well.
+    $srv = txn_server(['UPDATE t SET n = 2' => [FakeServer::DROP]]);
     $db = txn_connect($srv);
     $lost = '/^connection lost inside a transaction: the statement was not sent/';
     $caught = [];
-    $body = function (Connection $c) use ($srv, &$caught, $lost) {
+    $body = function (Connection $c) use (&$caught, $lost) {
         assert_eq(1, $c->exec('UPDATE t SET n = 1'));
-        $srv->closeAll();
         try {
             $c->exec('UPDATE t SET n = 2');
         } catch (SkaidbException $e) {
@@ -560,23 +562,27 @@ test('transaction: the body swallows a lost connection and writes on — the wri
     assert_eq(2, count($caught));
     assert_match('/^connection closed by server/', $caught[0], 'statement 2: the transport error');
     assert_match($lost, $caught[1], 'statement 3: refused, not sent');
-    // The server saw one connection and, on it, the transaction's start
-    // and statement 1: no statement 3, no COMMIT, no ROLLBACK anywhere.
+    // The server saw one connection and, on it, the transaction's start,
+    // statement 1 and the statement it dropped the connection under: no
+    // statement 3, no COMMIT, no ROLLBACK anywhere.
     assert_eq(1, $srv->connections());
-    assert_eq(['BEGIN', 'UPDATE t SET n = 1'], txn_statements($srv));
+    assert_eq(['BEGIN', 'UPDATE t SET n = 1', 'UPDATE t SET n = 2'], txn_statements($srv));
     // Afterwards the connection is what it is after any connection loss:
     // the next statement re-dials and runs, on its own.
     assert_true(!$db->isUsable());
     assert_eq(1, $db->exec('UPDATE t SET n = 9'));
     assert_true($db->isUsable());
     assert_eq(2, $srv->connections());
-    assert_eq(['UPDATE t SET n = 9'], array_slice(txn_statements($srv), 2));
+    assert_eq(['UPDATE t SET n = 9'], array_slice(txn_statements($srv), 3));
     $db->close();
     $srv->stop();
 });
 
 test('transaction: the opening statement meets a lost connection exactly as an ordinary statement does', function () {
-    $srv = txn_server();
+    $srv = txn_server([
+        'UPDATE t SET n = 5' => [FakeServer::DROP, F::mutation(1)],
+        'BEGIN ATOMIC' => [FakeServer::DROP, F::ddl()],
+    ]);
     $plain = txn_connect($srv);
     $txn = txn_connect($srv);
     $runs = 0;
@@ -585,42 +591,48 @@ test('transaction: the opening statement meets a lost connection exactly as an o
         return $c->exec('UPDATE t SET n = 1');
     };
     // Idle connections, and the server goes away under them (a restart).
-    // Neither knows yet: its next statement finds out and throws, once.
+    // An ordinary statement finds out before it is sent and runs on a new
+    // connection; so does the transaction, $begin first.
     $srv->closeAll();
-    $ordinary = assert_throws(SkaidbException::class, fn () => $plain->exec('UPDATE t SET n = 0'), '/^connection closed by server/');
-    $begin = assert_throws(SkaidbException::class, fn () => $txn->transaction($body), '/^connection closed by server/');
-    assert_eq(get_class($ordinary), get_class($begin));
-    assert_eq(0, $runs, 'the body never ran');
-    assert_eq([], txn_statements($srv), 'and nothing else was sent');
-    // Both now know, and both re-dial on the next call: the ordinary
-    // statement runs, and so does the whole transaction, $begin first.
     assert_eq(1, $plain->exec('UPDATE t SET n = 0'));
     assert_eq(1, $txn->transaction($body));
     assert_eq(1, $runs);
     assert_eq(['UPDATE t SET n = 0', 'BEGIN', 'UPDATE t SET n = 1', 'COMMIT'], txn_statements($srv));
     assert_eq(4, $srv->connections());
     assert_true($plain->isUsable() && $txn->isUsable());
+    // The connection lost UNDER the statement: an ordinary one throws the
+    // transport error, once, and is not sent again. So does $begin — the
+    // body never runs — and the next call re-dials, for both.
+    $runs = 0;
+    $ordinary = assert_throws(ConnectionException::class, fn () => $plain->exec('UPDATE t SET n = 5'), '/^connection closed by server$/');
+    $begin = assert_throws(ConnectionException::class, fn () => $txn->transaction($body, 3, 'BEGIN ATOMIC'), '/^connection closed by server$/');
+    assert_eq(get_class($ordinary), get_class($begin));
+    assert_eq(0, $runs, 'the body never ran');
+    assert_eq(['UPDATE t SET n = 5', 'BEGIN ATOMIC'], array_slice(txn_statements($srv), 4), 'and nothing else was sent');
+    assert_eq(1, $plain->exec('UPDATE t SET n = 5'));
+    assert_eq(1, $txn->transaction($body, 3, 'BEGIN ATOMIC'));
+    assert_eq(1, $runs);
+    assert_eq(['UPDATE t SET n = 5', 'BEGIN ATOMIC', 'UPDATE t SET n = 1', 'COMMIT'], array_slice(txn_statements($srv), 6));
+    assert_eq(6, $srv->connections());
     $plain->close();
     $txn->close();
-    // A pool: its idle connection looks fine too, and is handed out. An
-    // ordinary statement on it throws once and the pool drops it; so does
-    // the transaction, and the next one runs on a new connection.
+    // A pool: its idle connection is found closed at the checkout and is
+    // not handed out, for an ordinary statement and for a transaction
+    // alike.
     $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret'], 4);
     $statement = fn (Connection $c) => $c->exec('UPDATE t SET n = 0');
     assert_eq(1, $pool->withConnection($statement));
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $pool->withConnection($statement), '/^connection closed by server/');
     assert_eq(1, $pool->withConnection($statement));
     $srv->closeAll();
     $runs = 0;
-    assert_throws(SkaidbException::class, fn () => $pool->transaction($body), '/^connection closed by server/');
-    assert_eq(0, $runs);
     assert_eq(1, $pool->transaction($body));
     assert_eq(1, $runs);
     assert_eq(
         ['UPDATE t SET n = 0', 'UPDATE t SET n = 0', 'BEGIN', 'UPDATE t SET n = 1', 'COMMIT'],
-        array_slice(txn_statements($srv), 4)
+        array_slice(txn_statements($srv), 10)
     );
+    assert_eq(9, $srv->connections());
     $m = $pool->members()[0];
     assert_eq([0, 1], [$m['in_use'], $m['idle']]);
     $pool->close();
@@ -854,16 +866,15 @@ test('transport: every way a live connection is marked broken closes its socket 
 test('transport: a connection the server closed lets go of its socket at once, on a read and on a write', function () {
     // The server's end is gone already, so nothing lingers there; what is
     // left to close is this process's own descriptor.
-    $srv = txn_server(['SELECT gone' => [FakeServer::DROP]]);
+    $srv = txn_server(['SELECT gone' => [FakeServer::DROP]], 1024 * 1024);
     $db = txn_connect($srv);
     assert_true(txn_holds_socket($db));
     assert_throws(SkaidbException::class, fn () => $db->query('SELECT gone'), '/^connection closed by server$/');
     assert_true(!txn_holds_socket($db), 'end-of-file on a read: the socket is still open');
     assert_eq(1, $db->exec('UPDATE t SET n = 1'));
     assert_true(txn_holds_socket($db));
-    // A request far larger than the socket buffers, to a peer that has
-    // closed: the write itself fails partway.
-    $srv->closeAll();
+    // A request far larger than the socket buffers, to a server that closes
+    // the connection a megabyte into it: the write itself fails partway.
     assert_throws(
         SkaidbException::class,
         fn () => $db->query('SELECT ' . str_repeat('x', 16 * 1024 * 1024)),
@@ -929,7 +940,7 @@ test('transport: a lost connection is a ConnectionException, and a statement err
         'SELECT garbled' => [[F::header(['n']), F::chunk([[1]]), chr(42)]],
         'SELECT nope' => [F::error('no such column: nope')],
         'COMMIT' => [F::error(TXN_CONFLICT)],
-    ] + txn_stream_script());
+    ] + txn_stream_script(), 1024 * 1024);
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 0.5);
     // Every way the connection is lost under a statement: one type, still a
     // SkaidbException, and the connection re-dials for the next statement.
@@ -949,8 +960,8 @@ test('transport: a lost connection is a ConnectionException, and a statement err
         assert_true(!$db->isUsable(), "{$name}: the connection is broken");
         assert_eq(1, $db->exec('UPDATE t SET n = 1'), "{$name}: the next statement re-dials");
     }
-    // A failed write.
-    $srv->closeAll();
+    // A failed write: the server closes the connection a megabyte into a
+    // request far larger than the socket buffers.
     assert_throws(ConnectionException::class, fn () => $db->query('SELECT ' . str_repeat('x', 16 * 1024 * 1024)), '/^connection closed by server \(write\)$/');
     // Inside transaction(), the statements that are not sent any more.
     $e = assert_throws(ConnectionException::class, fn () => $db->transaction(function (Connection $c) {

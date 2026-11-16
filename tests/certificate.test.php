@@ -12,6 +12,7 @@ use Skaidb\Connection;
 use Skaidb\ConnectionException;
 use Skaidb\SkaidbException;
 use SkaidbTests\F;
+use SkaidbTests\FakeServer;
 
 /** A throwaway CA, a server certificate for 'skaidb' and a client certificate for CN=app. */
 function cert_fixture(): array
@@ -213,6 +214,42 @@ test('a client certificate alongside SCRAM: presented in TLS, the login stays th
     assert_true($db->isUsable());
     $db->close();
     cert_join($join);
+});
+
+test('TLS: a connection the server closed while it sat idle is seen at the socket, and a live one is left alone', function () {
+    // The look that finds an idle connection closed polls the socket. TLS
+    // sits above it with buffers of its own: what must show there is the
+    // transport's end-of-file or reset, and a healthy TLS connection —
+    // session tickets and all — must not look closed.
+    $fx = cert_fixture();
+    $srv = (new FakeServer([
+        'tls' => ['local_cert' => $fx['server']],
+        'handle' => fn (array $req) => $req['op'] === 1 ? F::rows(['answer_to'], [[$req['sql']]]) : null,
+    ]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 5.0, null, false, $fx['ca']);
+    for ($i = 0; $i < 20; $i++) {
+        usleep(10_000);
+        assert_true($db->isUsable(), "statement {$i}");
+        assert_eq("SELECT {$i}", $db->query("SELECT {$i}")->fetchColumn());
+    }
+    assert_eq(1, $srv->connections(), 'a live TLS connection was taken for a closed one');
+    $n = 1;
+    foreach ([FakeServer::HALF, FakeServer::CLOSE, FakeServer::RESET] as $how) {
+        // Twice each way: found by the statement, and by isUsable().
+        $srv->closeAll($how);
+        usleep(100_000);
+        assert_eq("SELECT {$how}", $db->query("SELECT {$how}")->fetchColumn(), $how);
+        assert_eq(++$n, $srv->connections(), $how);
+        $srv->closeAll($how);
+        assert_true(!$db->isUsable(), $how);
+        assert_eq('SELECT after', $db->query('SELECT after')->fetchColumn(), $how);
+        assert_eq(++$n, $srv->connections(), $how);
+        assert_true($db->isUsable(), $how);
+    }
+    usleep(50_000);
+    assert_eq(0, $srv->strayBytes(), 'bytes written to a connection the server had closed');
+    $db->close();
+    $srv->stop();
 });
 
 test('certificate mechanism: configuration errors are refused before dialling', function () {

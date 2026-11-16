@@ -390,7 +390,6 @@ test('prepared: a statement the server will not prepare is sent as text, and the
     // What the memory holds is what THIS connection was told: a new one
     // (another member, another version) is asked again.
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $ttl->execute([360]), '/^connection closed by server/');
     assert_true($ttl->execute([360]));
     assert_true($ttl->execute([420]));
     assert_eq(
@@ -464,7 +463,6 @@ test('prepared: a server from before prepared statements gets every parameterise
         "INSERT INTO t (id, name) VALUES (4, 'b')",
     ], declining_seen($srv));
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $st->execute([5, 'c']), '/^connection closed by server/');
     assert_true($st->execute([5, 'c']));
     assert_eq(['prepare INSERT INTO t (id, name) VALUES (?, ?)', "INSERT INTO t (id, name) VALUES (5, 'c')"], array_slice(declining_seen($srv), 6));
     $db->close();
@@ -629,7 +627,6 @@ test('prepared: after a re-dial a held statement is prepared again — it never 
     // The connection is lost while idle. B runs first on the new one, where
     // it takes id 0 — the id A had on the lost connection.
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $stB->execute(['y', 3]), '/^connection closed by server/');
     $stB->execute(['y', 3]);
     assert_eq(['ran' => $b, 'params' => ['y', 3]], $stB->fetch());
     $stA->execute(['x', 4]);
@@ -637,7 +634,6 @@ test('prepared: after a re-dial a held statement is prepared again — it never 
     // A batch through the held statement likewise: 2 as the UPDATE it is,
     // 1002 had it run as the DELETE.
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $stB->executeBatch([['y', 5]]), '/^connection closed by server/');
     assert_eq(1001, $stB->executeBatch([['y', 5]]));
     assert_eq(2, $stA->executeBatch([['x', 6], ['x', 7]]), 'the batch ran under an id issued by the lost connection');
     // Per connection: prepare before execute, and never an id the server
@@ -974,7 +970,6 @@ test('reconnect: a connection the server dropped re-dials on the next statement 
     $st = $db->prepare('SELECT ?');
     $st->execute([1]);
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/connection closed by server|timed out/');
     assert_true(!$db->isUsable());
     $st->execute([2]);
     assert_eq(2, $st->fetch()['p0']);
@@ -991,18 +986,32 @@ test('reconnect: a connection the server dropped re-dials on the next statement 
 /**
  * A server for the session database: USE … answers Ddl (an Error when it
  * names "gone"), a stream one row, SELECT one row, anything else a one-row
- * mutation.
+ * mutation. A prepare is taken, an execute answers a one-row mutation and
+ * a batch one row per row. $tls: `ssl` context options, to listen with TLS.
+ *
+ * @param array<string,mixed>|null $tls
  */
-function session_server(): FakeServer
+function session_server(?array $tls = null): FakeServer
 {
-    return (new FakeServer(['handle' => function (array $req) {
-        if (!in_array($req['op'], [1, 5], true)) {
-            return null;
+    return (new FakeServer(['tls' => $tls, 'handle' => function (array $req) {
+        switch ($req['op']) {
+            case 2:
+                return F::prepared(1, substr_count($req['sql'], '?'));
+            case 3:
+                return F::mutation(1);
+            case 7:
+                return F::mutation(count($req['rows']));
+            case 1:
+            case 5:
+            case 9:
+                break;
+            default:
+                return null;
         }
         if (preg_match('/^\s*use\b/i', $req['sql']) === 1) {
             return str_contains($req['sql'], 'gone') ? F::error('database "gone" does not exist') : F::ddl();
         }
-        if ($req['op'] === 5) {
+        if ($req['op'] !== 1) {
             return [F::header(['n']), F::chunk([[3]]), F::end()];
         }
         return str_starts_with($req['sql'], 'SELECT') ? F::rows(['n'], [[3]]) : F::mutation(1);
@@ -1011,7 +1020,8 @@ function session_server(): FakeServer
 
 /**
  * What a server saw, connection by connection: 'connect', then each
- * statement ("stream <sql>" for a streamed one). The Hello is left out.
+ * statement ("stream <sql>" for a streamed one, "prepare <sql>", "execute
+ * <params>", "batch <rows>"). The Hello is left out.
  *
  * @return array<int,string>
  */
@@ -1019,16 +1029,222 @@ function session_seen(FakeServer $srv): array
 {
     $out = [];
     foreach ($srv->requests() as $r) {
-        if ($r['op'] === 'connect') {
-            $out[] = 'connect';
-        } elseif ($r['op'] === 1) {
-            $out[] = $r['sql'];
-        } elseif ($r['op'] === 5) {
-            $out[] = 'stream ' . $r['sql'];
+        switch ($r['op']) {
+            case 'connect':
+                $out[] = 'connect';
+                break;
+            case 1:
+                $out[] = $r['sql'];
+                break;
+            case 2:
+                $out[] = 'prepare ' . $r['sql'];
+                break;
+            case 3:
+                $out[] = 'execute ' . json_encode($r['params']);
+                break;
+            case 7:
+                $out[] = 'batch ' . json_encode($r['rows']);
+                break;
+            case 5:
+            case 9:
+                $out[] = 'stream ' . $r['sql'];
+                break;
         }
     }
     return $out;
 }
+
+/**
+ * Every way a statement is sent, each returning what the session server
+ * answers it: [what it is, the call, what the server then saw].
+ *
+ * @return array<string,array{0:callable(Connection):mixed,1:mixed,2:array<int,string>}>
+ */
+function idle_statements(): array
+{
+    return [
+        'a read' => [fn (Connection $c) => $c->query('SELECT count(*) FROM notes')->fetchColumn(), 3, ['SELECT count(*) FROM notes']],
+        'a write' => [fn (Connection $c) => $c->exec('INSERT INTO notes (id) VALUES (1)'), 1, ['INSERT INTO notes (id) VALUES (1)']],
+        'a prepared write' => [function (Connection $c) {
+            $st = $c->prepare('INSERT INTO notes (id) VALUES (?)');
+            $st->execute([2]);
+            return $st->rowCount();
+        }, 1, ['prepare INSERT INTO notes (id) VALUES (?)', 'execute [2]']],
+        'a batch' => [
+            fn (Connection $c) => $c->prepare('INSERT INTO notes (id) VALUES (?)')->executeBatch([[3], [4]]),
+            2,
+            ['prepare INSERT INTO notes (id) VALUES (?)', 'batch [[3],[4]]'],
+        ],
+        'a stream' => [fn (Connection $c) => iterator_to_array($c->stream('SELECT n FROM notes')), [['n' => 3]], ['stream SELECT n FROM notes']],
+        'a stream with parameters' => [
+            fn (Connection $c) => iterator_to_array($c->stream('SELECT n FROM notes WHERE id > ?', [0])),
+            [['n' => 3]],
+            ['stream SELECT n FROM notes WHERE id > ?'],
+        ],
+    ];
+}
+
+test('idle: a connection the server closed while it sat idle costs no statement — nothing is written to it', function () {
+    // Over a real network a write to a connection the peer has closed
+    // succeeds, and only the read finds out. The half-closed fake server
+    // is that peer: it has sent its end-of-file and still takes whatever
+    // the client writes.
+    foreach (idle_statements() as $name => [$run, $answer, $seen]) {
+        $srv = session_server();
+        $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 5.0, 'app');
+        assert_eq(3, $db->query('SELECT 1')->fetchColumn());
+        $srv->closeAll(FakeServer::HALF);
+        usleep(100_000);
+        // No error reaches the application, for a read and a write alike:
+        // the statement was not sent on the dead connection, so it runs —
+        // once — on a new one, in the session's database.
+        assert_eq($answer, $run($db), $name);
+        assert_eq(['connect', 'USE "app"', 'SELECT 1', 'connect', 'USE "app"', ...$seen], session_seen($srv), $name);
+        usleep(50_000);
+        assert_eq(0, $srv->strayBytes(), "{$name}: bytes written to a connection the server had closed");
+        assert_true($db->isUsable());
+        $db->close();
+        $srv->stop();
+    }
+});
+
+test('idle: a clean close and a reset are found the same way', function () {
+    foreach ([FakeServer::CLOSE, FakeServer::RESET] as $how) {
+        $srv = session_server();
+        $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 5.0);
+        $db->exec('USE app');
+        foreach (idle_statements() as $name => [$run, $answer, $seen]) {
+            $from = count(session_seen($srv));
+            $srv->closeAll($how);
+            assert_eq($answer, $run($db), "{$how}: {$name}");
+            assert_eq(['connect', 'USE "app"', ...$seen], array_slice(session_seen($srv), $from), "{$how}: {$name}");
+        }
+        $db->close();
+        $srv->stop();
+    }
+});
+
+test('idle: a live connection is not taken for a dead one, and isUsable() tells the two apart', function () {
+    $srv = session_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    foreach (idle_statements() as $name => [$run, $answer]) {
+        usleep(20_000);
+        assert_true($db->isUsable(), $name);
+        assert_eq($answer, $run($db), $name);
+    }
+    assert_eq(1, $srv->connections(), 'the look at the socket replaced a healthy connection');
+    // The same look answers isUsable(): no round trip, and no statement
+    // needed to find out.
+    $srv->closeAll(FakeServer::HALF);
+    assert_true(!$db->isUsable());
+    assert_true(
+        !is_resource((new \ReflectionProperty(Connection::class, 'sock'))->getValue($db)),
+        'found closed: the connection is broken, and lets go of its socket at once'
+    );
+    assert_eq(3, $db->query('SELECT 1')->fetchColumn());
+    assert_true($db->isUsable());
+    assert_eq([2, 0], [$srv->connections(), $srv->strayBytes()]);
+    // A connection in the middle of a stream is not idle: what is readable
+    // on it is the stream, and it is not looked at.
+    $srv2 = scripted_server();
+    $db2 = new Connection('127.0.0.1', $srv2->port, 'ada', 'secret');
+    $n = 0;
+    foreach ($db2->stream('SELECT big') as $row) {
+        if (++$n % 500 === 0) {
+            usleep(5_000);
+            assert_true(!$db2->isUsable(), 'busy, as during any stream');
+        }
+    }
+    assert_eq(5000, $n);
+    assert_true($db2->isUsable());
+    assert_eq(1, $srv2->connections());
+    $db2->close();
+    $srv2->stop();
+    $db->close();
+    $srv->stop();
+});
+
+test('idle: bytes nobody asked for mean the connection is not at a request boundary — it is replaced', function () {
+    // A reply followed by a frame no request is waiting for. Left on the
+    // connection it would answer the next statement, and every reply after
+    // it would come one statement late.
+    $srv = (new FakeServer(['handle' => function (array $req) {
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        $reply = F::rows(['answer_to'], [[$req['sql']]]);
+        return $req['sql'] === 'SELECT twice' ? [$reply, F::rows(['answer_to'], [['a leftover frame']])] : $reply;
+    }]))->start();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    assert_eq('SELECT twice', $db->query('SELECT twice')->fetchColumn());
+    usleep(50_000);
+    assert_eq('SELECT after', $db->query('SELECT after')->fetchColumn(), 'the statement was answered with a leftover frame');
+    assert_eq('SELECT again', $db->query('SELECT again')->fetchColumn());
+    assert_eq(2, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('idle: inside transaction() a connection found dead is a lost transaction, not a re-dial', function () {
+    $srv = session_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $lost = '/^connection lost inside a transaction: the statement was not sent/';
+    $e = assert_throws(ConnectionException::class, fn () => $db->transaction(function (Connection $c) use ($srv, $lost) {
+        $c->exec('INSERT INTO notes (id) VALUES (1)');
+        $srv->closeAll(FakeServer::HALF);
+        // Found by the look, before anything is written: not sent here,
+        // and not on a new connection, where it would autocommit.
+        assert_throws(ConnectionException::class, fn () => $c->exec('INSERT INTO notes (id) VALUES (2)'), $lost);
+        assert_throws(ConnectionException::class, fn () => $c->prepare('INSERT INTO notes (id) VALUES (?)')->execute([3]), $lost);
+        return 'all is well';
+    }), $lost);
+    usleep(50_000);
+    assert_eq(['connect', 'BEGIN', 'INSERT INTO notes (id) VALUES (1)'], session_seen($srv));
+    assert_eq(0, $srv->strayBytes());
+    // Afterwards it re-dials, like any lost connection.
+    assert_eq(1, $db->exec('INSERT INTO notes (id) VALUES (4)'));
+    assert_eq(['connect', 'INSERT INTO notes (id) VALUES (4)'], array_slice(session_seen($srv), 3));
+    $db->close();
+    $srv->stop();
+});
+
+test('pool: a connection the server closed while it sat idle in the pool is not handed out', function () {
+    foreach ([FakeServer::HALF, FakeServer::CLOSE, FakeServer::RESET] as $how) {
+        $srv = session_server();
+        $pool = new Pool(['127.0.0.1', $srv->port, 'ada', 'secret', 'database' => 'app'], 4);
+        $one = $pool->acquire();
+        $two = $pool->acquire();
+        $pool->release($one);
+        $pool->release($two);
+        assert_eq(2, $pool->members()[0]['idle']);
+        $srv->closeAll($how);
+        // The checkout looks before it hands a connection out: both idle
+        // ones are dropped, and the borrower gets one that works.
+        $got = $pool->acquire();
+        assert_true($got !== $one && $got !== $two, "{$how}: a dead connection was handed out");
+        assert_eq(3, $got->query('SELECT count(*) FROM notes')->fetchColumn(), $how);
+        $pool->release($got);
+        $m = $pool->members()[0];
+        assert_eq(['ready', 0, 1], [$m['state'], $m['in_use'], $m['idle']], "{$how}: an idle close is not the member failing");
+        assert_eq(1, $pool->withConnection(fn (Connection $c) => $c->exec('INSERT INTO notes (id) VALUES (1)')), $how);
+        assert_eq(
+            ['connect', 'USE "app"', 'SELECT count(*) FROM notes', 'INSERT INTO notes (id) VALUES (1)'],
+            array_slice(session_seen($srv), 4),
+            $how
+        );
+        usleep(50_000);
+        assert_eq(0, $srv->strayBytes(), $how);
+        // Closed under a borrower who holds it: its next statement re-dials
+        // inside the checkout, in the pool's database.
+        $pool->withConnection(function (Connection $c) use ($srv, $how) {
+            $srv->closeAll($how);
+            assert_eq(3, $c->query('SELECT count(*) FROM notes')->fetchColumn(), $how);
+        });
+        assert_eq(['connect', 'USE "app"', 'SELECT count(*) FROM notes'], array_slice(session_seen($srv), 8), $how);
+        $pool->close();
+        $srv->stop();
+    }
+});
 
 test('reconnect: the session database is entered again on the new connection, however it was entered', function () {
     $count = 'SELECT count(*) FROM notes';
@@ -1078,10 +1294,9 @@ test('reconnect: the session database is entered again on the new connection, ho
     foreach ($ways as $name => [$enter, $first, $reentered]) {
         $srv = session_server();
         $db = $enter($srv);
-        // The connection is lost while idle; the statement that finds out
-        // throws, and the next one re-dials.
+        // The connection is lost while idle; the next statement finds out
+        // before it is sent, and runs on a new connection.
         $srv->closeAll();
-        assert_throws(SkaidbException::class, fn () => $db->query($count), '/^connection closed by server/');
         assert_eq(3, $db->query($count)->fetchColumn(), $name);
         assert_eq(1, $db->exec($insert), $name);
         assert_eq(['connect', ...$first, 'connect', $reentered, $count, $insert], session_seen($srv), $name);
@@ -1116,7 +1331,6 @@ test('reconnect: only a statement that is exactly one USE moves the session data
     $db->exec('USE app');
     $db->exec('USE other; USE third');
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
     $db->query('SELECT 1');
     assert_eq(['connect', 'USE "app"', 'SELECT 1'], array_slice(session_seen($srv), 3));
     $db->close();
@@ -1147,7 +1361,6 @@ test('reconnect: a USE with a -- comment is read as the server reads it', functi
     $db->exec('USE app');
     $db->exec('USE other -- the reporting database');
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $db->query('SELECT count(*) FROM notes'), '/^connection closed by server/');
     assert_eq(3, $db->query('SELECT count(*) FROM notes')->fetchColumn());
     assert_eq(1, $db->exec('INSERT INTO notes (id) VALUES (1)'));
     assert_eq(
@@ -1174,7 +1387,6 @@ test('reconnect: a session database that cannot be entered again fails the state
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
     $db->exec('USE app');
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $db->query('SELECT count(*) FROM notes'), '/^connection closed by server/');
     assert_throws(SkaidbException::class, fn () => $db->query('SELECT count(*) FROM notes'), '/^database "app" does not exist$/');
     assert_true(!$db->isUsable());
     assert_throws(SkaidbException::class, fn () => $db->exec('INSERT INTO notes (id) VALUES (1)'), '/^database "app" does not exist$/');
@@ -1199,7 +1411,6 @@ test('reconnect: a re-dial the server turns away in its handshake leaves the con
     ]))->start();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
     touch($full);
     // Each of these dials, reaches the server and is turned away.
     assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
@@ -1218,7 +1429,7 @@ test('reconnect: close() is terminal for a broken connection too — its next st
     $srv = scripted_server();
     $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
     $srv->closeAll();
-    assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
+    assert_true(!$db->isUsable(), 'found closed by the server: broken, and it would re-dial');
     $db->close();
     assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection is closed$/');
     assert_throws(SkaidbException::class, fn () => $db->prepare('SELECT ?')->execute([1]), '/^connection is closed$/');
@@ -1241,10 +1452,12 @@ test('pool: idle connections are reused, broken ones discarded, surplus closed',
     assert_true($a === $pool->acquire());
     $pool->release($a);
     $srv->closeAll();
-    $c = $pool->acquire(); // $a still looks usable locally; it is handed out and re-dials
-    assert_true($c === $a);
-    assert_throws(SkaidbException::class, fn () => $c->query('SELECT 1'));
-    $pool->release($c);  // broken now: not pooled
+    $c = $pool->acquire(); // $a was closed by the server while it sat idle: not handed out
+    assert_true($c !== $a);
+    assert_true(!$a->isUsable());
+    assert_eq(1, $c->query('SELECT 1')->rowCount());
+    assert_throws(SkaidbException::class, fn () => $c->query('SELECT garbage'));
+    $pool->release($c);  // broken under its borrower: not pooled
     assert_true(!$c->isUsable());
     $d = $pool->acquire();
     assert_true($d !== $c);
@@ -1262,9 +1475,8 @@ test('pool: a borrower\'s USE does not reach the next borrower, and a re-dialled
     // A pooled connection lost while idle, re-dialled inside one checkout:
     // back in the pool's database before anything else is sent.
     $pool->withConnection(fn (Connection $c) => $c->query($count));
-    $srv->closeAll();
-    $pool->withConnection(function (Connection $c) use ($count) {
-        assert_throws(SkaidbException::class, fn () => $c->query($count), '/^connection closed by server/');
+    $pool->withConnection(function (Connection $c) use ($srv, $count) {
+        $srv->closeAll();
         assert_eq(3, $c->query($count)->fetchColumn());
     });
     assert_eq(['connect', 'USE "app"', $count, 'connect', 'USE "app"', $count], session_seen($srv));
@@ -1284,7 +1496,6 @@ test('pool: a borrower\'s USE does not reach the next borrower, and a re-dialled
     $pool->withConnection(function (Connection $c) use ($srv, $count) {
         $c->exec('USE other');
         $srv->closeAll();
-        assert_throws(SkaidbException::class, fn () => $c->query($count), '/^connection closed by server/');
         assert_eq(3, $c->query($count)->fetchColumn());
     });
     assert_eq(['USE app', 'USE other', 'connect', 'USE "other"', $count], array_slice(session_seen($srv), 10));

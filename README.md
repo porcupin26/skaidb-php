@@ -421,6 +421,16 @@ try {
   again and clears the prepared-statement cache. Because the failed
   statement *may* have executed, the driver never retries it for you: retry
   a write only if it is idempotent. `isUsable()` reports the state.
+- **A connection the server closed while it sat idle costs no statement.**
+  A restart, a failover or an idle timeout closes idle connections, and a
+  write to one still succeeds — only the read would fail, when the
+  statement can no longer be sent elsewhere. So before it writes a request
+  the driver looks at the socket (one poll with a zero timeout, no round
+  trip; under TLS too): a connection found closed, reset, or holding bytes
+  no request is waiting for is replaced there and then, and the statement
+  runs on the new one. No error reaches the application, for a read and a
+  write alike — nothing was sent on the dead connection. `isUsable()` makes
+  the same look, and a pool makes it at every checkout.
 - **The session database survives the re-dial.** It is the constructor's
   `$database`, or the one the last `USE` the server accepted moved to: a
   statement that is exactly `USE [DATABASE] <name>` (the name bare or in

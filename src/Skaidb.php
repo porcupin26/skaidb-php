@@ -776,15 +776,25 @@ class Connection
     }
 
     /**
-     * False once closed, once a transport error broke the socket, and while a
-     * stream is still in flight. Pool::acquire/release use this as the health
-     * check, and a connection parked on a RowsChunk would answer the next
-     * borrower's statement with a leftover stream frame.
+     * False once closed, once a transport error broke the socket, while a
+     * stream is still in flight, and when the server has closed the
+     * connection while it sat idle — found by a look at the socket that
+     * costs no round trip (see peerGone), and the connection is broken from
+     * then on: its next statement re-dials. Pool::acquire/release use this
+     * as the health check: an idle connection the server closed is not
+     * handed out, and a connection parked on a RowsChunk would answer the
+     * next borrower's statement with a leftover stream frame.
      */
     public function isUsable(): bool
     {
-        return !$this->closed && !$this->broken && !$this->streaming
-            && is_resource($this->sock);
+        if ($this->closed || $this->broken || $this->streaming || !is_resource($this->sock)) {
+            return false;
+        }
+        if ($this->peerGone()) {
+            $this->markBroken();
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -1568,8 +1578,9 @@ class Connection
     }
 
     /**
-     * Re-dial if the transport died since the last statement, BEFORE anything
-     * is prepared on it.
+     * Re-dial if the transport died since the last statement — under it, or
+     * while the connection sat idle (see peerGone) — BEFORE anything is
+     * prepared or written on it.
      *
      * The prepared-statement cache MUST be cleared: an id is only valid on the
      * connection that created it, so carrying one across a reconnect would run
@@ -1581,6 +1592,13 @@ class Connection
         // it was closed: nothing dials again.
         if ($this->closed || ($this->sock === null && !$this->broken)) {
             throw new SkaidbException('connection is closed');
+        }
+        if (!$this->broken && $this->peerGone()) {
+            // Closed by the server while it sat idle (a restart, a
+            // failover, an idle timeout). Nothing has been written, so
+            // this is the connection's loss and not the statement's: it is
+            // replaced below, and the statement runs on the new one.
+            $this->markBroken();
         }
         if (!$this->broken) {
             return;
@@ -1615,6 +1633,38 @@ class Connection
             $this->markBroken();   // still down; the next statement retries
             throw $e;
         }
+    }
+
+    /**
+     * The look at an idle connection before a request is written on it:
+     * whether the server has closed it meanwhile.
+     *
+     * A write to a connection the peer has closed succeeds — its reset
+     * comes back later, over a real network after the write returned — so
+     * only the read would find out, when the statement can no longer be
+     * sent elsewhere (it may have run). Asking the socket first costs no
+     * round trip: one poll with a zero timeout. Between two requests the
+     * server sends nothing, so a connection that is readable holds an
+     * end-of-file, a reset, or bytes no request is waiting for; each means
+     * it is not a connection at a request boundary any more.
+     *
+     * The poll is of the socket itself, also under TLS: stream_select()
+     * polls the descriptor, where an end-of-file or a reset shows whatever
+     * the TLS layer above has buffered (and it reports unread bytes PHP
+     * holds for the stream as readable too). A connection in the middle of
+     * a stream is not idle and is never looked at. When the poll cannot be
+     * made the answer is "no": the write and the read then find out, as
+     * they would have.
+     */
+    private function peerGone(): bool
+    {
+        if (!is_resource($this->sock)) {
+            return false;
+        }
+        $read = [$this->sock];
+        $write = null;
+        $except = null;
+        return @stream_select($read, $write, $except, 0, 0) > 0;
     }
 
     /**
@@ -2941,9 +2991,10 @@ class Pool
                 $this->nextRefresh = self::now() + $this->refreshInterval;
                 $this->listThrough($conn);
             }
-            // A connection the server closed while it sat idle still looks
-            // fine locally (its next statement throws once and re-dials);
-            // this drops the ones already known dead, then loops.
+            // isUsable() looks at the socket: an idle connection the server
+            // closed meanwhile (a restart, an idle timeout) is dropped here
+            // instead of being handed out, and the loop takes the next one
+            // or dials.
             if (!$conn->isUsable()) {
                 $conn->close();
                 continue;

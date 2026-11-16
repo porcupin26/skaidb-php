@@ -31,10 +31,13 @@ $pool->close();
   number checked out: a burst opens extras and the surplus is closed on
   release.
 - `acquire()` returns an idle connection only if it is still usable and
-  otherwise opens a new one. A connection the server closed while it sat
-  idle looks fine locally; its next statement throws once and re-dials
-  after that (in the pool's order: usable members first, the one it lost
-  last), like any other connection.
+  otherwise opens a new one. It looks at the socket of each idle connection
+  it is about to hand out (a poll, no round trip): one the server closed
+  while it sat idle — a restart, an idle timeout — is dropped, not handed
+  out, and that is not counted against the member. A connection closed
+  under a borrower who holds it re-dials on its next statement (in the
+  pool's order: usable members first, the one it lost last), like any other
+  connection.
 - `release()` closes a connection instead of pooling it when it is broken,
   still streaming, its member is ejected, not `ready` or gone, or the pool
   is full or closed.

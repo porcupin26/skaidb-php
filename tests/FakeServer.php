@@ -120,6 +120,24 @@ final class FakeServer
     /** Return this from a handler to close the connection instead of answering. */
     public const DROP = "\0DROP\0";
 
+    /** closeAll(): close every connection, as a node going away does. */
+    public const CLOSE = 'close';
+
+    /**
+     * closeAll(): shut down only the SENDING side of every connection and
+     * keep reading. The client reads end-of-file while its writes still
+     * succeed — what a connection closed by a peer looks like over a real
+     * network, where the reset for a write has not come back yet. Whatever
+     * arrives afterwards is counted (strayBytes()) and discarded.
+     */
+    public const HALF = 'half';
+
+    /**
+     * closeAll(): close every connection with a reset (SO_LINGER 0) instead
+     * of a clean end-of-file. Needs the sockets extension.
+     */
+    public const RESET = 'reset';
+
     public int $port = 0;
 
     private int $pid = 0;
@@ -128,6 +146,15 @@ final class FakeServer
     private $listener = null;
 
     private string $log;
+
+    /** How the next SIGUSR1 ends the connections: CLOSE, HALF or RESET. */
+    private string $ctl;
+
+    /** @var array<string,mixed>|null `ssl` context options: listen with TLS */
+    private ?array $tls;
+
+    /** Close a connection once this many bytes of one unfinished frame have arrived; 0 = never. */
+    private int $cutAt;
 
     private string $password;
 
@@ -153,7 +180,7 @@ final class FakeServer
      */
     private int $owner;
 
-    /** Set by SIGUSR1; the select loop closes every client at its next safe point. */
+    /** Set by SIGUSR1; the select loop ends every client connection at its next safe point. */
     private bool $dropAll = false;
 
     /**
@@ -170,6 +197,12 @@ final class FakeServer
      *              connection before the handshake (a node at capacity).
      *   deny     — a reason: every login is answered with AuthOutcome
      *              Denied carrying it, whatever the proof.
+     *   tls      — `ssl` stream-context options (local_cert, …): the server
+     *              listens with TLS.
+     *   cutAt    — bytes: a connection is closed once that much of a frame
+     *              has arrived and the frame is still not complete, as a
+     *              server closes one that sends a frame beyond its limit.
+     *              The client is still writing then: its write fails.
      */
     public function __construct(array $opts = [])
     {
@@ -177,16 +210,28 @@ final class FakeServer
         $this->handler = $opts['handle'] ?? fn (array $req) => null;
         $this->refuse = $opts['refuse'] ?? null;
         $this->deny = $opts['deny'] ?? null;
+        $this->tls = $opts['tls'] ?? null;
+        $this->cutAt = $opts['cutAt'] ?? 0;
         $this->owner = getmypid();
         $this->corruptServerSignature = $opts['corruptServerSignature'] ?? false;
         $this->log = tempnam(sys_get_temp_dir(), 'skaidb-fake-');
+        $this->ctl = tempnam(sys_get_temp_dir(), 'skaidb-fake-ctl-');
     }
 
     public function start(): self
     {
         $errno = 0;
         $errstr = '';
-        $this->listener = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        // With TLS the listener is still plain TCP: each accepted
+        // connection is upgraded in the child (see serve()), which keeps
+        // its socket reachable for closeAll(RESET).
+        $this->listener = stream_socket_server(
+            'tcp://127.0.0.1:0',
+            $errno,
+            $errstr,
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+            stream_context_create($this->tls === null ? [] : ['ssl' => $this->tls])
+        );
         if ($this->listener === false) {
             throw new \RuntimeException("fake server cannot listen: {$errstr}");
         }
@@ -212,13 +257,26 @@ final class FakeServer
         return $this;
     }
 
-    /** Ask the child to close every live client connection, as a node restart would. */
-    public function closeAll(): void
+    /**
+     * Ask the child to end every live client connection — closed, as a node
+     * restart would (CLOSE), half-closed (HALF) or reset (RESET) — and wait
+     * until it has: the child logs it, and the end-of-file or reset has had
+     * time to reach the client.
+     */
+    public function closeAll(string $how = self::CLOSE): void
     {
-        if ($this->pid > 0) {
-            posix_kill($this->pid, SIGUSR1);
-            usleep(50_000);
+        if ($this->pid <= 0) {
+            return;
         }
+        $done = fn () => count(array_filter($this->events(), fn ($r) => $r['op'] === 'dropped'));
+        $before = $done();
+        file_put_contents($this->ctl, $how);
+        posix_kill($this->pid, SIGUSR1);
+        $until = microtime(true) + 5.0;
+        while ($done() === $before && microtime(true) < $until) {
+            usleep(1_000);
+        }
+        usleep(50_000);
     }
 
     public function stop(): void
@@ -232,6 +290,7 @@ final class FakeServer
             $this->pid = 0;
         }
         @unlink($this->log);
+        @unlink($this->ctl);
     }
 
     public function __destruct()
@@ -248,7 +307,20 @@ final class FakeServer
      */
     public function requests(): array
     {
-        return array_values(array_filter($this->events(), fn ($r) => $r['op'] !== 'hangup'));
+        return array_values(array_filter(
+            $this->events(),
+            fn ($r) => !in_array($r['op'], ['hangup', 'dropped', 'stray'], true)
+        ));
+    }
+
+    /**
+     * How many bytes arrived on connections after closeAll(HALF) half-closed
+     * them: what a client wrote to a connection it could have known was
+     * gone. The child notices within its select loop, so give it a moment.
+     */
+    public function strayBytes(): int
+    {
+        return array_sum(array_map(fn ($r) => $r['op'] === 'stray' ? $r['bytes'] : 0, $this->events()));
     }
 
     /**
@@ -304,10 +376,22 @@ final class FakeServer
             }
             if ($this->dropAll) {
                 $this->dropAll = false;
-                foreach ($conns as $c) {
+                $how = (string) @file_get_contents($this->ctl);
+                foreach ($conns as $id => $c) {
+                    if ($how === self::HALF) {
+                        stream_socket_shutdown($c['sock'], STREAM_SHUT_WR);
+                        $conns[$id]['half'] = true;
+                        continue;
+                    }
+                    if ($how === self::RESET) {
+                        // SO_LINGER with a zero timeout: close() sends a
+                        // reset instead of the orderly end-of-file.
+                        socket_set_option($c['raw'], SOL_SOCKET, SO_LINGER, ['l_onoff' => 1, 'l_linger' => 0]);
+                    }
                     fclose($c['sock']);
+                    unset($conns[$id]);
                 }
-                $conns = [];
+                $this->record(['op' => 'dropped', 'how' => $how]);
             }
             $read = [$this->listener];
             foreach ($conns as $c) {
@@ -327,9 +411,17 @@ final class FakeServer
                         continue;
                     }
                     if ($client !== false) {
+                        // The socket under the stream, taken before TLS
+                        // wraps it: a TLS stream cannot be imported later.
+                        $raw = function_exists('socket_import_stream') ? socket_import_stream($client) : null;
+                        if ($this->tls !== null
+                            && @stream_socket_enable_crypto($client, true, STREAM_CRYPTO_METHOD_TLS_SERVER) !== true) {
+                            fclose($client);
+                            continue;
+                        }
                         stream_set_blocking($client, false);
-                        $conns[(int) $client] = ['sock' => $client, 'buf' => '', 'state' => 'start',
-                            'user' => '', 'salted' => '', 'authMessage' => '', 'n' => ++$accepted];
+                        $conns[(int) $client] = ['sock' => $client, 'raw' => $raw, 'buf' => '', 'state' => 'start',
+                            'user' => '', 'salted' => '', 'authMessage' => '', 'n' => ++$accepted, 'half' => false];
                         $this->record(['op' => 'connect']);
                     }
                     continue;
@@ -345,7 +437,20 @@ final class FakeServer
                     $this->record(['op' => 'hangup']);
                     continue;
                 }
+                if ($conns[$id]['half']) {
+                    // Half-closed: nothing is answered any more. Count what
+                    // still arrives and drop it.
+                    if ($data !== '') {
+                        $this->record(['op' => 'stray', 'bytes' => strlen($data)]);
+                    }
+                    continue;
+                }
                 $conns[$id]['buf'] .= $data;
+                if ($this->cutAt > 0 && strlen($conns[$id]['buf']) >= $this->cutAt) {
+                    fclose($sock);
+                    unset($conns[$id]);
+                    continue;
+                }
                 while (isset($conns[$id])) {
                     $buf = $conns[$id]['buf'];
                     if (strlen($buf) < 4) {

@@ -153,7 +153,10 @@ The default consistency for statements created afterwards.
 ### `isUsable(): bool`
 
 False once closed, once a transport error broke the connection (the next
-statement will re-dial), and while a stream is in flight.
+statement will re-dial), while a stream is in flight, and when the server
+has closed the connection while it sat idle. The last is found by a look at
+the socket — one poll with a zero timeout, no round trip — and breaks the
+connection: its socket is closed, and the next statement re-dials.
 
 ### `endpoint(): ?string`
 
@@ -189,6 +192,16 @@ leaves the connection broken, so the statement after it dials again. The
 new session has no transaction open: a statement sent after a transport
 error inside a hand-written `BEGIN` … `COMMIT` autocommits, so stop and
 start the transaction again (`transaction()` refuses to send it).
+
+A connection lost while it sat idle is replaced the same way, and costs no
+statement. Every statement first looks at the socket (one poll with a zero
+timeout; the socket itself, also under TLS): readable between two requests
+means the server closed it (end-of-file), reset it, or sent bytes no
+request is waiting for. Nothing has been written at that point, so the
+connection re-dials and the statement runs on the new one, with no error.
+A connection in the middle of a stream is not idle and is not looked at.
+Inside `transaction()` a connection found closed is not replaced: the
+statement throws `connection lost inside a transaction: …`.
 
 The session database is the constructor's `$database`, or the one named by
 the last `USE` the server accepted. The driver reads a statement that is

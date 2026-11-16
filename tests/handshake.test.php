@@ -113,7 +113,6 @@ test('seeds: a seed that refuses its handshake is walked past, like one that ref
     $db = $open('secret', $seeds);
     for ($i = 0; $i < 20; $i++) {
         $good->closeAll();
-        assert_throws(SkaidbException::class, fn () => $db->query('SELECT 1'), '/^connection closed by server/');
         assert_eq(1, $db->query('SELECT 1')->rowCount(), "re-dial {$i}");
     }
     $db->close();
