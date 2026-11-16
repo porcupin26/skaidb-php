@@ -229,6 +229,17 @@ statement with that error, unsent, as a database that cannot be entered
 does. (A streamed `SET CONSISTENCY` is refused by the server and so never
 noted; send it with `exec()`.)
 
+One piece of that state is left out of a re-dial: the one the statement
+behind it replaces. When the statement that finds the connection gone is
+itself a `USE` the driver can read, the new connection is not taken into
+the old database first — the settings are put back, then the `USE` is sent
+and its answer decides the session database. A database that was dropped
+therefore fails every statement (`database "app" does not exist`) but not
+the `USE` that leaves it. The same holds for a `SET CONSISTENCY …` or a
+`SET SCAN BUDGET …` and the setting of its kind. If such a statement is
+then refused, the connection is not where the driver's notes say, so it is
+closed and the next statement dials again, with everything put back.
+
 ## `Statement`
 
 Created by `prepare()`/`query()`. Holds the whole result of the last

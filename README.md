@@ -456,6 +456,14 @@ try {
   setting cleared with `… DEFAULT` is not sent. If one is refused there,
   the statement throws that error and is not sent: it never runs under
   other settings than the ones you set.
+- **A `USE` always gets you out.** If the session database was dropped and
+  the connection is lost, every statement fails at the re-dial's `USE`
+  (`database "app" does not exist`) — except a `USE` itself: the new
+  connection is not taken into the old database first, so `$db->exec('USE
+  other')` succeeds and the session carries on in `other`. A `SET
+  CONSISTENCY …` or `SET SCAN BUDGET …` replaces a setting the new
+  connection refuses the same way. Should that statement be refused in
+  turn, the connection is dropped again rather than used half restored.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   rather than hand the next caller a misaligned reply; the next statement
   reconnects.

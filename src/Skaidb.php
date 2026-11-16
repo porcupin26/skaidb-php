@@ -300,6 +300,17 @@ class Connection
     private ?string $scanBudgetNote = null;
 
     /**
+     * The live connection was dialled WITHOUT one piece of the session's
+     * noted state, because the statement it was dialled for replaces that
+     * piece (see dial). Until that statement is answered the connection is
+     * not where the notes say it is: accepted, the note is the statement's
+     * and all is well; refused, or lost, the connection is given up (see
+     * landed) rather than used in a state nobody chose. The statement is
+     * written right after the dial, with nothing in between that can throw.
+     */
+    private bool $adrift = false;
+
+    /**
      * The Pool that owns this connection (see Pool), or null outside one:
      * told each round trip's latency, each transport failure and each write,
      * and asked for the dial order when the connection re-dials.
@@ -390,12 +401,20 @@ class Connection
     }
 
     /**
-     * Connect, authenticate and enter the session database. Used for the
+     * Connect, authenticate and put the session's state back. Used for the
      * first connect and for every reconnect, so a recovered connection is
      * indistinguishable from a fresh one.
+     *
+     * $replaces names the piece of that state ('use', 'consistency',
+     * 'scan') the statement behind this dial is about to replace, when it
+     * is one the driver reads as such. That piece is not put back first: a
+     * database that was dropped, or a setting this member refuses, would
+     * otherwise fail every dial, the one for the USE or the SET that leaves
+     * it included, and nothing short of a new Connection could get out.
      */
-    private function dial(): void
+    private function dial(?string $replaces = null): void
     {
+        $this->adrift = false;
         extract($this->dialArgs);
 
         $errno = 0;
@@ -514,15 +533,23 @@ class Connection
         // database is gone, a setting is refused — fails, and so does the
         // statement behind it, rather than run in another database or
         // under other settings.
-        if ($this->database !== null) {
-            $this->exec('USE "' . str_replace('"', '""', $this->database) . '"');
+        $restore = [
+            'use' => $this->database === null ? null : 'USE "' . str_replace('"', '""', $this->database) . '"',
+            'consistency' => $this->consistencyNote,
+            'scan' => $this->scanBudgetNote,
+        ];
+        $left = false;
+        foreach ($restore as $what => $statement) {
+            if ($statement === null) {
+                continue;
+            }
+            if ($what === $replaces) {
+                $left = true;
+                continue;
+            }
+            $this->exec($statement);
         }
-        if ($this->consistencyNote !== null) {
-            $this->exec($this->consistencyNote);
-        }
-        if ($this->scanBudgetNote !== null) {
-            $this->exec($this->scanBudgetNote);
-        }
+        $this->adrift = $left;
     }
 
     /**
@@ -855,7 +882,8 @@ class Connection
     public function runQuery(string $sql, int $consistency): array
     {
         $this->assertNotStreaming();
-        $this->ensureLive();
+        $read = self::sessionStatement($sql);
+        $this->ensureLive($read[0] ?? null);
         if ($this->closed) {
             throw new SkaidbException('connection is closed');
         }
@@ -863,8 +891,14 @@ class Connection
         // OP_QUERY=1, consistency u8, u32 LE sql_len, sql bytes.
         $req = pack('C', 1) . pack('C', $consistency)
             . pack('V', strlen($sqlBytes)) . $sqlBytes;
-        $res = $this->roundtrip($req);
-        $this->noteSession($sql);
+        try {
+            $res = $this->roundtrip($req);
+        } catch (SkaidbException $e) {
+            $this->landed(false);
+            throw $e;
+        }
+        $this->noteSession($read);
+        $this->landed(true);
         return $res;
     }
 
@@ -928,22 +962,22 @@ class Connection
         $params = array_values($params);
         $level = $consistency === null ? $this->consistency : self::resolveConsistency($consistency);
         $this->assertNotStreaming();
-        $this->ensureLive();
-        if ($this->closed) {
-            throw new SkaidbException('connection is closed');
-        }
         // OP_QUERY_STREAM=5: consistency u8, u32 LE sql_len, sql bytes. With
         // parameters, OP_QUERY_STREAM_PARAMS=9: the same, then the parameter
-        // vector. Built before anything is sent, so a value that cannot be
-        // bound throws with the connection still at a request boundary.
+        // vector. Built before anything is sent — and before the connection
+        // is looked at — so a value that cannot be bound throws with the
+        // connection untouched, still at a request boundary.
         $req = pack('C', $params === [] ? 5 : 9) . pack('C', $level) . pack('V', strlen($sql)) . $sql;
         if ($params !== []) {
             $req .= self::encodeParams($params);
         }
+        $read = self::sessionStatement($sql);
+        $this->ensureLive($read[0] ?? null);
         $started = hrtime(true);
         try {
             $this->writeFrame($req);
         } catch (SkaidbException $e) {
+            $this->landed(false);
             $this->observeFailure();
             throw $e;
         }
@@ -956,6 +990,7 @@ class Connection
             try {
                 $frame = $this->readFrame();
             } catch (SkaidbException $e) {
+                $this->landed(false);
                 $this->observeFailure();
                 throw $e;
             }
@@ -968,11 +1003,13 @@ class Connection
                 $tag = $r->u8();
             } catch (\Throwable $e) {
                 $this->markBroken();
+                $this->landed(false);
                 throw new ConnectionException($e->getMessage(), 0, $e);
             }
             if ($tag === 3) {
                 // One ordinary Error frame before any header: the statement
                 // failed and the connection is at a request boundary.
+                $this->landed(false);
                 $msg = $r->text();
                 if (str_contains($msg, 'unknown opcode')) {
                     $what = $params === [] ? 'streaming' : 'parameterised streaming (skaidb >= 0.330)';
@@ -980,7 +1017,8 @@ class Connection
                 }
                 throw self::serverError($msg);
             }
-            $this->noteSession($sql);
+            $this->noteSession($read);
+            $this->landed(true);
             $this->noteStatement($sql);
             if ($tag === 1) { // Mutation: not row-producing
                 return ['kind' => 'mutation', 'columns' => [], 'affected' => $r->u64()];
@@ -1518,16 +1556,16 @@ class Connection
     }
 
     /**
-     * The server accepted $sql, sent as text: if it changed the session's
-     * state in a way the driver can read, note it — a re-dial has to put
-     * that state back (see dial). A USE moved the session to another
+     * The server accepted a statement sent as text, read as $read (see
+     * sessionStatement): if it changed the session's state in a way the
+     * driver can read, note it — a re-dial has to put that state back (see
+     * dial). A USE moved the session to another
      * database; a SET CONSISTENCY or a SET SCAN BUDGET set the override or
      * the limit, or cleared it with DEFAULT. Only text statements come
      * through here: the server prepares none of these.
      */
-    private function noteSession(string $sql): void
+    private function noteSession(?array $read): void
     {
-        $read = self::sessionStatement($sql);
         if ($read === null) {
             return;
         }
@@ -1538,6 +1576,25 @@ class Connection
             $this->consistencyNote = $value;
         } else {
             $this->scanBudgetNote = $value;
+        }
+    }
+
+    /**
+     * The statement a connection was dialled adrift for has been answered,
+     * or will not be (see $adrift). Accepted, the connection is where the
+     * notes say again — the statement's own note is taken by then. Anything
+     * else leaves it without a piece of the session's state, so it is given
+     * up: the next statement re-dials and puts everything back, or fails
+     * there, but never runs in a database or under settings nobody chose.
+     */
+    private function landed(bool $accepted): void
+    {
+        if (!$this->adrift) {
+            return;
+        }
+        $this->adrift = false;
+        if (!$accepted && !$this->broken) {
+            $this->markBroken();
         }
     }
 
@@ -1675,8 +1732,12 @@ class Connection
      * The prepared-statement cache MUST be cleared: an id is only valid on the
      * connection that created it, so carrying one across a reconnect would run
      * a different statement (or fail obscurely).
+     *
+     * $replaces: the piece of the session's state the statement about to be
+     * sent replaces, which a re-dial then does not put back first (see
+     * dial).
      */
-    private function ensureLive(): void
+    private function ensureLive(?string $replaces = null): void
     {
         // close() is terminal, also for a connection that was broken when
         // it was closed: nothing dials again.
@@ -1718,7 +1779,7 @@ class Connection
             $this->order = $this->pool->dialOrder($this->connected);
         }
         try {
-            $this->dial();
+            $this->dial($replaces);
         } catch (SkaidbException $e) {
             $this->markBroken();   // still down; the next statement retries
             throw $e;

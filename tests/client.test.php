@@ -1584,6 +1584,157 @@ test('reconnect: a session database that cannot be entered again fails the state
     $srv->stop();
 });
 
+/**
+ * A server on which the database "app" was dropped behind the client's
+ * back: `USE app` — the client's own — is taken, the quoted `USE "app"` a
+ * re-dial sends is refused from the second connection on. `USE gone` is
+ * refused always, as is a SET naming BOGUS; `SET CONSISTENCY ALL` and `SET
+ * SCAN BUDGET ROWS 1111` are taken on the first connection and refused on
+ * every later one, as by a member that will not have them.
+ */
+function hostage_server(): FakeServer
+{
+    return (new FakeServer(['handle' => function (array $req) {
+        if ($req['op'] !== 1) {
+            return null;
+        }
+        $sql = $req['sql'];
+        if ($sql === 'USE "app"' && $req['conn'] > 1) {
+            return F::error('database "app" does not exist');
+        }
+        if (str_contains($sql, 'gone')) {
+            return F::error('database "gone" does not exist');
+        }
+        if (in_array($sql, ['SET CONSISTENCY ALL', 'SET SCAN BUDGET ROWS 1111'], true) && $req['conn'] > 1) {
+            return F::error('not on this member');
+        }
+        if (str_contains($sql, 'BOGUS')) {
+            return F::error('parse error: no such setting');
+        }
+        if (str_starts_with($sql, 'INSERT')) {
+            return F::mutation(1);
+        }
+        return str_starts_with($sql, 'SELECT') ? F::rows(['n'], [[3]]) : F::ddl();
+    }]))->start();
+}
+
+test('reconnect: a USE is not held hostage by the database it leaves', function () {
+    $count = 'SELECT count(*) FROM notes';
+    $srv = hostage_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $db->exec('USE app');
+    $db->exec('SET CONSISTENCY ONE');
+    $db->exec('SET SCAN BUDGET ROWS 5');
+    // "app" is dropped from another connection, and this one is lost.
+    $srv->closeAll();
+    // Any other statement fails at the re-dial's USE, as it must: it would
+    // run elsewhere.
+    $e = assert_throws(SkaidbException::class, fn () => $db->query($count), '/^database "app" does not exist$/');
+    assert_eq(SkaidbException::class, get_class($e));
+    assert_eq(['connect', 'USE "app"'], array_slice(session_seen($srv), 4));
+    // A USE is the way out, so it is not preceded by the USE it replaces:
+    // the settings are put back, then it is sent, and its answer decides.
+    assert_eq(0, $db->exec('USE other'));
+    assert_eq(['connect', 'SET CONSISTENCY ONE', 'SET SCAN BUDGET ROWS 5', 'USE other'], array_slice(session_seen($srv), 6));
+    assert_eq('other', $db->sessionDatabase());
+    assert_eq(3, $db->query($count)->fetchColumn());
+    assert_eq([$count], array_slice(session_seen($srv), 10), 'on the connection the USE was sent on');
+    // The session is settled there: a statement the server refuses now is
+    // an ordinary statement error.
+    assert_throws(SkaidbException::class, fn () => $db->exec('SET CONSISTENCY BOGUS'), '/^parse error: no such setting$/');
+    assert_true($db->isUsable());
+    assert_eq(['SET CONSISTENCY BOGUS'], array_slice(session_seen($srv), 11));
+    // And "other" is the session's database from here on.
+    $srv->closeAll();
+    assert_eq(3, $db->query($count)->fetchColumn());
+    assert_eq(['connect', 'USE "other"', 'SET CONSISTENCY ONE', 'SET SCAN BUDGET ROWS 5', $count], array_slice(session_seen($srv), 12));
+    $db->close();
+    $srv->stop();
+
+    // The same on a re-dial the look did not cause, in every spelling the
+    // driver reads as a USE.
+    foreach (['USE other', 'use database "other";', "USE other -- the reporting database"] as $use) {
+        $srv = hostage_server();
+        $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret', 'QUORUM', 5.0, 'app');
+        $srv->closeAll(FakeServer::HALF);
+        assert_throws(SkaidbException::class, fn () => $db->exec('INSERT INTO notes (id) VALUES (1)'), '/^database "app" does not exist$/');
+        $db->prepare($use)->execute();
+        assert_eq(1, $db->exec('INSERT INTO notes (id) VALUES (1)'));
+        assert_eq(['connect', $use, 'INSERT INTO notes (id) VALUES (1)'], array_slice(session_seen($srv), 4), $use);
+        $db->close();
+        $srv->stop();
+    }
+});
+
+test('reconnect: a USE that is refused after such a re-dial costs the connection — nothing runs outside the session database', function () {
+    $count = 'SELECT count(*) FROM notes';
+    // "app" exists here: only the application's new USE is refused.
+    $srv = session_server();
+    $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+    $db->exec('USE app');
+    $srv->closeAll();
+    // The new connection was not taken into "app" for a USE that was
+    // about to leave it. Refused, that USE leaves a connection in no
+    // database the session knows: it is given up, not used.
+    foreach (['exec' => fn () => $db->exec('USE gone'), 'stream' => fn () => iterator_to_array($db->stream('USE gone'))] as $how => $use) {
+        $from = count(session_seen($srv));
+        assert_throws(SkaidbException::class, $use, '/^database "gone" does not exist$/');
+        assert_eq('app', $db->sessionDatabase());
+        assert_true(!$db->isUsable(), "{$how}: the connection is in no database the session knows, and still in use");
+        assert_eq(3, $db->query($count)->fetchColumn());
+        assert_eq(
+            ['connect', ($how === 'stream' ? 'stream ' : '') . 'USE gone', 'connect', 'USE "app"', $count],
+            array_slice(session_seen($srv), $from),
+            $how
+        );
+        $srv->closeAll();
+    }
+    // On a connection that IS in the session database a refused USE
+    // changes nothing and costs nothing.
+    $db->query($count);
+    $connections = $srv->connections();
+    assert_throws(SkaidbException::class, fn () => $db->exec('USE gone'), '/^database "gone" does not exist$/');
+    assert_true($db->isUsable());
+    $db->query($count);
+    assert_eq($connections, $srv->connections());
+    $db->close();
+    $srv->stop();
+});
+
+test('reconnect: a setting is not held hostage by the one it replaces either', function () {
+    $count = 'SELECT count(*) FROM notes';
+    foreach ([
+        'the scan budget' => ['SET SCAN BUDGET ROWS 1111', 'SET SCAN BUDGET DEFAULT', 'SET SCAN BUDGET BOGUS', 'SET CONSISTENCY ONE'],
+        'the consistency' => ['SET CONSISTENCY ALL', 'SET CONSISTENCY DEFAULT', 'SET CONSISTENCY BOGUS', 'SET SCAN BUDGET ROWS 9'],
+    ] as $name => [$set, $clear, $wrong, $other]) {
+        $srv = hostage_server();
+        $db = new Connection('127.0.0.1', $srv->port, 'ada', 'secret');
+        $db->exec($other);
+        $db->exec($set);
+        $srv->closeAll();
+        // The member the connection lands on refuses the noted setting.
+        assert_throws(SkaidbException::class, fn () => $db->query($count), '/^not on this member$/');
+        // Another statement of the same kind replaces it, so the old one
+        // is not sent first — but one that is refused leaves the
+        // connection without the setting the session has, and costs it.
+        $from = count(session_seen($srv));
+        assert_throws(SkaidbException::class, fn () => $db->exec($wrong), '/^parse error: no such setting$/');
+        assert_true(!$db->isUsable(), $name);
+        assert_throws(SkaidbException::class, fn () => $db->query($count), '/^not on this member$/');
+        // Clearing it is accepted, and frees the session.
+        assert_eq(0, $db->exec($clear));
+        assert_eq(3, $db->query($count)->fetchColumn(), $name);
+        // A dial sends the consistency before the scan budget: the other
+        // setting is put back either way, and reached before the refused
+        // one only when it is the consistency.
+        $dial = ['connect', $other];
+        $refused = $name === 'the scan budget' ? ['connect', $other, $set] : ['connect', $set];
+        assert_eq([...$dial, $wrong, ...$refused, ...$dial, $clear, $count], array_slice(session_seen($srv), $from), $name);
+        $db->close();
+        $srv->stop();
+    }
+});
+
 test('reconnect: a re-dial the server turns away in its handshake leaves the connection broken, not closed', function () {
     // A node at capacity closes a new connection unanswered (PROTOCOL.md
     // §6), and a node on its way up or down may do the same: a connection
